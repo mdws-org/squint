@@ -5,6 +5,7 @@
 //! a SSIMULACRA2 threshold.
 
 mod metadata;
+pub mod png;
 pub use metadata::{extract_icc, extract_orientation};
 
 use imgref::ImgVec;
