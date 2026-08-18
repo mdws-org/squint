@@ -1,0 +1,19 @@
+[package]
+name = "squint-core"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Perceptual image compression engine for squint"
+
+[dependencies]
+fast-ssim2 = { version = "0.8", features = ["imgref"] }
+imgref = "1.12"
+mozjpeg = "0.10"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[[bin]]
+name = "squint"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
