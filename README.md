@@ -1,27 +1,69 @@
-# squint
+# Squint
 
 A macOS image optimizer that compresses to a perceptual target instead of a fixed quality number.
 
-Most optimizers ask you to choose a quality setting once and then apply it to every image forever. A flat interface screenshot and a noisy photograph do not tolerate the same setting, so one number wastes bytes on the first and visibly damages the second. squint measures perceived difference per image and finds the smallest file that stays under the threshold you set. You get consistent perceived quality rather than a consistent encoder setting.
+Most optimizers ask you to choose a quality setting once and then apply it to every image forever. A flat interface screenshot and a noisy photograph do not tolerate the same setting, so one number wastes bytes on the first and visibly damages the second. Squint measures perceived difference per image and finds the smallest file that stays above the threshold you set.
 
 ## Status
 
-Pre-alpha. No code exists yet. This repository currently holds the design and the roadmap.
+Working, unreleased. JPEG and PNG are implemented. There is no signed build and no download yet.
+
+What runs today: a drag and drop window, two Finder Services entries, in-place replacement that preserves Finder tags, and a command line harness for measurement.
+
+What does not exist yet: HEIC, GIF and SVG input; Balanced mode; recipes; WebP and AVIF output; PDF; automatic updates.
 
 ## Why this exists
 
-[ImageOptim](https://imageoptim.com) has been the reference tool in this space for over a decade, and squint owes its interaction model to it: drop files on a window, or right-click them in Finder, and they get smaller. That part is worth preserving exactly.
+[ImageOptim](https://imageoptim.com) has been the reference tool in this space for over a decade, and Squint owes its interaction model to it: drop files on a window, or right-click them in Finder, and they get smaller. That part is worth preserving exactly.
 
 Three things are missing from it. It cannot write WebP or AVIF. It produces exactly one output per input, because its job model tracks a single result per file. And its quality is a fixed number applied uniformly, so the result varies in perceived quality from image to image.
 
-One behaviour is worth correcting rather than copying. With strip-metadata enabled, ImageOptim passes `-copy none` to jpegtran and `--strip-all` to jpegoptim. Both drop every marker, including the ICC colour profile. A Display P3 photograph from an iPhone then gets interpreted as sRGB, and its colours shift. squint strips location, camera, and timestamp metadata, and keeps the colour profile.
+One behaviour is worth correcting rather than copying. With strip-metadata enabled, ImageOptim passes `-copy none` to jpegtran and `--strip-all` to jpegoptim. Both drop every marker, including the ICC colour profile. A Display P3 photograph from an iPhone then gets interpreted as sRGB, and its colours shift.
 
-## Roadmap
+## Measured against ImageOptim
 
-- **v1** — ImageOptim parity plus the perceptual engine. HEIC/PNG/JPEG/GIF/SVG in, same format, same dimensions, in place. Context menu. ICC preserved, GPS stripped. Nothing else.
-- **v1.1** — recipes, and with them the Email/Social presets and dimension caps
-- **v1.2** — WebP/AVIF output and SVG rasterization via resvg
-- **v1.3** — PDF compression
+One 4032x3024 Display P3 photograph, on an Apple M1, with ImageOptim in lossy mode at its author's habitual quality of 74.5.
+
+| | bytes | of original | SSIMULACRA2 | colour profile |
+|---|---|---|---|---|
+| source | 1,465,453 | | | Display P3 |
+| Squint, fast mode | 401,879 | 27.4% | 76.95 | **Display P3** |
+| ImageOptim | 400,965 | 27.4% | 76.95 | sRGB |
+
+Squint is not smaller. It compresses to the same size at the same perceived quality, spends 914 bytes carrying the colour profile across, and reports the score rather than leaving you to guess.
+
+One hundred files through fast mode, eight at a time, took 9 seconds on an 8 core machine.
+
+## Install
+
+There is no release yet. Build it:
+
+```
+git clone https://github.com/mdws-org/squint.git
+cd squint/app
+xcodegen generate
+xcodebuild -project Squint.xcodeproj -scheme Squint -configuration Release build
+```
+
+Requirements: Xcode, [XcodeGen](https://github.com/yonaskolb/XcodeGen), and a Rust toolchain. The Xcode build invokes `cargo` to build the engine.
+
+The application is unsandboxed by design. Replacing arbitrary files in place is not possible under the App Sandbox, which is also why ImageOptim ships unsandboxed.
+
+## Use
+
+Drop images on the window, or right-click them in Finder and choose **Services**, then **Squint (Fast)** or **Squint (Quality)**.
+
+Files are replaced in place. Keep copies until you trust it.
+
+Note that an already-open Get Info window will keep showing camera and location data after a file is processed. Finder caches that panel and does not re-read the file. Close the window and open it again.
+
+## Modes
+
+**Fast** is the default. It encodes once at a fixed quality and evaluates no metric, which matches ImageOptim's speed.
+
+**Quality** searches at full resolution and returns the smallest file that still meets the perceptual target.
+
+**Balanced** is designed but not implemented. It will search a downscaled proxy and then encode at full resolution.
 
 ## Design rules
 
@@ -29,9 +71,13 @@ These hold across every release.
 
 **Never strip the colour profile.** Remove GPS, camera, and timestamp metadata. Keep ICC. Bake orientation into the pixels rather than leaving it as a tag.
 
-**In-place writes require a single same-format output.** A run that produces exactly one file in the same format can overwrite the original. A run that produces two or more outputs, or a different format, must write beside the original and must not modify it.
+**Never grow a file.** A source that is already compressed can require more bytes to match at a high target. When that happens the original is kept.
 
-**Complexity belongs in the preset, not at the point of use.** The Finder context menu offers named destinations. It does not offer settings.
+**In-place writes require a single same-format output.** A run producing two or more outputs, or a different format, must write beside the original and must not modify it.
+
+**Complexity belongs in the preset, not at the point of use.** The Finder menu offers named destinations. It does not offer settings.
+
+**Fail loudly.** Every refusal returns a typed error that explains itself. This domain produces failures that look like success, and a metric that returns a plausible number when it has no valid answer is worse than one that stops.
 
 ## Engine
 
@@ -41,33 +87,46 @@ These hold across every release.
 | PNG quantization | [libimagequant](https://github.com/ImageOptim/libimagequant) | GPL-3.0-or-later |
 | PNG optimization | [oxipng](https://github.com/shssoichiro/oxipng) | MIT |
 | JPEG encoding | [mozjpeg](https://github.com/mozilla/mozjpeg) | BSD-3-Clause |
-| SVG rasterization (v1.2) | [resvg](https://github.com/linebender/resvg) | Apache-2.0 |
+| SVG rasterization (planned) | [resvg](https://github.com/linebender/resvg) | Apache-2.0 |
 
-fast-ssim2 implements SSIMULACRA2 and agrees with the libjxl reference to within 0.04 across a quality sweep, while running about twice as fast as the `rust-av/ssimulacra2` crate on Apple Silicon. It is pure Rust with `#![forbid(unsafe_code)]` and dispatches NEON at runtime.
+Squint is GPL-3.0 because it links libimagequant, which is the only PNG quantizer implementing a quality floor. GPL-3 rather than GPL-2 is required, because resvg is Apache-2.0 and Apache-2.0 is incompatible with GPL-2.
 
-squint is GPL-3.0 because it links libimagequant, which is the only PNG quantizer implementing a quality floor. GPL-3 rather than GPL-2 is required: resvg is Apache-2.0, which is incompatible with GPL-2.
+Three metrics were measured on the same 12 megapixel photograph, on an Apple M1, median of five runs:
 
-`dssim` was measured at roughly five times faster than SSIMULACRA2 and remains a candidate for search bracketing. It is not the primary metric, because its `1/SSIM-1` output is uncalibrated and carries no published visually-lossless threshold.
+| metric | time | score | licence |
+|---|---|---|---|
+| dssim | 0.381 s | uncalibrated | AGPL-3.0 |
+| **fast-ssim2** | **0.810 s** | 87.81 | BSD-2-Clause |
+| rust-av/ssimulacra2 | 1.606 s | 87.75 | BSD-2-Clause |
 
-GPU evaluation was rejected. See `docs/` for the record.
+fast-ssim2 runs about twice as fast as `rust-av/ssimulacra2` and agrees with it to within 0.07. It is pure Rust with `#![forbid(unsafe_code)]` and dispatches NEON at runtime.
 
-## Modes
+dssim is faster still and remains a candidate for search bracketing, but it is not the primary metric: its `1/SSIM-1` output is uncalibrated and carries no published visually-lossless threshold, so a target expressed in it would mean nothing to a person.
 
-Every image is judged in one of three modes. The mode belongs to a preset, not to a global setting.
+A GPU implementation was evaluated and rejected. Its own documentation disables macOS Metal testing because 12 megapixel images wedge the GPU on unified memory, and reports that the score silently becomes zero when that happens.
 
-**Fast** is the default. It encodes once at a fixed quality and evaluates no metric, which matches ImageOptim's speed.
+## Search
 
-**Balanced** searches for a quality target using a downscaled proxy, then encodes at full resolution.
+The search opens at a quality predicted from the target, interpolates between the probes bracketing it, and collapses its bracket rather than stopping as soon as a probe lands within tolerance. Stopping early was measured to cost 13 to 45 percent in file size, because the goal is the smallest file above a bar rather than a result near a number.
 
-**Quality** searches at full resolution and returns the smallest file that still meets the perceptual target.
+It returns the best satisfying probe rather than the bracket endpoint. Quality is not monotonic in the encoder setting for synthetic content: text and interface screenshots have been measured to invert by up to 3.5 points.
 
-## Measured cost
+Perceptual targeting is refused below 113 pixels on the shorter side. SSIMULACRA2 misindexes its internal weight table below that size, and a visibly degraded image can score above 90.
 
-One perceptual comparison of a 12-megapixel photograph takes about 1.6 seconds with `rust-av/ssimulacra2`, about 0.76 seconds with fast-ssim2, and about 0.30 seconds with dssim. Measured on an Apple M1. The metric dominates: encoding and decoding the same image costs about 74 milliseconds.
+Both sides of a comparison must be interpreted in the same colour space. Comparing a Display P3 reference against an untagged candidate shifts the score by 1.5 to 4.4 points, which exceeds the difference between any two implementations.
 
-Perceptual targeting must be refused below 113 pixels on the shorter side. SSIMULACRA2 misindexes its internal weight table below that size and returns scores that are not meaningful.
+## Concurrency
 
-Both sides of a comparison must be interpreted in the same colour space. Comparing a Display P3 reference against an untagged candidate shifts the score by 1.5 to 4.4 points, which is larger than the difference between any two implementations.
+Fast mode is bounded by core count. It peaks at 167 MB per file.
+
+Quality mode is bounded by memory, and exceeding that bound is not merely wasteful but harmful. A 12 megapixel comparison peaks at 2.84 GB. Sixteen files on an 8 core, 8 GB machine took 36 seconds at two concurrent, 60 at four, and 116 at eight, against about 63 seconds run one at a time.
+
+## Roadmap
+
+- **v1** — ImageOptim parity plus the perceptual engine, in place, colour profile preserved, location data dropped. JPEG and PNG are done. HEIC, GIF and SVG input remain.
+- **v1.1** — recipes, the Email and Social presets, dimension caps, and a Finder Sync extension for the preset submenu
+- **v1.2** — WebP and AVIF output, and SVG rasterization
+- **v1.3** — PDF compression
 
 ## License
 
