@@ -8,6 +8,13 @@ import Foundation
 /// is bounded by cores as usual.
 @MainActor
 final class JobQueue: ObservableObject {
+    /// One queue for the whole application. The window and the Finder service
+    /// both feed it, so work arriving by either route joins the same run and
+    /// respects the same concurrency limit.
+    static let shared = JobQueue()
+
+    private init() {}
+
     @Published private(set) var jobs: [Job] = []
     @Published private(set) var isRunning = false
     @Published var mode: Engine.Mode = .fast

@@ -2,7 +2,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct ContentView: View {
-    @StateObject private var queue = JobQueue()
+    @StateObject private var queue = JobQueue.shared
     @State private var isTargeted = false
 
     var body: some View {

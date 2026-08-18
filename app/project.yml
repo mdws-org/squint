@@ -11,6 +11,8 @@ targets:
     platform: macOS
     sources:
       - path: Sources
+      - path: ../design/squint.icns
+        buildPhase: resources
     settings:
       base:
         PRODUCT_NAME: squint
@@ -33,9 +35,24 @@ targets:
       path: Info.plist
       properties:
         CFBundleName: squint
+        CFBundleIconFile: squint
         LSMinimumSystemVersion: "14.0"
         LSApplicationCategoryType: public.app-category.graphics-design
         NSHighResolutionCapable: true
+        # The Finder right-click entry. NSMessage must match the @objc method on
+        # ServiceProvider; a mismatch fails silently with no registration error.
+        NSServices:
+          - NSMenuItem:
+              default: squint
+            NSMessage: optimizeFiles
+            NSPortName: squint
+            NSSendFileTypes:
+              - public.jpeg
+              - public.png
+            NSRequiredContext:
+              NSApplicationIdentifier: com.apple.finder
+              NSTextContent: FilePath
+            NSServiceDescription: Shrink images in place, keeping the colour profile
     preBuildScripts:
       - name: Build the engine
         basedOnDependencyAnalysis: false
