@@ -3,7 +3,7 @@
 //! This drives the engine without a user interface so that quality and speed can
 //! be measured against real photographs before any application exists.
 
-use squint_core::{search, encode_jpeg, score, Image, JPEG_SCORE_CEILING};
+use squint_core::{search, encode_jpeg, score, extract_icc, extract_orientation, Image, JPEG_SCORE_CEILING};
 use std::time::Instant;
 
 fn usage() -> ! {
@@ -31,6 +31,7 @@ fn main() {
     let mut fixed_quality = 75.0f32;
     let mut probes = 6usize;
     let mut against: Option<String> = None;
+    let mut out_path: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -41,6 +42,7 @@ fn main() {
             "--quality" => fixed_quality = next.and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             "--probes" => probes = next.and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             "--against" => against = Some(next.unwrap_or_else(|| usage()).clone()),
+            "--out" => out_path = Some(next.unwrap_or_else(|| usage()).clone()),
             _ => usage(),
         }
         i += 2;
@@ -53,13 +55,16 @@ fn main() {
             std::process::exit(1)
         }
     };
-    let image = match Image::decode(&bytes) {
+    let mut image = match Image::decode(&bytes) {
         Ok(i) => i,
         Err(e) => {
             eprintln!("{e}");
             std::process::exit(1)
         }
     };
+    let icc = extract_icc(&bytes);
+    let orientation = extract_orientation(&bytes);
+    image.apply_orientation(orientation);
 
     println!(
         "{}  {}x{} = {:.2} MP  {:.0} KB",
@@ -69,9 +74,16 @@ fn main() {
         image.megapixels(),
         bytes.len() as f64 / 1024.0
     );
+    println!(
+        "         icc {}  orientation {}{}",
+        match &icc { Some(p) => format!("{} bytes preserved", p.len()), None => "absent".into() },
+        orientation,
+        if orientation != 1 { " (baked into pixels)" } else { "" }
+    );
 
     // Scoring one file against another, which is how a fixed-quality result gets
     // a perceptual number attached to it.
+    let _ = &icc;
     if let Some(other) = against {
         let ob = std::fs::read(&other).unwrap_or_else(|e| { eprintln!("could not read {other}: {e}"); std::process::exit(1) });
         let oi = Image::decode(&ob).unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(1) });
@@ -87,7 +99,7 @@ fn main() {
     let started = Instant::now();
     match mode.as_str() {
         "fast" => {
-            let out = encode_jpeg(&image, fixed_quality).unwrap_or_else(|e| {
+            let out = encode_jpeg(&image, fixed_quality, icc.as_deref()).unwrap_or_else(|e| {
                 eprintln!("{e}");
                 std::process::exit(1)
             });
@@ -99,6 +111,10 @@ fn main() {
                 100.0 * out.len() as f64 / bytes.len() as f64,
                 elapsed
             );
+            if let Some(o) = &out_path {
+                std::fs::write(o, &out).unwrap_or_else(|e| { eprintln!("write failed: {e}"); std::process::exit(1) });
+                println!("         wrote {o}");
+            }
         }
         "quality" => {
             if target > JPEG_SCORE_CEILING {
@@ -108,7 +124,7 @@ fn main() {
                 );
                 std::process::exit(1)
             }
-            match search(&image, target, probes, bytes.len()) {
+            match search(&image, target, probes, bytes.len(), icc.as_deref()) {
                 Ok(r) => {
                     let elapsed = started.elapsed().as_secs_f64();
                     for p in &r.probes {
@@ -129,6 +145,10 @@ fn main() {
                         r.probes.len(),
                         elapsed
                     );
+                    if let Some(o) = &out_path {
+                        std::fs::write(o, &r.data).unwrap_or_else(|e| { eprintln!("write failed: {e}"); std::process::exit(1) });
+                        println!("         wrote {o}");
+                    }
                 }
                 Err(e) => {
                     eprintln!("{e}");

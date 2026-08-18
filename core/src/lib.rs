@@ -4,6 +4,9 @@
 //! For each image it searches for the smallest file that still scores at or above
 //! a SSIMULACRA2 threshold.
 
+mod metadata;
+pub use metadata::{extract_icc, extract_orientation};
+
 use imgref::ImgVec;
 
 /// SSIMULACRA2 misindexes its internal weight table below this size and returns
@@ -83,6 +86,40 @@ impl Image {
         (self.width * self.height) as f64 / 1_000_000.0
     }
 
+    /// Bake an EXIF orientation into the pixels.
+    ///
+    /// squint drops EXIF on re-encode, so an orientation left as a tag would be
+    /// lost and the image would display rotated. Applying it to the pixels makes
+    /// the file correct without metadata.
+    pub fn apply_orientation(&mut self, orientation: u16) {
+        if !(2..=8).contains(&orientation) {
+            return;
+        }
+        let (w, h) = (self.width, self.height);
+        let transposed = matches!(orientation, 5 | 6 | 7 | 8);
+        let (nw, nh) = if transposed { (h, w) } else { (w, h) };
+        let mut out = vec![[0u8; 3]; w * h];
+
+        for y in 0..h {
+            for x in 0..w {
+                let (nx, ny) = match orientation {
+                    2 => (w - 1 - x, y),
+                    3 => (w - 1 - x, h - 1 - y),
+                    4 => (x, h - 1 - y),
+                    5 => (y, x),
+                    6 => (h - 1 - y, x),
+                    7 => (h - 1 - y, w - 1 - x),
+                    8 => (y, w - 1 - x),
+                    _ => (x, y),
+                };
+                out[ny * nw + nx] = self.pixels[y * w + x];
+            }
+        }
+        self.pixels = out;
+        self.width = nw;
+        self.height = nh;
+    }
+
     fn as_img(&self) -> ImgVec<[u8; 3]> {
         ImgVec::new(self.pixels.clone(), self.width, self.height)
     }
@@ -107,12 +144,20 @@ pub fn score(reference: &Image, candidate: &Image) -> Result<f64, Error> {
         .map_err(|e| Error::Metric(format!("{e:?}")))
 }
 
-pub fn encode_jpeg(image: &Image, quality: f32) -> Result<Vec<u8>, Error> {
+/// Encode to JPEG, carrying the colour profile across.
+///
+/// Passing `None` for `icc` produces an untagged file. That is the bug ImageOptim
+/// ships: it drops the profile with the EXIF, so Display P3 photographs are then
+/// read as sRGB and their colours shift. Callers should pass the source profile.
+pub fn encode_jpeg(image: &Image, quality: f32, icc: Option<&[u8]>) -> Result<Vec<u8>, Error> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut comp = mozjpeg::Compress::new(mozjpeg::ColorSpace::JCS_RGB);
         comp.set_size(image.width, image.height);
         comp.set_quality(quality);
         let mut started = comp.start_compress(Vec::new())?;
+        if let Some(profile) = icc {
+            started.write_icc_profile(profile);
+        }
         started.write_scanlines(&image.flat())?;
         started.finish()
     }))
@@ -159,6 +204,7 @@ pub fn search(
     target: f64,
     max_probes: usize,
     original_bytes: usize,
+    icc: Option<&[u8]>,
 ) -> Result<SearchResult, Error> {
     if reference.shorter_side() < MIN_PERCEPTUAL_DIM {
         return Err(Error::TooSmall { shorter_side: reference.shorter_side() });
@@ -180,7 +226,7 @@ pub fn search(
             break; // bracket has collapsed onto an already-measured point
         }
 
-        let data = encode_jpeg(reference, q)?;
+        let data = encode_jpeg(reference, q, icc)?;
         let decoded = Image::decode(&data)?;
         let s = score(reference, &decoded)?;
         let probe = Probe { quality: q, score: s, bytes: data.len() };
@@ -254,4 +300,84 @@ fn interpolate(probes: &[Probe], target: f64) -> Option<f32> {
     }
     let t = (target - b.score) / (a.score - b.score);
     Some((b.quality as f64 + t * (a.quality - b.quality) as f64) as f32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 2 wide by 3 tall image whose pixels encode their own coordinates as
+    /// `y * 10 + x`, so a transform can be checked by reading values back.
+    fn coded() -> Image {
+        let mut pixels = Vec::new();
+        for y in 0..3u8 {
+            for x in 0..2u8 {
+                pixels.push([y * 10 + x, 0, 0]);
+            }
+        }
+        Image { pixels, width: 2, height: 3 }
+    }
+
+    fn at(img: &Image, x: usize, y: usize) -> u8 {
+        img.pixels[y * img.width + x][0]
+    }
+
+    #[test]
+    fn orientation_1_is_a_no_op() {
+        let mut img = coded();
+        img.apply_orientation(1);
+        assert_eq!((img.width, img.height), (2, 3));
+        assert_eq!(at(&img, 0, 0), 0);
+        assert_eq!(at(&img, 1, 2), 21);
+    }
+
+    #[test]
+    fn orientation_3_rotates_180() {
+        let mut img = coded();
+        img.apply_orientation(3);
+        assert_eq!((img.width, img.height), (2, 3));
+        // The bottom right pixel becomes the top left.
+        assert_eq!(at(&img, 0, 0), 21);
+        assert_eq!(at(&img, 1, 2), 0);
+    }
+
+    #[test]
+    fn orientation_6_rotates_90_clockwise() {
+        let mut img = coded();
+        img.apply_orientation(6);
+        // Dimensions transpose.
+        assert_eq!((img.width, img.height), (3, 2));
+        // Rotating clockwise moves the bottom left corner to the top left.
+        assert_eq!(at(&img, 0, 0), 20);
+        assert_eq!(at(&img, 1, 0), 10);
+        assert_eq!(at(&img, 2, 0), 0);
+        assert_eq!(at(&img, 0, 1), 21);
+    }
+
+    #[test]
+    fn orientation_8_rotates_90_counterclockwise() {
+        let mut img = coded();
+        img.apply_orientation(8);
+        assert_eq!((img.width, img.height), (3, 2));
+        // The top right corner moves to the top left.
+        assert_eq!(at(&img, 0, 0), 1);
+        assert_eq!(at(&img, 2, 1), 20);
+    }
+
+    #[test]
+    fn out_of_range_orientation_is_ignored() {
+        let mut img = coded();
+        img.apply_orientation(99);
+        assert_eq!((img.width, img.height), (2, 3));
+        assert_eq!(at(&img, 0, 0), 0);
+    }
+
+    #[test]
+    fn perceptual_targeting_is_refused_below_the_valid_size() {
+        let img = Image { pixels: vec![[0, 0, 0]; 100 * 100], width: 100, height: 100 };
+        match search(&img, 80.0, 4, 999_999, None) {
+            Err(Error::TooSmall { shorter_side }) => assert_eq!(shorter_side, 100),
+            other => panic!("expected TooSmall, got {other:?}"),
+        }
+    }
 }
