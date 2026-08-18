@@ -13,16 +13,29 @@ final class JobQueue: ObservableObject {
     @Published var mode: Engine.Mode = .fast
     @Published var target: Double = 80
 
-    private static let bytesPerComparison: UInt64 = 2_000_000_000
+    /// Measured peak for one 12 megapixel comparison: 2.84 GB. Rounded up,
+    /// because the figure grows with pixel count and phone cameras are moving up.
+    private static let bytesPerQualityJob: UInt64 = 3_000_000_000
+
+    /// Fraction of physical memory this application is willing to claim.
+    ///
+    /// Chosen to reproduce the measured optimum. On an 8 core, 8 GB machine,
+    /// 16 files in quality mode took 36 s at two concurrent, 60 s at four, and
+    /// 116 s at eight, against 63 s if run one at a time. Concurrency past the
+    /// point where the working sets fit is not merely wasted, it is negative:
+    /// eight-way was nearly twice as slow as serial. This share yields 2 on 8 GB,
+    /// 4 on 16 GB, 8 on 32 GB.
+    private static let memoryShare = 0.75
 
     var concurrencyLimit: Int {
         let cores = ProcessInfo.processInfo.activeProcessorCount
         switch mode {
         case .fast:
+            // Measured at 167 MB per job, so memory is not the binding constraint.
             return cores
         case .quality:
-            let memory = ProcessInfo.processInfo.physicalMemory
-            let byMemory = Int(memory / Self.bytesPerComparison)
+            let usable = UInt64(Double(ProcessInfo.processInfo.physicalMemory) * Self.memoryShare)
+            let byMemory = Int(usable / Self.bytesPerQualityJob)
             return max(1, min(cores, byMemory))
         }
     }
