@@ -8,9 +8,9 @@ Most optimizers ask you to choose a quality setting once and then apply it to ev
 
 Working, unreleased. JPEG and PNG are implemented. There is no signed build and no download yet.
 
-What runs today: a drag and drop window, two Finder Services entries, in-place replacement that preserves Finder tags, and a command line harness for measurement.
+What runs today: a drag and drop window, three Finder Services entries, in-place replacement that preserves Finder tags, and a command line harness for measurement.
 
-What does not exist yet: HEIC, GIF and SVG input; Balanced mode; recipes; WebP and AVIF output; PDF; automatic updates.
+What does not exist yet: HEIC, TIFF, WebP, AVIF, GIF and SVG input; Balanced mode; recipes; WebP and AVIF output; PDF; automatic updates.
 
 ## Why this exists
 
@@ -63,7 +63,23 @@ Note that an already-open Get Info window will keep showing camera and location 
 
 **Quality** searches at full resolution and returns the smallest file that still meets the perceptual target.
 
+**Strip** removes metadata and nothing else. The pixels are copied unchanged, so the result is identical to the input image, and only the container shrinks.
+
 **Balanced** is designed but not implemented. It will search a downscaled proxy and then encode at full resolution.
+
+## Metadata
+
+Fast and Quality remove metadata as a consequence of re-encoding: the file is rebuilt from pixels, so nothing survives that is not deliberately written. Strip removes the same things without re-encoding.
+
+For JPEG, every `APPn` segment is dropped except the ICC colour profile, along with comment segments. That covers EXIF and its embedded thumbnail, XMP, IPTC, Multi Picture Format, HDR gain maps, Apple's rotation block, and C2PA content credentials. None of them are recognised individually. Anything not deliberately kept is removed, which is why provenance formats that did not exist when this was written will also go.
+
+For PNG, only the chunks needed to render are kept: `IHDR`, `PLTE`, `IDAT`, `IEND`, `tRNS`, `iCCP`, `sRGB` and `gAMA`. Dropped chunks include `tEXt`, `iTXt` and `zTXt`, where image generators write prompts and seeds, along with `eXIf`, `tIME` and the `caBX` chunk carrying C2PA.
+
+The colour profile is always kept. It carries no personal information, and discarding it shifts the colours of every photograph taken on a modern phone.
+
+Measured on a 4032x3024 iPhone photograph: 1,465,453 bytes to 1,346,322 in 0.004 seconds, with only the colour profile surviving. Scoring the result against the original returns exactly 100, confirming the pixels are untouched.
+
+Apple writes trailing data past the end-of-image marker, where a second embedded image and further XMP live. Stripping stops at that marker rather than copying to the end of the file. A first implementation did not, and XMP survived.
 
 ## Design rules
 
@@ -123,10 +139,12 @@ Quality mode is bounded by memory, and exceeding that bound is not merely wastef
 
 ## Roadmap
 
-- **v1** — ImageOptim parity plus the perceptual engine, in place, colour profile preserved, location data dropped. JPEG and PNG are done. HEIC, GIF and SVG input remain.
+Formats are tracked separately for reading and writing. Squint should read anything a person is likely to have, because Strip mode is useful on a file it cannot re-encode, while writing a format is a larger commitment.
+
+- **v1** — ImageOptim parity plus the perceptual engine, in place, colour profile preserved, location data dropped. JPEG and PNG read and written. HEIC, TIFF, WebP, AVIF, GIF and SVG remain to be read.
 - **v1.1** — recipes, the Email and Social presets, dimension caps, and a Finder Sync extension for the preset submenu
-- **v1.2** — WebP and AVIF output, and SVG rasterization
-- **v1.3** — PDF compression
+- **v1.2** — WebP and AVIF written, and SVG rasterization
+- **v1.3** — PDF, both compression and metadata removal
 
 ## License
 
