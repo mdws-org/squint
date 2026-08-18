@@ -68,6 +68,17 @@ targets:
               NSApplicationIdentifier: com.apple.finder
               NSTextContent: FilePath
             NSServiceDescription: Shrink images to a perceptual quality target
+          - NSMenuItem:
+              default: Squint (Strip Metadata)
+            NSMessage: stripMetadata
+            NSPortName: Squint
+            NSSendFileTypes:
+              - public.jpeg
+              - public.png
+            NSRequiredContext:
+              NSApplicationIdentifier: com.apple.finder
+              NSTextContent: FilePath
+            NSServiceDescription: Remove location and camera data without re-encoding
     preBuildScripts:
       - name: Build the engine
         basedOnDependencyAnalysis: false

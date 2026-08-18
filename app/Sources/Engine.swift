@@ -10,6 +10,8 @@ enum Engine {
         case fast = 0
         /// Search for the smallest file meeting a perceptual target.
         case quality = 1
+        /// Remove metadata without touching the pixels.
+        case strip = 2
     }
 
     struct Result {

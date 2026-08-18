@@ -311,6 +311,9 @@ pub enum Mode {
     Fast,
     /// Search for the smallest file meeting a perceptual target.
     Quality,
+    /// Remove metadata without touching the pixels. The result is
+    /// pixel-identical to the input and usually only slightly smaller.
+    Strip,
 }
 
 /// The outcome of optimizing one file.
@@ -332,10 +335,30 @@ pub fn optimize(
     fixed_quality: f32,
     png_min_quality: Option<u8>,
 ) -> Result<Optimized, Error> {
+    if mode == Mode::Strip {
+        let stripped = if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+            png::strip_png(bytes)
+        } else {
+            metadata::strip_jpeg(bytes)
+        }
+        .ok_or_else(|| Error::Decode("not a JPEG or PNG".into()))?;
+
+        if stripped.len() >= bytes.len() {
+            return Err(Error::NoSmallerResult {
+                best_bytes: stripped.len(),
+                original_bytes: bytes.len(),
+            });
+        }
+        return Ok(Optimized { data: stripped, score: None, original_bytes: bytes.len() });
+    }
+
     if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
         let effort = match mode {
-            Mode::Fast => png::Effort::Quick,
             Mode::Quality => png::Effort::Thorough,
+            // Strip returns before reaching here; Fast must not pay the
+            // thorough preset, which costs an order of magnitude for a few
+            // percent.
+            Mode::Fast | Mode::Strip => png::Effort::Quick,
         };
         let r = png::optimize_png(bytes, png_min_quality, mode == Mode::Quality, effort)?;
         return Ok(Optimized { data: r.data, score: r.score, original_bytes: bytes.len() });
@@ -346,7 +369,8 @@ pub fn optimize(
     image.apply_orientation(extract_orientation(bytes));
 
     match mode {
-        Mode::Fast => {
+        // Strip is handled above and never reaches this match.
+        Mode::Fast | Mode::Strip => {
             let data = encode_jpeg(&image, fixed_quality, icc.as_deref())?;
             if data.len() >= bytes.len() {
                 return Err(Error::NoSmallerResult {
@@ -438,6 +462,45 @@ mod tests {
         img.apply_orientation(99);
         assert_eq!((img.width, img.height), (2, 3));
         assert_eq!(at(&img, 0, 0), 0);
+    }
+
+    /// A minimal PNG carrying one text chunk, which must not survive stripping.
+    fn png_with_text() -> Vec<u8> {
+        fn chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+            let mut c = Vec::new();
+            c.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            c.extend_from_slice(kind);
+            c.extend_from_slice(data);
+            c.extend_from_slice(&[0, 0, 0, 0]); // CRC is not checked by the stripper
+            c
+        }
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        png.extend(chunk(b"IHDR", &[0; 13]));
+        png.extend(chunk(b"tEXt", b"Comment\0secret location"));
+        png.extend(chunk(b"iCCP", b"profile"));
+        png.extend(chunk(b"IDAT", b"pixels"));
+        png.extend(chunk(b"IEND", b""));
+        png
+    }
+
+    #[test]
+    fn stripping_a_png_removes_text_and_keeps_pixels_and_profile() {
+        let out = png::strip_png(&png_with_text()).expect("valid png");
+        assert!(!out.windows(4).any(|w| w == b"tEXt"), "text chunk survived");
+        assert!(!out.windows(6).any(|w| w == b"secret"), "text payload survived");
+        assert!(out.windows(4).any(|w| w == b"IDAT"), "pixels were dropped");
+        assert!(out.windows(4).any(|w| w == b"iCCP"), "colour profile was dropped");
+        assert!(out.len() < png_with_text().len());
+    }
+
+    #[test]
+    fn stripping_rejects_input_that_is_not_a_png() {
+        assert!(png::strip_png(b"not a png at all").is_none());
+    }
+
+    #[test]
+    fn stripping_rejects_input_that_is_not_a_jpeg() {
+        assert!(metadata::strip_jpeg(b"not a jpeg").is_none());
     }
 
     #[test]

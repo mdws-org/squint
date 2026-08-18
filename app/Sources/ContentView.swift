@@ -28,9 +28,10 @@ struct ContentView: View {
             Picker("", selection: $queue.mode) {
                 Text("Fast").tag(Engine.Mode.fast)
                 Text("Quality").tag(Engine.Mode.quality)
+                Text("Strip").tag(Engine.Mode.strip)
             }
             .pickerStyle(.segmented)
-            .frame(width: 160)
+            .frame(width: 220)
             .disabled(queue.isRunning)
 
             if queue.mode == .quality {
@@ -56,7 +57,7 @@ struct ContentView: View {
         VStack(spacing: 6) {
             Text("Drop images here")
                 .font(.title3)
-            Text("JPEG and PNG. Files are replaced in place.")
+            Text(queue.mode == .strip ? "Removes metadata. Pixels are untouched." : "JPEG and PNG. Files are replaced in place.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }

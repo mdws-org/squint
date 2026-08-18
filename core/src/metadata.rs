@@ -106,3 +106,77 @@ pub fn extract_orientation(jpeg: &[u8]) -> u16 {
     }
     1
 }
+
+
+/// Remove every metadata container from a JPEG without touching the pixels.
+///
+/// The entropy-coded scan is copied byte for byte, so the result is
+/// pixel-identical to the input. This is the difference between shrinking a file
+/// and sanitising one: a photograph being delivered as finished work should lose
+/// its location data without being re-encoded.
+///
+/// Every `APPn` segment is dropped except the ICC colour profile. That covers
+/// EXIF and its embedded thumbnail (APP1), XMP (APP1), IPTC (APP13), Multi
+/// Picture Format and HDR gain maps (APP2), Apple's rotation block (APP10), and
+/// C2PA content credentials (APP11), without needing to recognise any of them:
+/// anything not deliberately kept is removed.
+pub fn strip_jpeg(jpeg: &[u8]) -> Option<Vec<u8>> {
+    if jpeg.len() < 4 || jpeg[0] != 0xFF || jpeg[1] != 0xD8 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(jpeg.len());
+    out.extend_from_slice(&jpeg[0..2]); // SOI
+
+    let mut i = 2;
+    while i + 4 <= jpeg.len() {
+        if jpeg[i] != 0xFF {
+            break;
+        }
+        let marker = jpeg[i + 1];
+
+        if marker == 0xD8 || (0xD0..=0xD7).contains(&marker) || marker == 0x01 {
+            out.extend_from_slice(&jpeg[i..i + 2]);
+            i += 2;
+            continue;
+        }
+        if marker == 0xDA {
+            // Start of scan. Copy the entropy-coded data, but stop at the end of
+            // image rather than the end of file. Apple writes trailing data past
+            // EOI — the Multi Picture Format secondary image and XMP live there —
+            // and copying to EOF would carry that metadata straight through.
+            //
+            // Scanning for FFD9 is safe inside entropy-coded data: a literal FF is
+            // stored as FF00, and the only other markers permitted are the restart
+            // markers FFD0 through FFD7.
+            let mut j = i + 2;
+            while j + 1 < jpeg.len() {
+                if jpeg[j] == 0xFF && jpeg[j + 1] == 0xD9 {
+                    out.extend_from_slice(&jpeg[i..j + 2]);
+                    return Some(out);
+                }
+                j += 1;
+            }
+            out.extend_from_slice(&jpeg[i..]);
+            return Some(out);
+        }
+        if marker == 0xD9 {
+            out.extend_from_slice(&jpeg[i..i + 2]);
+            return Some(out);
+        }
+
+        let len = u16::from_be_bytes([jpeg[i + 2], jpeg[i + 3]]) as usize;
+        if len < 2 || i + 2 + len > jpeg.len() {
+            break;
+        }
+        let payload = &jpeg[i + 4..i + 2 + len];
+        let is_app = (0xE0..=0xEF).contains(&marker);
+        let is_comment = marker == 0xFE;
+        let keep = !is_app && !is_comment || payload.starts_with(b"ICC_PROFILE\0");
+
+        if keep {
+            out.extend_from_slice(&jpeg[i..i + 2 + len]);
+        }
+        i += 2 + len;
+    }
+    Some(out)
+}
