@@ -18,7 +18,7 @@ One behaviour is worth correcting rather than copying. With strip-metadata enabl
 
 ## Roadmap
 
-- **v1** — ImageOptim parity plus the perceptual engine. PNG/JPEG/GIF/SVG, same format, same dimensions, in place. Context menu. ICC preserved, GPS stripped. Nothing else.
+- **v1** — ImageOptim parity plus the perceptual engine. HEIC/PNG/JPEG/GIF/SVG in, same format, same dimensions, in place. Context menu. ICC preserved, GPS stripped. Nothing else.
 - **v1.1** — recipes, and with them the Email/Social presets and dimension caps
 - **v1.2** — WebP/AVIF output and SVG rasterization via resvg
 - **v1.3** — PDF compression
@@ -37,15 +37,38 @@ These hold across every release.
 
 | Component | Library | License |
 |---|---|---|
-| Perceptual metric | [ssimulacra2](https://github.com/rust-av/ssimulacra2) | BSD-2-Clause |
-| SVG rasterization (v1.2) | [resvg](https://github.com/linebender/resvg) | Apache-2.0 |
+| Perceptual metric | [fast-ssim2](https://github.com/imazen/fast-ssim2) | BSD-2-Clause |
+| PNG quantization | [libimagequant](https://github.com/ImageOptim/libimagequant) | GPL-3.0-or-later |
 | PNG optimization | [oxipng](https://github.com/shssoichiro/oxipng) | MIT |
 | JPEG encoding | [mozjpeg](https://github.com/mozilla/mozjpeg) | BSD-3-Clause |
+| SVG rasterization (v1.2) | [resvg](https://github.com/linebender/resvg) | Apache-2.0 |
 
-squint targets a permissively licensed dependency set so that the application can stay under MIT. `dssim` was evaluated for the perceptual metric and rejected: it is AGPL-3.0, and SSIMULACRA2 correlates better with human ratings.
+fast-ssim2 implements SSIMULACRA2 and agrees with the libjxl reference to within 0.04 across a quality sweep, while running about twice as fast as the `rust-av/ssimulacra2` crate on Apple Silicon. It is pure Rust with `#![forbid(unsafe_code)]` and dispatches NEON at runtime.
 
-Distribution is a notarized Developer ID build, outside the Mac App Store. Overwriting files in place and running bundled helper executables both require an unsandboxed application.
+squint is GPL-3.0 because it links libimagequant, which is the only PNG quantizer implementing a quality floor. GPL-3 rather than GPL-2 is required: resvg is Apache-2.0, which is incompatible with GPL-2.
+
+`dssim` was measured at roughly five times faster than SSIMULACRA2 and remains a candidate for search bracketing. It is not the primary metric, because its `1/SSIM-1` output is uncalibrated and carries no published visually-lossless threshold.
+
+GPU evaluation was rejected. See `docs/` for the record.
+
+## Modes
+
+Every image is judged in one of three modes. The mode belongs to a preset, not to a global setting.
+
+**Fast** is the default. It encodes once at a fixed quality and evaluates no metric, which matches ImageOptim's speed.
+
+**Balanced** searches for a quality target using a downscaled proxy, then encodes at full resolution.
+
+**Quality** searches at full resolution and returns the smallest file that still meets the perceptual target.
+
+## Measured cost
+
+One perceptual comparison of a 12-megapixel photograph takes about 1.6 seconds with `rust-av/ssimulacra2`, about 0.76 seconds with fast-ssim2, and about 0.30 seconds with dssim. Measured on an Apple M1. The metric dominates: encoding and decoding the same image costs about 74 milliseconds.
+
+Perceptual targeting must be refused below 113 pixels on the shorter side. SSIMULACRA2 misindexes its internal weight table below that size and returns scores that are not meaningful.
+
+Both sides of a comparison must be interpreted in the same colour space. Comparing a Display P3 reference against an untagged candidate shifts the score by 1.5 to 4.4 points, which is larger than the difference between any two implementations.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+GPL-3.0-or-later. See [LICENSE](LICENSE).
