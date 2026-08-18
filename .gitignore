@@ -64,3 +64,6 @@ fastlane/test_output
 # Design working files (concept sheets, published as artifacts)
 design/icon-concepts.html
 design/icon-slit-variations.html
+
+# Rust build output
+core/target/
