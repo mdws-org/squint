@@ -173,3 +173,44 @@ pub fn optimize_png(
 
     Ok(PngResult { data: optimized, score, quantized })
 }
+
+
+/// Chunks a PNG needs in order to render. Everything else is metadata.
+const PNG_KEEP: [&[u8; 4]; 8] = [
+    b"IHDR", b"PLTE", b"IDAT", b"IEND", // structure and pixels
+    b"tRNS", b"iCCP", b"sRGB", b"gAMA", // transparency and colour
+];
+
+/// Remove metadata chunks from a PNG without touching the pixels.
+///
+/// `IDAT` is copied unchanged, so the image is pixel-identical. Dropped chunks
+/// include `tEXt`, `iTXt` and `zTXt` (where generators write prompts and seeds),
+/// `eXIf` (location and camera data), `tIME`, and `caBX` (C2PA credentials).
+///
+/// The colour chunks are kept, for the same reason the JPEG path keeps ICC.
+pub fn strip_png(png: &[u8]) -> Option<Vec<u8>> {
+    const SIGNATURE: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    if !png.starts_with(SIGNATURE) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(png.len());
+    out.extend_from_slice(SIGNATURE);
+
+    let mut i = SIGNATURE.len();
+    while i + 12 <= png.len() {
+        let len = u32::from_be_bytes([png[i], png[i + 1], png[i + 2], png[i + 3]]) as usize;
+        let kind = &png[i + 4..i + 8];
+        let total = 12 + len;
+        if i + total > png.len() {
+            break;
+        }
+        if PNG_KEEP.iter().any(|k| k[..] == *kind) {
+            out.extend_from_slice(&png[i..i + total]);
+        }
+        i += total;
+        if kind == b"IEND" {
+            break;
+        }
+    }
+    Some(out)
+}

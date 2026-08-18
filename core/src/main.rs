@@ -3,7 +3,7 @@
 //! This drives the engine without a user interface so that quality and speed can
 //! be measured against real photographs before any application exists.
 
-use squint_core::{search, encode_jpeg, score, extract_icc, extract_orientation, png, Image, JPEG_SCORE_CEILING};
+use squint_core::{search, encode_jpeg, score, extract_icc, extract_orientation, optimize, png, Image, Mode, JPEG_SCORE_CEILING};
 use std::time::Instant;
 
 fn usage() -> ! {
@@ -57,6 +57,28 @@ fn main() {
             std::process::exit(1)
         }
     };
+    if mode == "strip" {
+        let t0 = Instant::now();
+        match optimize(&bytes, Mode::Strip, 0.0, 0.0, None) {
+            Ok(r) => {
+                println!(
+                    "{}  {:>7.0} KB -> {:>7.0} KB  {:>5.1}%  metadata removed, pixels untouched  {:.3}s",
+                    path,
+                    bytes.len() as f64 / 1024.0,
+                    r.data.len() as f64 / 1024.0,
+                    100.0 * r.data.len() as f64 / bytes.len() as f64,
+                    t0.elapsed().as_secs_f64()
+                );
+                if let Some(o) = &out_path {
+                    std::fs::write(o, &r.data).unwrap_or_else(|e| { eprintln!("write failed: {e}"); std::process::exit(1) });
+                    println!("         wrote {o}");
+                }
+            }
+            Err(e) => { eprintln!("{e}"); std::process::exit(1) }
+        }
+        return;
+    }
+
     // PNG takes a different path: palette quantization rather than a quality dial,
     // and an alpha channel the metric cannot see directly.
     if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {

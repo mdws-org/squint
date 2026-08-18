@@ -28,6 +28,14 @@ final class ServiceProvider: NSObject {
         run(pasteboard, mode: .quality, error: error)
     }
 
+    @objc func stripMetadata(
+        _ pasteboard: NSPasteboard,
+        userData: String?,
+        error: AutoreleasingUnsafeMutablePointer<NSString>
+    ) {
+        run(pasteboard, mode: .strip, error: error)
+    }
+
     private func run(
         _ pasteboard: NSPasteboard,
         mode: Engine.Mode,

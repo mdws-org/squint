@@ -37,8 +37,9 @@ final class JobQueue: ObservableObject {
     var concurrencyLimit: Int {
         let cores = ProcessInfo.processInfo.activeProcessorCount
         switch mode {
-        case .fast:
-            // Measured at 167 MB per job, so memory is not the binding constraint.
+        case .fast, .strip:
+            // Fast peaks at 167 MB per job and strip does not decode at all, so
+            // memory is not the binding constraint for either.
             return cores
         case .quality:
             let usable = UInt64(Double(ProcessInfo.processInfo.physicalMemory) * Self.memoryShare)
