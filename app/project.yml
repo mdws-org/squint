@@ -1,0 +1,45 @@
+name: squint
+options:
+  bundleIdPrefix: net.mdws
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+
+targets:
+  squint:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources
+    settings:
+      base:
+        PRODUCT_NAME: squint
+        PRODUCT_BUNDLE_IDENTIFIER: net.mdws.squint
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.0"
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/Squint-Bridging-Header.h
+        HEADER_SEARCH_PATHS: $(SRCROOT)/../core/include
+        LIBRARY_SEARCH_PATHS: $(SRCROOT)/../core/target/release
+        OTHER_LDFLAGS: -lsquint_core
+        # Deliberately unsandboxed. Overwriting arbitrary files in place, which is
+        # the whole point of the app, is not possible under the App Sandbox.
+        ENABLE_APP_SANDBOX: NO
+        ENABLE_HARDENED_RUNTIME: YES
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGNING_ALLOWED: NO
+    info:
+      path: Info.plist
+      properties:
+        CFBundleName: squint
+        LSMinimumSystemVersion: "14.0"
+        LSApplicationCategoryType: public.app-category.graphics-design
+        NSHighResolutionCapable: true
+    preBuildScripts:
+      - name: Build the engine
+        basedOnDependencyAnalysis: false
+        script: |
+          export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
+          cd "$SRCROOT/../core"
+          cargo build --release

@@ -5,6 +5,7 @@
 //! a SSIMULACRA2 threshold.
 
 mod metadata;
+pub mod ffi;
 pub mod png;
 pub use metadata::{extract_icc, extract_orientation};
 
@@ -301,6 +302,72 @@ fn interpolate(probes: &[Probe], target: f64) -> Option<f32> {
     }
     let t = (target - b.score) / (a.score - b.score);
     Some((b.quality as f64 + t * (a.quality - b.quality) as f64) as f32)
+}
+
+/// How hard to work.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Mode {
+    /// Encode once at a fixed quality and evaluate no metric. ImageOptim's speed.
+    Fast,
+    /// Search for the smallest file meeting a perceptual target.
+    Quality,
+}
+
+/// The outcome of optimizing one file.
+pub struct Optimized {
+    pub data: Vec<u8>,
+    /// Absent in fast mode, and for images too small to score.
+    pub score: Option<f64>,
+    pub original_bytes: usize,
+}
+
+/// Optimize an encoded image, dispatching on its format.
+///
+/// This is the single entry point. The command line harness and the C API both
+/// call it, so the application cannot drift away from what the CLI measures.
+pub fn optimize(
+    bytes: &[u8],
+    mode: Mode,
+    target: f64,
+    fixed_quality: f32,
+    png_min_quality: Option<u8>,
+) -> Result<Optimized, Error> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        let effort = match mode {
+            Mode::Fast => png::Effort::Quick,
+            Mode::Quality => png::Effort::Thorough,
+        };
+        let r = png::optimize_png(bytes, png_min_quality, mode == Mode::Quality, effort)?;
+        return Ok(Optimized { data: r.data, score: r.score, original_bytes: bytes.len() });
+    }
+
+    let mut image = Image::decode(bytes)?;
+    let icc = extract_icc(bytes);
+    image.apply_orientation(extract_orientation(bytes));
+
+    match mode {
+        Mode::Fast => {
+            let data = encode_jpeg(&image, fixed_quality, icc.as_deref())?;
+            if data.len() >= bytes.len() {
+                return Err(Error::NoSmallerResult {
+                    best_bytes: data.len(),
+                    original_bytes: bytes.len(),
+                });
+            }
+            Ok(Optimized { data, score: None, original_bytes: bytes.len() })
+        }
+        Mode::Quality => {
+            if target > JPEG_SCORE_CEILING {
+                return Err(Error::Unreachable { best_score: JPEG_SCORE_CEILING });
+            }
+            let r = search(&image, target, 6, bytes.len(), icc.as_deref())?;
+            Ok(Optimized {
+                score: Some(r.chosen.score),
+                data: r.data,
+                original_bytes: bytes.len(),
+            })
+        }
+    }
 }
 
 #[cfg(test)]
