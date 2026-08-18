@@ -1,4 +1,4 @@
-name: squint
+name: Squint
 options:
   bundleIdPrefix: net.mdws
   deploymentTarget:
@@ -6,7 +6,7 @@ options:
   createIntermediateGroups: true
 
 targets:
-  squint:
+  Squint:
     type: application
     platform: macOS
     sources:
@@ -15,7 +15,7 @@ targets:
         buildPhase: resources
     settings:
       base:
-        PRODUCT_NAME: squint
+        PRODUCT_NAME: Squint
         PRODUCT_BUNDLE_IDENTIFIER: net.mdws.squint
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"
@@ -34,18 +34,22 @@ targets:
     info:
       path: Info.plist
       properties:
-        CFBundleName: squint
+        CFBundleName: Squint
         CFBundleIconFile: squint
         LSMinimumSystemVersion: "14.0"
         LSApplicationCategoryType: public.app-category.graphics-design
         NSHighResolutionCapable: true
-        # The Finder right-click entry. NSMessage must match the @objc method on
-        # ServiceProvider; a mismatch fails silently with no registration error.
+        # The Finder right-click entries, one per mode. Services are listed
+        # alphabetically by title; there is no ordering key, so placement in the
+        # menu cannot be controlled beyond the name itself.
+        #
+        # NSMessage must match the @objc method name on ServiceProvider. A
+        # mismatch fails silently: the item appears and does nothing.
         NSServices:
           - NSMenuItem:
-              default: squint
-            NSMessage: optimizeFiles
-            NSPortName: squint
+              default: Squint (Fast)
+            NSMessage: optimizeFast
+            NSPortName: Squint
             NSSendFileTypes:
               - public.jpeg
               - public.png
@@ -53,6 +57,17 @@ targets:
               NSApplicationIdentifier: com.apple.finder
               NSTextContent: FilePath
             NSServiceDescription: Shrink images in place, keeping the colour profile
+          - NSMenuItem:
+              default: Squint (Quality)
+            NSMessage: optimizeQuality
+            NSPortName: Squint
+            NSSendFileTypes:
+              - public.jpeg
+              - public.png
+            NSRequiredContext:
+              NSApplicationIdentifier: com.apple.finder
+              NSTextContent: FilePath
+            NSServiceDescription: Shrink images to a perceptual quality target
     preBuildScripts:
       - name: Build the engine
         basedOnDependencyAnalysis: false
