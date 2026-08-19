@@ -10,7 +10,7 @@ Working, unreleased. JPEG and PNG are implemented. There is no signed build and 
 
 What runs today: a drag and drop window, three Finder Services entries, in-place replacement that preserves Finder tags, and a command line harness for measurement.
 
-What does not exist yet: HEIC, TIFF, WebP, AVIF, GIF and SVG input; Balanced mode; recipes; WebP and AVIF output; PDF; automatic updates.
+What does not exist yet: HEIC, TIFF, WebP, AVIF, GIF and SVG input; Balanced mode; recipes; WebP and AVIF output; PDF; automatic updates; HDR gain maps through a re-encode, which Strip keeps but Fast and Quality report as removed.
 
 ## Why this exists
 
@@ -63,7 +63,7 @@ Note that an already-open Get Info window will keep showing camera and location 
 
 **Quality** searches at full resolution and returns the smallest file that still meets the perceptual target.
 
-**Strip** removes metadata and nothing else. The pixels are copied unchanged, so the result is identical to the input image, and only the container shrinks.
+**Strip** removes metadata and nothing else. The pixels are copied unchanged, so the result is identical to the input image, and only the container shrinks. An HDR gain map is kept, because it is part of the picture rather than a record of where it was taken.
 
 **Balanced** is designed but not implemented. It will search a downscaled proxy and then encode at full resolution.
 
@@ -71,21 +71,35 @@ Note that an already-open Get Info window will keep showing camera and location 
 
 Fast and Quality remove metadata as a consequence of re-encoding: the file is rebuilt from pixels, so nothing survives that is not deliberately written. Strip removes the same things without re-encoding.
 
-For JPEG, every `APPn` segment is dropped except the ICC colour profile, along with comment segments. That covers EXIF and its embedded thumbnail, XMP, IPTC, Multi Picture Format, HDR gain maps, Apple's rotation block, and C2PA content credentials. None of them are recognised individually. Anything not deliberately kept is removed, which is why provenance formats that did not exist when this was written will also go.
+For JPEG, every `APPn` segment is dropped except the ICC colour profile, along with comment segments. That covers EXIF and its embedded thumbnail, XMP, IPTC, Apple's rotation block, and C2PA content credentials. None of them are recognised individually. Anything not deliberately kept is removed, which is why provenance formats that did not exist when this was written will also go. The exception is the HDR gain map, which is put back afterwards: see below.
 
 For PNG, only the chunks needed to render are kept: `IHDR`, `PLTE`, `IDAT`, `IEND`, `tRNS`, `iCCP`, `sRGB` and `gAMA`. Dropped chunks include `tEXt`, `iTXt` and `zTXt`, where image generators write prompts and seeds, along with `eXIf`, `tIME` and the `caBX` chunk carrying C2PA.
 
 The colour profile is always kept. It carries no personal information, and discarding it shifts the colours of every photograph taken on a modern phone.
 
-Measured on a 4032x3024 iPhone photograph: 1,465,453 bytes to 1,346,322 in 0.004 seconds, with only the colour profile surviving. Scoring the result against the original returns exactly 100, confirming the pixels are untouched.
+Strip also writes back a 32 byte EXIF block holding the orientation and nothing else. Since it copies the pixels through untouched, that tag is the only thing saying which way up they go, and a portrait photograph stripped without it comes back on its side. Which way up a picture goes identifies nobody; GPS, camera identity and Apple's maker note are still gone. Fast and Quality need no such block, because they turn the pixels themselves.
 
-Apple writes trailing data past the end-of-image marker, where a second embedded image and further XMP live. Stripping stops at that marker rather than copying to the end of the file. A first implementation did not, and XMP survived.
+Measured on a 4032x3024 iPhone photograph: 1,465,453 bytes to 1,442,452, with the colour profile and the gain map surviving and nothing else. Scoring the result against the original returns exactly 100, confirming the pixels are untouched.
+
+Apple writes trailing data past the end-of-image marker, where the gain map and further XMP live. Stripping stops at that marker rather than copying to the end of the file. A first implementation did not, and XMP survived.
+
+## High dynamic range
+
+A photograph from a recent iPhone is two images in one file. The primary is the standard range picture; behind it sits a smaller greyscale gain map saying how far to lift each pixel on a display that can show more. The two are bound together by a Multi Picture Format index. On the sample photograph above the map is 2016x1512 and 96,772 bytes, about a fifteenth of the file.
+
+Losing it is quiet. The file still opens, still looks right on an ordinary display, and looks flat on the display it was taken for. That is the same failure as dropping the colour profile, so it is tracked and reported on every result: the window says `HDR kept` or `HDR removed`, and the command line harness prints the same.
+
+**Strip keeps the map.** It is picture data, not a record of where the picture was taken. Its own EXIF is removed and the parameters describing how to apply it are kept, since without those it is an unreadable grey picture. The result was checked against ImageIO, which reads the map back at full size and reports the headroom, exactly as it does for the untouched original.
+
+**Fast and Quality do not, yet.** The container Squint builds is sound: the same index and the same map, attached to a primary encoded by libjpeg-turbo or to the untouched primary that Strip produces, are read by ImageIO without complaint. Attached to a primary that mozjpeg encoded, macOS will not open the file at all, and `sips` reports nothing either. Substituting the colour profile, the quantization tables, the scan mode and the segment order one at a time changed nothing, which places the trigger in mozjpeg's entropy-coded output. A file that will not open is a worse outcome than one that has lost its extra range, so these modes report the loss instead of causing it silently. Carrying the map through a re-encode needs a different encoder for the primary and is not yet done.
 
 ## Design rules
 
 These hold across every release.
 
-**Never strip the colour profile.** Remove GPS, camera, and timestamp metadata. Keep ICC. Bake orientation into the pixels rather than leaving it as a tag.
+**Never strip the colour profile.** Remove GPS, camera, and timestamp metadata. Keep ICC. Where the pixels are re-encoded, turn them the right way up and write no orientation tag; where they are copied through untouched, keep the tag, because it is the only thing saying which way up they go.
+
+**Never change how a picture looks without saying so.** Colour profiles and gain maps both decide appearance rather than describe origin. Where one cannot be carried across, the result says which, rather than leaving it to be noticed on a better display months later.
 
 **Never grow a file.** A source that is already compressed can require more bytes to match at a high target. When that happens the original is kept.
 

@@ -99,7 +99,8 @@ final class JobQueue: ObservableObject {
                 return .done(
                     bytes: result.data.count,
                     originalBytes: result.originalBytes,
-                    score: result.score
+                    score: result.score,
+                    hdr: result.hdr
                 )
             } catch let failure as Engine.Failure {
                 return failure.isAlreadyOptimal ? .alreadyOptimal : .failed(failure.message)

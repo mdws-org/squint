@@ -6,6 +6,7 @@
 
 mod metadata;
 pub mod ffi;
+pub mod gainmap;
 pub mod png;
 pub use metadata::{extract_icc, extract_orientation};
 
@@ -97,29 +98,10 @@ impl Image {
         if !(2..=8).contains(&orientation) {
             return;
         }
-        let (w, h) = (self.width, self.height);
-        let transposed = matches!(orientation, 5 | 6 | 7 | 8);
-        let (nw, nh) = if transposed { (h, w) } else { (w, h) };
-        let mut out = vec![[0u8; 3]; w * h];
-
-        for y in 0..h {
-            for x in 0..w {
-                let (nx, ny) = match orientation {
-                    2 => (w - 1 - x, y),
-                    3 => (w - 1 - x, h - 1 - y),
-                    4 => (x, h - 1 - y),
-                    5 => (y, x),
-                    6 => (h - 1 - y, x),
-                    7 => (h - 1 - y, w - 1 - x),
-                    8 => (y, w - 1 - x),
-                    _ => (x, y),
-                };
-                out[ny * nw + nx] = self.pixels[y * w + x];
-            }
-        }
-        self.pixels = out;
-        self.width = nw;
-        self.height = nh;
+        let (pixels, w, h) = oriented(&self.pixels, self.width, self.height, orientation);
+        self.pixels = pixels;
+        self.width = w;
+        self.height = h;
     }
 
     fn as_img(&self) -> ImgVec<[u8; 3]> {
@@ -134,6 +116,43 @@ impl Image {
         }
         out
     }
+}
+
+/// Apply an EXIF orientation to a grid of pixels, returning it and its new size.
+///
+/// Written once and used for both the picture and its gain map. The two are a
+/// matched pair, so a map turned differently from the image it lifts would
+/// brighten the wrong corner of it.
+pub fn oriented<P: Copy + Default>(
+    pixels: &[P],
+    width: usize,
+    height: usize,
+    orientation: u16,
+) -> (Vec<P>, usize, usize) {
+    if !(2..=8).contains(&orientation) {
+        return (pixels.to_vec(), width, height);
+    }
+    let (w, h) = (width, height);
+    let transposed = matches!(orientation, 5 | 6 | 7 | 8);
+    let (nw, nh) = if transposed { (h, w) } else { (w, h) };
+    let mut out = vec![P::default(); w * h];
+
+    for y in 0..h {
+        for x in 0..w {
+            let (nx, ny) = match orientation {
+                2 => (w - 1 - x, y),
+                3 => (w - 1 - x, h - 1 - y),
+                4 => (x, h - 1 - y),
+                5 => (y, x),
+                6 => (h - 1 - y, x),
+                7 => (h - 1 - y, w - 1 - x),
+                8 => (y, w - 1 - x),
+                _ => (x, y),
+            };
+            out[ny * nw + nx] = pixels[y * w + x];
+        }
+    }
+    (out, nw, nh)
 }
 
 /// Score a candidate against its reference. 100 is identical, 90 is visually
@@ -165,6 +184,21 @@ pub fn encode_jpeg(image: &Image, quality: f32, icc: Option<&[u8]>) -> Result<Ve
     }))
     .map_err(|_| Error::Encode("mozjpeg panicked".into()))?
     .map_err(|e| Error::Encode(e.to_string()))
+}
+
+/// Whether a file carries an HDR gain map, without lifting it out.
+pub fn has_gain_map(bytes: &[u8]) -> bool {
+    gainmap::extract(bytes).is_some()
+}
+
+/// Strip a gain map's metadata while keeping what makes it usable.
+///
+/// The general stripper removes every container it is not told to keep, which
+/// for a gain map would take its parameters with the camera identity. They go
+/// back on afterwards.
+fn strip_gain_map(map: &[u8]) -> Option<Vec<u8>> {
+    let bare = metadata::strip_jpeg(map)?;
+    gainmap::insert_segments(&bare, &gainmap::descriptive_segments(map))
 }
 
 /// One encode plus one measurement.
@@ -316,11 +350,27 @@ pub enum Mode {
     Strip,
 }
 
+/// What became of a high dynamic range photograph's gain map.
+///
+/// Reported on every result so that losing the extra range is never something a
+/// file does quietly. A picture that comes back flat on the display it was taken
+/// for should say so.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Hdr {
+    /// The source carried no gain map.
+    Absent,
+    /// The source carried one and the output carries it too.
+    Preserved,
+    /// The source carried one and the output does not.
+    Dropped,
+}
+
 /// The outcome of optimizing one file.
 pub struct Optimized {
     pub data: Vec<u8>,
     /// Absent in fast mode, and for images too small to score.
     pub score: Option<f64>,
+    pub hdr: Hdr,
     pub original_bytes: usize,
 }
 
@@ -336,12 +386,36 @@ pub fn optimize(
     png_min_quality: Option<u8>,
 ) -> Result<Optimized, Error> {
     if mode == Mode::Strip {
-        let stripped = if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
-            png::strip_png(bytes)
+        let (stripped, hdr) = if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+            (png::strip_png(bytes), Hdr::Absent)
         } else {
-            metadata::strip_jpeg(bytes)
-        }
-        .ok_or_else(|| Error::Decode("not a JPEG or PNG".into()))?;
+            // The orientation tag goes back on before anything else, because it
+            // lengthens the picture and the gain map's index records where the
+            // picture ends.
+            let bare = metadata::strip_jpeg(bytes).and_then(|stripped| {
+                match extract_orientation(bytes) {
+                    1 => Some(stripped),
+                    turned => gainmap::insert_segments(
+                        &stripped,
+                        &[(0xE1, metadata::orientation_segment(turned))],
+                    ),
+                }
+            });
+            // A gain map is picture data, not metadata. Stripping a photograph
+            // of its location should not also take away half its brightness.
+            match (bare, gainmap::extract(bytes)) {
+                (Some(bare), Some(map)) => {
+                    let cleaned = strip_gain_map(&map.jpeg)
+                        .ok_or_else(|| Error::Encode("could not strip the gain map".into()))?;
+                    match gainmap::attach(&bare, &cleaned, map.iso_segment.as_deref()) {
+                        Some(joined) => (Some(joined), Hdr::Preserved),
+                        None => (Some(bare), Hdr::Dropped),
+                    }
+                }
+                (bare, _) => (bare, Hdr::Absent),
+            }
+        };
+        let stripped = stripped.ok_or_else(|| Error::Decode("not a JPEG or PNG".into()))?;
 
         if stripped.len() >= bytes.len() {
             return Err(Error::NoSmallerResult {
@@ -349,7 +423,7 @@ pub fn optimize(
                 original_bytes: bytes.len(),
             });
         }
-        return Ok(Optimized { data: stripped, score: None, original_bytes: bytes.len() });
+        return Ok(Optimized { data: stripped, score: None, hdr, original_bytes: bytes.len() });
     }
 
     if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
@@ -361,37 +435,55 @@ pub fn optimize(
             Mode::Fast | Mode::Strip => png::Effort::Quick,
         };
         let r = png::optimize_png(bytes, png_min_quality, mode == Mode::Quality, effort)?;
-        return Ok(Optimized { data: r.data, score: r.score, original_bytes: bytes.len() });
+        return Ok(Optimized {
+            data: r.data,
+            score: r.score,
+            hdr: Hdr::Absent,
+            original_bytes: bytes.len(),
+        });
     }
 
     let mut image = Image::decode(bytes)?;
     let icc = extract_icc(bytes);
-    image.apply_orientation(extract_orientation(bytes));
+    let orientation = extract_orientation(bytes);
+    image.apply_orientation(orientation);
 
-    match mode {
+    let (data, score) = match mode {
         // Strip is handled above and never reaches this match.
-        Mode::Fast | Mode::Strip => {
-            let data = encode_jpeg(&image, fixed_quality, icc.as_deref())?;
-            if data.len() >= bytes.len() {
-                return Err(Error::NoSmallerResult {
-                    best_bytes: data.len(),
-                    original_bytes: bytes.len(),
-                });
-            }
-            Ok(Optimized { data, score: None, original_bytes: bytes.len() })
-        }
+        Mode::Fast | Mode::Strip => (encode_jpeg(&image, fixed_quality, icc.as_deref())?, None),
         Mode::Quality => {
             if target > JPEG_SCORE_CEILING {
                 return Err(Error::Unreachable { best_score: JPEG_SCORE_CEILING });
             }
             let r = search(&image, target, 6, bytes.len(), icc.as_deref())?;
-            Ok(Optimized {
-                score: Some(r.chosen.score),
-                data: r.data,
-                original_bytes: bytes.len(),
-            })
+            (r.data, Some(r.chosen.score))
         }
+    };
+
+    // A gain map cannot yet be carried onto a re-encoded picture, so say so
+    // rather than losing the range quietly.
+    //
+    // The container squint builds is sound: the same index and the same map,
+    // attached to a primary from libjpeg-turbo or to the untouched primary that
+    // strip mode produces, are read by ImageIO without complaint. Attached to a
+    // primary mozjpeg encoded, macOS will not open the file at all — no
+    // properties, no decode, and `sips` reports nothing either. What triggers it
+    // lives in mozjpeg's entropy-coded output: the colour profile, the
+    // quantization tables, the scan mode and the segment order were each
+    // substituted in turn and none of them made the difference. An unopenable
+    // file is a worse outcome than one that has lost its extra range, so the
+    // map is left off until the picture can be encoded some other way.
+    let hdr = if has_gain_map(bytes) { Hdr::Dropped } else { Hdr::Absent };
+
+    // Checked on the finished file rather than the picture alone: carrying the
+    // gain map costs bytes, and an optimizer must never grow a file.
+    if data.len() >= bytes.len() {
+        return Err(Error::NoSmallerResult {
+            best_bytes: data.len(),
+            original_bytes: bytes.len(),
+        });
     }
+    Ok(Optimized { data, score, hdr, original_bytes: bytes.len() })
 }
 
 #[cfg(test)]
@@ -501,6 +593,18 @@ mod tests {
     #[test]
     fn stripping_rejects_input_that_is_not_a_jpeg() {
         assert!(metadata::strip_jpeg(b"not a jpeg").is_none());
+    }
+
+    #[test]
+    fn the_orientation_squint_writes_is_the_orientation_it_reads() {
+        for turned in [2u16, 3, 4, 5, 6, 7, 8] {
+            let payload = metadata::orientation_segment(turned);
+            let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE1];
+            jpeg.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+            jpeg.extend_from_slice(&payload);
+            jpeg.extend_from_slice(&[0xFF, 0xD9]);
+            assert_eq!(extract_orientation(&jpeg), turned);
+        }
     }
 
     #[test]

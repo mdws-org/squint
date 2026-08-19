@@ -108,6 +108,31 @@ pub fn extract_orientation(jpeg: &[u8]) -> u16 {
 }
 
 
+/// Build an APP1 payload carrying nothing but the EXIF orientation.
+///
+/// Strip copies the pixels through untouched, which means the tag saying which
+/// way up they go has to survive with them. Left out, a portrait photograph
+/// comes back on its side: the pixels are identical and the picture is wrong.
+/// The re-encoding modes have no such problem, because they turn the pixels
+/// themselves and then need no tag.
+///
+/// Everything else EXIF carries is left behind. Which way up a picture goes
+/// identifies nobody.
+pub fn orientation_segment(orientation: u16) -> Vec<u8> {
+    let mut p = Vec::with_capacity(32);
+    p.extend_from_slice(b"Exif\0\0");
+    p.extend_from_slice(b"MM\x00\x2a\x00\x00\x00\x08"); // big endian, first entry at 8
+    p.extend_from_slice(&1u16.to_be_bytes()); // one field
+    p.extend_from_slice(&0x0112u16.to_be_bytes()); // orientation
+    p.extend_from_slice(&3u16.to_be_bytes()); // SHORT
+    p.extend_from_slice(&1u32.to_be_bytes());
+    // A SHORT sits in the first two bytes of the four byte value field.
+    p.extend_from_slice(&orientation.to_be_bytes());
+    p.extend_from_slice(&[0, 0]);
+    p.extend_from_slice(&0u32.to_be_bytes()); // no further block
+    p
+}
+
 /// Remove every metadata container from a JPEG without touching the pixels.
 ///
 /// The entropy-coded scan is copied byte for byte, so the result is
