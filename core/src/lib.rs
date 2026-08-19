@@ -595,6 +595,90 @@ mod tests {
         assert!(metadata::strip_jpeg(b"not a jpeg").is_none());
     }
 
+    /// The output of a failed walk used to be returned as a success. Since the
+    /// caller writes that over the original, every one of these refusals is a
+    /// photograph not destroyed.
+    #[test]
+    fn a_png_that_does_not_walk_cleanly_is_refused_rather_than_truncated() {
+        let good = png_with_text();
+
+        // A chunk claiming to be longer than the file.
+        let mut lying = good.clone();
+        lying[8..12].copy_from_slice(&0xFFFF_u32.to_be_bytes());
+        assert!(png::strip_png(&lying).is_none(), "a bad length must refuse");
+
+        // Cut short, so the end marker never arrives.
+        assert!(png::strip_png(&good[..good.len() - 4]).is_none(), "truncation must refuse");
+
+        // Structurally walkable, but carrying no pixels.
+        let mut headless = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        headless.extend_from_slice(&0u32.to_be_bytes());
+        headless.extend_from_slice(b"IEND");
+        headless.extend_from_slice(&[0, 0, 0, 0]);
+        assert!(png::strip_png(&headless).is_none(), "a file with no pixels must refuse");
+    }
+
+    #[test]
+    fn a_jpeg_whose_segment_length_is_wrong_is_refused_rather_than_truncated() {
+        // A marker, an APP1 that lies about its length by one byte, then a scan.
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x08];
+        jpeg.extend_from_slice(b"Exif\0\0");
+        jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x11, 0x22, 0xFF, 0xD9]);
+        assert!(metadata::strip_jpeg(&jpeg).is_some(), "the control must strip");
+
+        let mut off_by_one = jpeg.clone();
+        off_by_one[5] = 0x09; // the walk now lands one byte past the next marker
+        assert!(metadata::strip_jpeg(&off_by_one).is_none());
+
+        let mut runs_past_the_end = jpeg.clone();
+        runs_past_the_end[4..6].copy_from_slice(&0xFF00_u16.to_be_bytes());
+        assert!(metadata::strip_jpeg(&runs_past_the_end).is_none());
+    }
+
+    #[test]
+    fn a_jpeg_with_no_end_marker_is_refused() {
+        let jpeg = vec![0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x02, 0x11, 0x22, 0x33];
+        assert!(metadata::strip_jpeg(&jpeg).is_none());
+    }
+
+    /// The profile is kept in APP2, where it is read from, and nowhere else.
+    #[test]
+    fn a_profile_tag_on_some_other_segment_does_not_survive() {
+        // APP13 carrying the profile tag: length covers the twelve payload bytes.
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xED, 0x00, 0x0E];
+        jpeg.extend_from_slice(b"ICC_PROFILE\0");
+        jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x11, 0x22, 0xFF, 0xD9]);
+        let out = metadata::strip_jpeg(&jpeg).expect("walks cleanly");
+        assert!(!out.windows(11).any(|w| w == b"ICC_PROFILE"));
+    }
+
+    #[test]
+    fn a_png_re_encode_carries_the_colour_chunks_across() {
+        let source = png_with_text();
+        // Stand in for the encoder's output: same picture, no colour chunks.
+        let mut bare = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        for (kind, data) in [(&b"IHDR"[..], &[0u8; 13][..]), (b"IDAT", b"pixels"), (b"IEND", b"")] {
+            bare.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            bare.extend_from_slice(kind);
+            bare.extend_from_slice(data);
+            bare.extend_from_slice(&[0, 0, 0, 0]);
+        }
+        assert!(!bare.windows(4).any(|w| w == b"iCCP"), "the stand-in starts untagged");
+
+        let carried = png::colour_chunks(&source);
+        let out = png::with_colour_chunks(&bare, &carried).expect("valid png");
+
+        assert!(out.windows(4).any(|w| w == b"iCCP"), "the profile did not come across");
+        // It has to precede the pixels, or a decoder will not apply it.
+        let icc = out.windows(4).position(|w| w == b"iCCP").unwrap();
+        let idat = out.windows(4).position(|w| w == b"IDAT").unwrap();
+        assert!(icc < idat, "the profile must come before the pixels");
+
+        // Applying it twice must not produce two of anything.
+        let again = png::with_colour_chunks(&out, &carried).expect("valid png");
+        assert_eq!(again.len(), out.len(), "a second pass duplicated a chunk");
+    }
+
     #[test]
     fn the_orientation_squint_writes_is_the_orientation_it_reads() {
         for turned in [2u16, 3, 4, 5, 6, 7, 8] {

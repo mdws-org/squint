@@ -111,6 +111,83 @@ pub fn quantize(image: &RgbaImage, min_quality: u8, max_quality: u8) -> Result<R
     Ok(RgbaImage { pixels, width: image.width, height: image.height })
 }
 
+/// The signature every PNG opens with.
+const SIGNATURE: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+
+/// Walk a PNG's chunks, yielding `(kind, whole_chunk_bytes)`.
+///
+/// Returns `None` rather than a partial list if the file does not walk cleanly,
+/// because a chunk length that runs past the end of the file means the rest of
+/// the walk is reading whatever happens to be there.
+fn chunks(png: &[u8]) -> Option<Vec<(&[u8], &[u8])>> {
+    if !png.starts_with(SIGNATURE) {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut i = SIGNATURE.len();
+    while i + 12 <= png.len() {
+        let len = u32::from_be_bytes([png[i], png[i + 1], png[i + 2], png[i + 3]]) as usize;
+        let total = len.checked_add(12)?;
+        if i + total > png.len() {
+            return None;
+        }
+        let kind = &png[i + 4..i + 8];
+        out.push((kind, &png[i..i + total]));
+        i += total;
+        if kind == b"IEND" {
+            return Some(out);
+        }
+    }
+    None // ran out of file without reaching the end marker
+}
+
+/// Chunks that decide how a PNG's colours are read.
+///
+/// The re-encoder writes none of these, so without carrying them across, a
+/// Display P3 screenshot comes back untagged and is read as sRGB. That is the
+/// ImageOptim behaviour this project exists to correct, and it was reaching the
+/// PNG path unnoticed because only the JPEG path was ever checked for it.
+const PNG_COLOUR: [&[u8; 4]; 5] = [b"iCCP", b"sRGB", b"gAMA", b"cHRM", b"cICP"];
+
+/// Lift the colour chunks out of a PNG, whole.
+///
+/// Copied verbatim, with their length and checksum, so nothing has to be
+/// recomputed: the bytes that described the colour space in the source describe
+/// it in the output.
+pub fn colour_chunks(png: &[u8]) -> Vec<Vec<u8>> {
+    let Some(found) = chunks(png) else { return Vec::new() };
+    found
+        .into_iter()
+        .filter(|(kind, _)| PNG_COLOUR.iter().any(|k| k[..] == **kind))
+        .map(|(_, whole)| whole.to_vec())
+        .collect()
+}
+
+/// Put colour chunks back, directly after `IHDR` where the format requires them.
+///
+/// A chunk whose kind is already present is skipped, so this cannot produce a
+/// file with two of anything.
+pub fn with_colour_chunks(png: &[u8], carried: &[Vec<u8>]) -> Option<Vec<u8>> {
+    if carried.is_empty() {
+        return Some(png.to_vec());
+    }
+    let present = chunks(png)?;
+    let header = present.first().filter(|(kind, _)| *kind == b"IHDR")?.1.len();
+    let at = SIGNATURE.len() + header;
+
+    let mut out = Vec::with_capacity(png.len() + carried.iter().map(Vec::len).sum::<usize>());
+    out.extend_from_slice(&png[..at]);
+    for chunk in carried {
+        let kind = chunk.get(4..8)?;
+        if present.iter().any(|(k, _)| *k == kind) {
+            continue;
+        }
+        out.extend_from_slice(chunk);
+    }
+    out.extend_from_slice(&png[at..]);
+    Some(out)
+}
+
 /// How hard to work at lossless recompression.
 ///
 /// The cost is not symmetric with the gain. On a 12 megapixel image the thorough
@@ -158,6 +235,12 @@ pub fn optimize_png(
     let encoded = candidate.encode_png()?;
     let optimized = optimize_lossless(&encoded, effort)?;
 
+    // The encoder writes no colour chunks at all, so they are put back from the
+    // source. After the lossless pass rather than before it, since oxipng is free
+    // to rewrite what it is given but not what it has already returned.
+    let optimized = with_colour_chunks(&optimized, &colour_chunks(bytes))
+        .ok_or_else(|| Error::Encode("could not carry the colour profile across".into()))?;
+
     if optimized.len() >= bytes.len() {
         return Err(Error::NoSmallerResult {
             best_bytes: optimized.len(),
@@ -176,9 +259,16 @@ pub fn optimize_png(
 
 
 /// Chunks a PNG needs in order to render. Everything else is metadata.
-const PNG_KEEP: [&[u8; 4]; 8] = [
+///
+/// The animation chunks are here because an animated PNG's later frames are
+/// picture, not provenance: dropping them leaves a still image and calls it
+/// unchanged. `cHRM` and `cICP` are here for the same reason `iCCP` is — a file
+/// that keeps its gamma and loses its primaries has had its colours altered.
+const PNG_KEEP: [&[u8; 4]; 13] = [
     b"IHDR", b"PLTE", b"IDAT", b"IEND", // structure and pixels
     b"tRNS", b"iCCP", b"sRGB", b"gAMA", // transparency and colour
+    b"cHRM", b"cICP", // colour primaries, and HDR signalling
+    b"acTL", b"fcTL", b"fdAT", // animation frames
 ];
 
 /// Remove metadata chunks from a PNG without touching the pixels.
@@ -188,29 +278,27 @@ const PNG_KEEP: [&[u8; 4]; 8] = [
 /// `eXIf` (location and camera data), `tIME`, and `caBX` (C2PA credentials).
 ///
 /// The colour chunks are kept, for the same reason the JPEG path keeps ICC.
+///
+/// Refuses rather than returning what it managed to copy. A file whose chunk
+/// lengths do not walk cleanly, or that is missing a header, pixels, or an end
+/// marker, is left alone: the caller writes the result over the original, and a
+/// partial copy of a photograph is worse than no copy at all.
 pub fn strip_png(png: &[u8]) -> Option<Vec<u8>> {
-    const SIGNATURE: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-    if !png.starts_with(SIGNATURE) {
-        return None;
-    }
+    let walked = chunks(png)?;
     let mut out = Vec::with_capacity(png.len());
     out.extend_from_slice(SIGNATURE);
 
-    let mut i = SIGNATURE.len();
-    while i + 12 <= png.len() {
-        let len = u32::from_be_bytes([png[i], png[i + 1], png[i + 2], png[i + 3]]) as usize;
-        let kind = &png[i + 4..i + 8];
-        let total = 12 + len;
-        if i + total > png.len() {
-            break;
+    let (mut header, mut pixels, mut end) = (false, false, false);
+    for (kind, whole) in walked {
+        match kind {
+            b"IHDR" => header = true,
+            b"IDAT" => pixels = true,
+            b"IEND" => end = true,
+            _ => {}
         }
         if PNG_KEEP.iter().any(|k| k[..] == *kind) {
-            out.extend_from_slice(&png[i..i + total]);
-        }
-        i += total;
-        if kind == b"IEND" {
-            break;
+            out.extend_from_slice(whole);
         }
     }
-    Some(out)
+    (header && pixels && end).then_some(out)
 }

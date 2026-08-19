@@ -145,6 +145,13 @@ pub fn orientation_segment(orientation: u16) -> Vec<u8> {
 /// Picture Format and HDR gain maps (APP2), Apple's rotation block (APP10), and
 /// C2PA content credentials (APP11), without needing to recognise any of them:
 /// anything not deliberately kept is removed.
+///
+/// Refuses rather than returning what it managed to copy. A segment length that
+/// is wrong by one byte desynchronises the walk, and returning the bytes
+/// gathered up to that point produces a headers-only file that is smaller than
+/// the original and therefore passes every check downstream — which the caller
+/// then writes over the photograph. Apple's decoder resynchronises where this
+/// one cannot, so the files that trigger it are files the user can still open.
 pub fn strip_jpeg(jpeg: &[u8]) -> Option<Vec<u8>> {
     if jpeg.len() < 4 || jpeg[0] != 0xFF || jpeg[1] != 0xD8 {
         return None;
@@ -155,7 +162,7 @@ pub fn strip_jpeg(jpeg: &[u8]) -> Option<Vec<u8>> {
     let mut i = 2;
     while i + 4 <= jpeg.len() {
         if jpeg[i] != 0xFF {
-            break;
+            return None; // the walk has lost the marker boundary
         }
         let marker = jpeg[i + 1];
 
@@ -181,8 +188,9 @@ pub fn strip_jpeg(jpeg: &[u8]) -> Option<Vec<u8>> {
                 }
                 j += 1;
             }
-            out.extend_from_slice(&jpeg[i..]);
-            return Some(out);
+            // No end marker anywhere in the scan. The pixels cannot be shown to
+            // have survived, so the original is left as it is.
+            return None;
         }
         if marker == 0xD9 {
             out.extend_from_slice(&jpeg[i..i + 2]);
@@ -191,17 +199,22 @@ pub fn strip_jpeg(jpeg: &[u8]) -> Option<Vec<u8>> {
 
         let len = u16::from_be_bytes([jpeg[i + 2], jpeg[i + 3]]) as usize;
         if len < 2 || i + 2 + len > jpeg.len() {
-            break;
+            return None; // a segment claiming to end past the end of the file
         }
         let payload = &jpeg[i + 4..i + 2 + len];
         let is_app = (0xE0..=0xEF).contains(&marker);
         let is_comment = marker == 0xFE;
-        let keep = !is_app && !is_comment || payload.starts_with(b"ICC_PROFILE\0");
+        // The profile lives in APP2 and is read from APP2, so it is kept only
+        // there. Without the marker test, any segment at all that opened with
+        // the tag would survive a strip.
+        let is_profile = marker == 0xE2 && payload.starts_with(b"ICC_PROFILE\0");
+        let keep = (!is_app && !is_comment) || is_profile;
 
         if keep {
             out.extend_from_slice(&jpeg[i..i + 2 + len]);
         }
         i += 2 + len;
     }
-    Some(out)
+    // Ran out of file without reaching the scan or the end marker.
+    None
 }
