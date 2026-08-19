@@ -161,11 +161,11 @@ pub fn descriptive_segments(map: &[u8]) -> Vec<(u8, Vec<u8>)> {
         .collect()
 }
 
-/// Insert APP segments into a JPEG, after the JFIF header where there is one.
+/// Insert APP segments into a JPEG, after any JFIF and EXIF headers.
 ///
-/// Position matters only in that APP0 must stay first. Apple writes the format
-/// index ahead of the colour profile and this follows suit, so that a file
-/// squint writes is ordered the way the files it reads are.
+/// Apple orders these APP0, APP1, then the format index, then the colour
+/// profile, and this follows suit, so that a file squint writes is ordered the
+/// way the files it reads are.
 pub fn insert_segments(jpeg: &[u8], segs: &[(u8, Vec<u8>)]) -> Option<Vec<u8>> {
     if segs.is_empty() {
         return Some(jpeg.to_vec());
@@ -173,14 +173,16 @@ pub fn insert_segments(jpeg: &[u8], segs: &[(u8, Vec<u8>)]) -> Option<Vec<u8>> {
     if jpeg.len() < 4 || jpeg[0] != 0xFF || jpeg[1] != 0xD8 {
         return None;
     }
-    // Skip APP0 if present, so the inserted segments follow it.
     let mut at = 2;
-    if jpeg[at] == 0xFF && jpeg[at + 1] == 0xE0 {
+    while at + 4 <= jpeg.len()
+        && jpeg[at] == 0xFF
+        && (jpeg[at + 1] == 0xE0 || jpeg[at + 1] == 0xE1)
+    {
         let len = u16::from_be_bytes([jpeg[at + 2], jpeg[at + 3]]) as usize;
+        if len < 2 || at + 2 + len > jpeg.len() {
+            return None;
+        }
         at += 2 + len;
-    }
-    if at > jpeg.len() {
-        return None;
     }
 
     let extra: usize = segs.iter().map(|(_, p)| p.len() + 4).sum();

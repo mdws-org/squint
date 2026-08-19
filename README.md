@@ -77,6 +77,8 @@ For PNG, only the chunks needed to render are kept: `IHDR`, `PLTE`, `IDAT`, `IEN
 
 The colour profile is always kept. It carries no personal information, and discarding it shifts the colours of every photograph taken on a modern phone.
 
+Strip also writes back a 32 byte EXIF block holding the orientation and nothing else. Since it copies the pixels through untouched, that tag is the only thing saying which way up they go, and a portrait photograph stripped without it comes back on its side. Which way up a picture goes identifies nobody; GPS, camera identity and Apple's maker note are still gone. Fast and Quality need no such block, because they turn the pixels themselves.
+
 Measured on a 4032x3024 iPhone photograph: 1,465,453 bytes to 1,442,452, with the colour profile and the gain map surviving and nothing else. Scoring the result against the original returns exactly 100, confirming the pixels are untouched.
 
 Apple writes trailing data past the end-of-image marker, where the gain map and further XMP live. Stripping stops at that marker rather than copying to the end of the file. A first implementation did not, and XMP survived.
@@ -95,7 +97,7 @@ Losing it is quiet. The file still opens, still looks right on an ordinary displ
 
 These hold across every release.
 
-**Never strip the colour profile.** Remove GPS, camera, and timestamp metadata. Keep ICC. Bake orientation into the pixels rather than leaving it as a tag.
+**Never strip the colour profile.** Remove GPS, camera, and timestamp metadata. Keep ICC. Where the pixels are re-encoded, turn them the right way up and write no orientation tag; where they are copied through untouched, keep the tag, because it is the only thing saying which way up they go.
 
 **Never change how a picture looks without saying so.** Colour profiles and gain maps both decide appearance rather than describe origin. Where one cannot be carried across, the result says which, rather than leaving it to be noticed on a better display months later.
 

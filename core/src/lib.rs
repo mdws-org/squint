@@ -389,7 +389,18 @@ pub fn optimize(
         let (stripped, hdr) = if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
             (png::strip_png(bytes), Hdr::Absent)
         } else {
-            let bare = metadata::strip_jpeg(bytes);
+            // The orientation tag goes back on before anything else, because it
+            // lengthens the picture and the gain map's index records where the
+            // picture ends.
+            let bare = metadata::strip_jpeg(bytes).and_then(|stripped| {
+                match extract_orientation(bytes) {
+                    1 => Some(stripped),
+                    turned => gainmap::insert_segments(
+                        &stripped,
+                        &[(0xE1, metadata::orientation_segment(turned))],
+                    ),
+                }
+            });
             // A gain map is picture data, not metadata. Stripping a photograph
             // of its location should not also take away half its brightness.
             match (bare, gainmap::extract(bytes)) {
@@ -582,6 +593,18 @@ mod tests {
     #[test]
     fn stripping_rejects_input_that_is_not_a_jpeg() {
         assert!(metadata::strip_jpeg(b"not a jpeg").is_none());
+    }
+
+    #[test]
+    fn the_orientation_squint_writes_is_the_orientation_it_reads() {
+        for turned in [2u16, 3, 4, 5, 6, 7, 8] {
+            let payload = metadata::orientation_segment(turned);
+            let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE1];
+            jpeg.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+            jpeg.extend_from_slice(&payload);
+            jpeg.extend_from_slice(&[0xFF, 0xD9]);
+            assert_eq!(extract_orientation(&jpeg), turned);
+        }
     }
 
     #[test]
