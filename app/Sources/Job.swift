@@ -7,7 +7,7 @@ final class Job: ObservableObject, Identifiable {
         case waiting
         case working
         /// Finished and smaller.
-        case done(bytes: Int, originalBytes: Int, score: Double?)
+        case done(bytes: Int, originalBytes: Int, score: Double?, hdr: Engine.Hdr)
         /// Finished, but the file was already as small as it can be.
         case alreadyOptimal
         case failed(String)
@@ -29,11 +29,21 @@ final class Job: ObservableObject, Identifiable {
         case .working: return "working"
         case .alreadyOptimal: return "already optimal"
         case .failed(let message): return message
-        case .done(let bytes, let original, let score):
+        case .done(let bytes, let original, let score, let hdr):
             let saved = 100 - (100 * Double(bytes) / Double(original))
-            let sizes = "\(format(original)) to \(format(bytes)), \(Int(saved.rounded()))% smaller"
-            guard let score else { return sizes }
-            return sizes + String(format: ", score %.1f", score)
+            var text = "\(format(original)) to \(format(bytes)), \(Int(saved.rounded()))% smaller"
+            if let score {
+                text += String(format: ", score %.1f", score)
+            }
+            // Losing the extra range changes how the picture looks on a display
+            // that can show it, so it is said out loud rather than left to be
+            // noticed later.
+            switch hdr {
+            case .absent: break
+            case .preserved: text += ", HDR kept"
+            case .dropped: text += ", HDR removed"
+            }
+            return text
         }
     }
 

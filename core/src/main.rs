@@ -3,8 +3,17 @@
 //! This drives the engine without a user interface so that quality and speed can
 //! be measured against real photographs before any application exists.
 
-use squint_core::{search, encode_jpeg, score, extract_icc, extract_orientation, optimize, png, Image, Mode, JPEG_SCORE_CEILING};
+use squint_core::{search, encode_jpeg, score, extract_icc, extract_orientation, has_gain_map, optimize, png, Hdr, Image, Mode, JPEG_SCORE_CEILING};
 use std::time::Instant;
+
+/// How the gain map fared, for the line the harness prints.
+fn hdr_note(hdr: Hdr) -> &'static str {
+    match hdr {
+        Hdr::Absent => "",
+        Hdr::Preserved => "  hdr gain map preserved",
+        Hdr::Dropped => "  HDR GAIN MAP DROPPED",
+    }
+}
 
 fn usage() -> ! {
     eprintln!(
@@ -62,11 +71,12 @@ fn main() {
         match optimize(&bytes, Mode::Strip, 0.0, 0.0, None) {
             Ok(r) => {
                 println!(
-                    "{}  {:>7.0} KB -> {:>7.0} KB  {:>5.1}%  metadata removed, pixels untouched  {:.3}s",
+                    "{}  {:>7.0} KB -> {:>7.0} KB  {:>5.1}%  metadata removed, pixels untouched{}  {:.3}s",
                     path,
                     bytes.len() as f64 / 1024.0,
                     r.data.len() as f64 / 1024.0,
                     100.0 * r.data.len() as f64 / bytes.len() as f64,
+                    hdr_note(r.hdr),
                     t0.elapsed().as_secs_f64()
                 );
                 if let Some(o) = &out_path {
@@ -155,13 +165,15 @@ fn main() {
                 eprintln!("{e}");
                 std::process::exit(1)
             });
+            let hdr = if has_gain_map(&bytes) { Hdr::Dropped } else { Hdr::Absent };
             let elapsed = started.elapsed().as_secs_f64();
             println!(
-                "fast     q{:<5.1} {:>7.0} KB  {:>5.1}% of original  {:.3}s  (no metric evaluated)",
+                "fast     q{:<5.1} {:>7.0} KB  {:>5.1}% of original  {:.3}s  (no metric evaluated){}",
                 fixed_quality,
                 out.len() as f64 / 1024.0,
                 100.0 * out.len() as f64 / bytes.len() as f64,
-                elapsed
+                elapsed,
+                hdr_note(hdr)
             );
             if let Some(o) = &out_path {
                 std::fs::write(o, &out).unwrap_or_else(|e| { eprintln!("write failed: {e}"); std::process::exit(1) });
@@ -188,17 +200,20 @@ fn main() {
                             if p.quality == r.chosen.quality { "   <- chosen" } else { "" }
                         );
                     }
+                    let out = r.data;
+                    let hdr = if has_gain_map(&bytes) { Hdr::Dropped } else { Hdr::Absent };
                     println!(
-                        "quality  q{:<5.1} {:>7.0} KB  {:>5.1}% of original  score {:.3}  {} probes  {:.3}s",
+                        "quality  q{:<5.1} {:>7.0} KB  {:>5.1}% of original  score {:.3}  {} probes  {:.3}s{}",
                         r.chosen.quality,
-                        r.chosen.bytes as f64 / 1024.0,
-                        100.0 * r.chosen.bytes as f64 / bytes.len() as f64,
+                        out.len() as f64 / 1024.0,
+                        100.0 * out.len() as f64 / bytes.len() as f64,
                         r.chosen.score,
                         r.probes.len(),
-                        elapsed
+                        elapsed,
+                        hdr_note(hdr)
                     );
                     if let Some(o) = &out_path {
-                        std::fs::write(o, &r.data).unwrap_or_else(|e| { eprintln!("write failed: {e}"); std::process::exit(1) });
+                        std::fs::write(o, &out).unwrap_or_else(|e| { eprintln!("write failed: {e}"); std::process::exit(1) });
                         println!("         wrote {o}");
                     }
                 }

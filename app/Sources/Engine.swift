@@ -14,10 +14,18 @@ enum Engine {
         case strip = 2
     }
 
+    /// What became of a high dynamic range photograph's gain map.
+    enum Hdr: Int32 {
+        case absent = 0
+        case preserved = 1
+        case dropped = 2
+    }
+
     struct Result {
         let data: Data
         /// Absent in fast mode, and for images too small to judge.
         let score: Double?
+        let hdr: Hdr
         let originalBytes: Int
 
         var ratio: Double { Double(data.count) / Double(originalBytes) }
@@ -56,6 +64,7 @@ enum Engine {
         return Result(
             data: data,
             score: result.score.isNaN ? nil : result.score,
+            hdr: Hdr(rawValue: result.hdr) ?? .absent,
             originalBytes: result.original_len
         )
     }

@@ -20,12 +20,19 @@
 
 #define SQUINT_MODE_FAST    0
 #define SQUINT_MODE_QUALITY 1
+#define SQUINT_MODE_STRIP   2
+
+// What became of a high dynamic range gain map.
+#define SQUINT_HDR_ABSENT    0
+#define SQUINT_HDR_PRESERVED 1
+#define SQUINT_HDR_DROPPED   2
 
 typedef struct {
     uint8_t *data;
     size_t   len;
     size_t   original_len;
     double   score;   // NaN when no metric was evaluated
+    int      hdr;     // one of the SQUINT_HDR_ values
     int      error;   // SQUINT_OK, or one of the SQUINT_ERR_ values
 } SquintResult;
 

@@ -3,8 +3,16 @@
 //! Ownership rule: every buffer returned here was allocated by Rust and must be
 //! handed back to `squint_result_free`. Nothing else may free it.
 
-use crate::{optimize, Error, Mode};
+use crate::{optimize, Error, Hdr, Mode};
 use std::os::raw::{c_char, c_int};
+
+pub const SQUINT_MODE_FAST: c_int = 0;
+pub const SQUINT_MODE_QUALITY: c_int = 1;
+pub const SQUINT_MODE_STRIP: c_int = 2;
+
+pub const SQUINT_HDR_ABSENT: c_int = 0;
+pub const SQUINT_HDR_PRESERVED: c_int = 1;
+pub const SQUINT_HDR_DROPPED: c_int = 2;
 
 pub const SQUINT_OK: c_int = 0;
 pub const SQUINT_ERR_DECODE: c_int = 1;
@@ -25,6 +33,8 @@ pub struct SquintResult {
     pub len: usize,
     pub original_len: usize,
     pub score: f64,
+    /// What became of a high dynamic range gain map. See the `SQUINT_HDR_` values.
+    pub hdr: c_int,
     pub error: c_int,
 }
 
@@ -35,6 +45,7 @@ impl SquintResult {
             len: 0,
             original_len,
             score: f64::NAN,
+            hdr: SQUINT_HDR_ABSENT,
             error,
         }
     }
@@ -53,8 +64,9 @@ fn code_for(e: &Error) -> c_int {
 
 /// Optimize an encoded image held in memory.
 ///
-/// `mode` is 0 for fast and 1 for quality. `png_min_quality` below 0 disables
-/// quantization. The format is detected from the bytes; the caller does not say.
+/// `mode` is one of the `SQUINT_MODE_` values. `png_min_quality` below 0
+/// disables quantization. The format is detected from the bytes; the caller
+/// does not say.
 ///
 /// # Safety
 /// `input` must point to `input_len` readable bytes.
@@ -71,7 +83,14 @@ pub unsafe extern "C" fn squint_optimize(
         return SquintResult::failure(SQUINT_ERR_NULL_INPUT, 0);
     }
     let bytes = std::slice::from_raw_parts(input, input_len);
-    let mode = if mode == 1 { Mode::Quality } else { Mode::Fast };
+    // Every mode is named here. Collapsing the unrecognised case into fast is
+    // what silently turned strip into a re-encode: the caller asked for the
+    // pixels to be left alone and got them rewritten.
+    let mode = match mode {
+        SQUINT_MODE_QUALITY => Mode::Quality,
+        SQUINT_MODE_STRIP => Mode::Strip,
+        _ => Mode::Fast,
+    };
     let png_min = if png_min_quality < 0 { None } else { Some(png_min_quality.min(100) as u8) };
 
     match optimize(bytes, mode, target, fixed_quality, png_min) {
@@ -85,6 +104,11 @@ pub unsafe extern "C" fn squint_optimize(
                 len,
                 original_len: out.original_bytes,
                 score: out.score.unwrap_or(f64::NAN),
+                hdr: match out.hdr {
+                    Hdr::Absent => SQUINT_HDR_ABSENT,
+                    Hdr::Preserved => SQUINT_HDR_PRESERVED,
+                    Hdr::Dropped => SQUINT_HDR_DROPPED,
+                },
                 error: SQUINT_OK,
             }
         }
