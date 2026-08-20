@@ -19,9 +19,7 @@ pub struct RgbaImage {
 
 impl RgbaImage {
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        let img = image::load_from_memory(bytes)
-            .map_err(|e| Error::Decode(e.to_string()))?
-            .to_rgba8();
+        let img = crate::decode_limited(bytes)?.to_rgba8();
         let (width, height) = (img.width() as usize, img.height() as usize);
         let pixels = img
             .into_raw()

@@ -22,6 +22,8 @@ pub const SQUINT_ERR_TOO_SMALL: c_int = 4;
 pub const SQUINT_ERR_UNREACHABLE: c_int = 5;
 pub const SQUINT_ERR_NO_SMALLER: c_int = 6;
 pub const SQUINT_ERR_NULL_INPUT: c_int = 7;
+pub const SQUINT_ERR_TOO_LARGE: c_int = 8;
+pub const SQUINT_ERR_PANIC: c_int = 9;
 
 /// The result of one optimization.
 ///
@@ -35,6 +37,8 @@ pub struct SquintResult {
     pub score: f64,
     /// What became of a high dynamic range gain map. See the `SQUINT_HDR_` values.
     pub hdr: c_int,
+    /// Non-zero when the colour count was reduced to shrink the file.
+    pub quantized: c_int,
     pub error: c_int,
 }
 
@@ -46,6 +50,7 @@ impl SquintResult {
             original_len,
             score: f64::NAN,
             hdr: SQUINT_HDR_ABSENT,
+            quantized: 0,
             error,
         }
     }
@@ -59,6 +64,8 @@ fn code_for(e: &Error) -> c_int {
         Error::TooSmall { .. } => SQUINT_ERR_TOO_SMALL,
         Error::Unreachable { .. } => SQUINT_ERR_UNREACHABLE,
         Error::NoSmallerResult { .. } => SQUINT_ERR_NO_SMALLER,
+        Error::TooLarge { .. } => SQUINT_ERR_TOO_LARGE,
+        Error::Panicked => SQUINT_ERR_PANIC,
     }
 }
 
@@ -93,7 +100,16 @@ pub unsafe extern "C" fn squint_optimize(
     };
     let png_min = if png_min_quality < 0 { None } else { Some(png_min_quality.min(100) as u8) };
 
-    match optimize(bytes, mode, target, fixed_quality, png_min) {
+    // Nothing may unwind past this frame. It is `extern "C"`, so a panic crossing
+    // it aborts the process, which in a batch means every other file in flight
+    // dies with no error reported to anyone. A panic is a defect either way; the
+    // difference is whether one file fails or all of them do.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        optimize(bytes, mode, target, fixed_quality, png_min)
+    }))
+    .unwrap_or(Err(Error::Panicked));
+
+    match outcome {
         Ok(mut out) => {
             out.data.shrink_to_fit();
             let len = out.data.len();
@@ -109,6 +125,7 @@ pub unsafe extern "C" fn squint_optimize(
                     Hdr::Preserved => SQUINT_HDR_PRESERVED,
                     Hdr::Dropped => SQUINT_HDR_DROPPED,
                 },
+                quantized: c_int::from(out.quantized),
                 error: SQUINT_OK,
             }
         }
@@ -140,6 +157,8 @@ pub extern "C" fn squint_error_message(code: c_int) -> *const c_char {
         SQUINT_ERR_UNREACHABLE => b"the quality target cannot be reached for this image\0",
         SQUINT_ERR_NO_SMALLER => b"already optimal; a smaller file is not possible\0",
         SQUINT_ERR_NULL_INPUT => b"no input was provided\0",
+        SQUINT_ERR_TOO_LARGE => b"this image is too large to open safely; the file was not changed\0",
+        SQUINT_ERR_PANIC => b"the engine failed unexpectedly; the file was not changed\0",
         _ => b"unknown error\0",
     };
     s.as_ptr() as *const c_char

@@ -17,6 +17,8 @@
 #define SQUINT_ERR_UNREACHABLE 5
 #define SQUINT_ERR_NO_SMALLER 6
 #define SQUINT_ERR_NULL_INPUT 7
+#define SQUINT_ERR_TOO_LARGE  8
+#define SQUINT_ERR_PANIC      9
 
 #define SQUINT_MODE_FAST    0
 #define SQUINT_MODE_QUALITY 1
@@ -33,6 +35,7 @@ typedef struct {
     size_t   original_len;
     double   score;   // NaN when no metric was evaluated
     int      hdr;     // one of the SQUINT_HDR_ values
+    int      quantized; // non-zero when the colour count was reduced
     int      error;   // SQUINT_OK, or one of the SQUINT_ERR_ values
 } SquintResult;
 

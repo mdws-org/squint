@@ -20,6 +20,46 @@ pub const MIN_PERCEPTUAL_DIM: usize = 113;
 /// cannot converge, so it must fail rather than exhaust its probe budget.
 pub const JPEG_SCORE_CEILING: f64 = 91.0;
 
+/// The largest picture the engine will decode.
+///
+/// A small file can declare an enormous one: a forty kilobyte PNG claiming
+/// 60000 by 60000 asks the decoder for fourteen gigabytes, and the answer is
+/// either an abort that takes every other job with it or a machine in swap.
+/// Refusing on the declared size, before anything is allocated, turns that into
+/// an ordinary typed error. The cap sits far above any camera — a 48 megapixel
+/// phone photograph is a fifth of it, and a large stitched panorama still fits.
+pub const MAX_PIXELS: usize = 250_000_000;
+
+/// Ceiling on what a decoder may allocate, as a backstop behind the size check.
+///
+/// Large enough for any picture that passes `MAX_PIXELS`, including the
+/// decoder's own working buffers.
+const MAX_DECODE_ALLOC: u64 = 1_500_000_000;
+
+/// Decode with the declared size checked first and an allocation ceiling behind it.
+///
+/// Both halves matter. The size check gives a typed error naming the dimensions,
+/// which is what a person needs to see; the allocation ceiling catches whatever
+/// a malformed header can do that the size check cannot anticipate.
+fn decode_limited(bytes: &[u8]) -> Result<image::DynamicImage, Error> {
+    let sized = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| Error::Decode(e.to_string()))?;
+    let (width, height) = sized.into_dimensions().map_err(|e| Error::Decode(e.to_string()))?;
+    let pixels = (width as usize).saturating_mul(height as usize);
+    if pixels > MAX_PIXELS {
+        return Err(Error::TooLarge { width: width as usize, height: height as usize });
+    }
+
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| Error::Decode(e.to_string()))?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(MAX_DECODE_ALLOC);
+    reader.limits(limits);
+    reader.decode().map_err(|e| Error::Decode(e.to_string()))
+}
+
 #[derive(Debug)]
 pub enum Error {
     Decode(String),
@@ -32,6 +72,11 @@ pub enum Error {
     /// The target was met, but only by a file larger than the original. An
     /// optimizer must never grow a file; the caller keeps the original.
     NoSmallerResult { best_bytes: usize, original_bytes: usize },
+    /// The picture declares more pixels than the engine will decode.
+    TooLarge { width: usize, height: usize },
+    /// Something below panicked. Reported rather than allowed to unwind into C,
+    /// where it would abort the process and take every other job with it.
+    Panicked,
 }
 
 impl std::fmt::Display for Error {
@@ -52,6 +97,11 @@ impl std::fmt::Display for Error {
                 f,
                 "target is only reachable at {best_bytes} bytes, larger than the original {original_bytes}; keeping the original"
             ),
+            Error::TooLarge { width, height } => write!(
+                f,
+                "image declares {width}x{height} pixels, beyond the {MAX_PIXELS} the engine will decode"
+            ),
+            Error::Panicked => write!(f, "the engine failed unexpectedly; the file was not changed"),
         }
     }
 }
@@ -74,9 +124,7 @@ impl Image {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        let img = image::load_from_memory(bytes)
-            .map_err(|e| Error::Decode(e.to_string()))?
-            .to_rgb8();
+        let img = decode_limited(bytes)?.to_rgb8();
         let (w, h) = (img.width() as usize, img.height() as usize);
         Ok(Image::from_rgb8(&img.into_raw(), w, h))
     }
@@ -186,12 +234,12 @@ pub fn encode_jpeg(image: &Image, quality: f32, icc: Option<&[u8]>) -> Result<Ve
     .map_err(|e| Error::Encode(e.to_string()))
 }
 
-/// Whether a file carries an HDR gain map, without lifting it out.
+/// Whether a file signals high dynamic range, without lifting anything out.
 pub fn has_gain_map(bytes: &[u8]) -> bool {
-    gainmap::extract(bytes).is_some()
+    gainmap::signals_hdr(bytes)
 }
 
-/// Strip a gain map's metadata while keeping what makes it usable.
+/// Strip a secondary image's metadata while keeping what makes it usable.
 ///
 /// The general stripper removes every container it is not told to keep, which
 /// for a gain map would take its parameters with the camera identity. They go
@@ -248,18 +296,30 @@ pub fn search(
 
     let mut probes: Vec<Probe> = Vec::new();
     let mut best: Option<(Probe, Vec<u8>)> = None;
-    // Bracket around the prediction rather than the whole legal range. Opening at
-    // the extremes wastes a probe bisecting into territory nothing is chosen from.
-    let predicted = predict_quality(target);
-    let mut lo = (predicted - 12.0).max(20.0);
-    let mut hi = (predicted + 8.0).min(98.0);
-    let mut next = predicted;
-    let mut widened = false;
+    // The bracket spans the whole legal range and the prediction decides only
+    // where to probe first. An earlier version narrowed the bracket to a window
+    // around the prediction and meant to widen it on demand, but the widening
+    // could never fire: it asked whether the first probe had landed at an edge,
+    // and the first probe is the prediction, which sits in the middle by
+    // construction. A picture needing a quality outside that window was refused
+    // as unreachable, quoting a best score measured only inside a window the
+    // search had never left. Spending the prediction on the opener rather than
+    // on the bounds keeps the speed and drops the false refusal.
+    let mut lo = 20.0f32;
+    let mut hi = 98.0f32;
+    let mut next = predict_quality(target);
 
     for _ in 0..max_probes {
-        let q = next.round().clamp(lo, hi);
+        let mut q = next.round().clamp(lo, hi);
         if probes.iter().any(|p| p.quality == q) {
-            break; // bracket has collapsed onto an already-measured point
+            // Interpolation landed somewhere already measured. Bisect rather
+            // than stop: the bracket can still be several points wide, and the
+            // smallest satisfying encode may be inside it.
+            let mid = ((lo + hi) / 2.0).round().clamp(lo, hi);
+            if mid == q || probes.iter().any(|p| p.quality == mid) {
+                break; // genuinely collapsed onto measured points
+            }
+            q = mid;
         }
 
         let data = encode_jpeg(reference, q, icc)?;
@@ -279,24 +339,27 @@ pub fn search(
             lo = q;
         }
 
-        // If the prediction bracketed wrongly, widen once before giving up on it.
-        if !widened && probes.len() == 1 {
-            if s < target && q >= hi - 0.5 {
-                hi = 98.0;
-                widened = true;
-            } else if s >= target && q <= lo + 0.5 {
-                lo = 20.0;
-                widened = true;
-            }
-        }
-
         if hi - lo <= 1.0 {
             break;
         }
 
-        // Interpolate against the two probes bracketing the target where we can,
-        // and fall back to bisection when we cannot.
-        next = interpolate(&probes, target).unwrap_or((lo + hi) / 2.0);
+        // Interpolate once the target is bracketed. Before that the two
+        // directions are not symmetric, and treating them the same is what made
+        // the old search refuse images it could have encoded.
+        //
+        // With nothing satisfying yet, go straight to the ceiling. Whether the
+        // target is reachable at all is the only question outstanding, one probe
+        // answers it, and creeping upward can exhaust the budget before arriving
+        // — which turns a reachable target into a refusal just as surely as a
+        // bracket that could not widen. With nothing failing yet there is already
+        // an answer in hand and only its size is in question, so step down
+        // gently and keep the interpolation accurate.
+        const STEP: f32 = 8.0;
+        next = match interpolate(&probes, target) {
+            Some(between) => between,
+            None if best.is_none() => hi,
+            None => (q - STEP).max(lo),
+        };
     }
 
     match best {
@@ -371,6 +434,10 @@ pub struct Optimized {
     /// Absent in fast mode, and for images too small to score.
     pub score: Option<f64>,
     pub hdr: Hdr,
+    /// True when the colour count was reduced. PNG's lossy mode is a palette
+    /// reduction rather than a quality dial, and it is on by default, so a file
+    /// can come back visibly changed with no score to show for it.
+    pub quantized: bool,
     pub original_bytes: usize,
 }
 
@@ -401,17 +468,29 @@ pub fn optimize(
                     ),
                 }
             });
-            // A gain map is picture data, not metadata. Stripping a photograph
-            // of its location should not also take away half its brightness.
+            // A secondary image is picture data, not metadata. Stripping a
+            // photograph of its location should not also take away half its
+            // brightness, or one eye of a stereo pair.
             match (bare, gainmap::extract(bytes)) {
-                (Some(bare), Some(map)) => {
-                    let cleaned = strip_gain_map(&map.jpeg)
-                        .ok_or_else(|| Error::Encode("could not strip the gain map".into()))?;
-                    match gainmap::attach(&bare, &cleaned, map.iso_segment.as_deref()) {
-                        Some(joined) => (Some(joined), Hdr::Preserved),
-                        None => (Some(bare), Hdr::Dropped),
+                (Some(bare), Some(found)) => {
+                    let cleaned = found
+                        .images
+                        .iter()
+                        .map(|img| strip_gain_map(img))
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or_else(|| Error::Encode("could not strip a secondary image".into()))?;
+                    let hdr = if found.has_gain_map { Hdr::Preserved } else { Hdr::Absent };
+                    match gainmap::attach(&bare, &cleaned, found.iso_segment.as_deref()) {
+                        Some(joined) => (Some(joined), hdr),
+                        // Reattaching failed, so whatever was carried is gone.
+                        None if found.has_gain_map => (Some(bare), Hdr::Dropped),
+                        None => (Some(bare), Hdr::Absent),
                     }
                 }
+                // No index to read. The marker in the primary can still say a map
+                // was there, and stripping cuts at the end of the primary, so it
+                // is gone either way and must not be reported as absent.
+                (Some(bare), None) if gainmap::signals_hdr(bytes) => (Some(bare), Hdr::Dropped),
                 (bare, _) => (bare, Hdr::Absent),
             }
         };
@@ -423,7 +502,13 @@ pub fn optimize(
                 original_bytes: bytes.len(),
             });
         }
-        return Ok(Optimized { data: stripped, score: None, hdr, original_bytes: bytes.len() });
+        return Ok(Optimized {
+            data: stripped,
+            score: None,
+            hdr,
+            quantized: false,
+            original_bytes: bytes.len(),
+        });
     }
 
     if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
@@ -439,6 +524,7 @@ pub fn optimize(
             data: r.data,
             score: r.score,
             hdr: Hdr::Absent,
+            quantized: r.quantized,
             original_bytes: bytes.len(),
         });
     }
@@ -483,7 +569,7 @@ pub fn optimize(
             original_bytes: bytes.len(),
         });
     }
-    Ok(Optimized { data, score, hdr, original_bytes: bytes.len() })
+    Ok(Optimized { data, score, hdr, quantized: false, original_bytes: bytes.len() })
 }
 
 #[cfg(test)]
