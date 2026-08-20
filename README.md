@@ -109,7 +109,9 @@ These hold across every release.
 
 **Complexity belongs in the preset, not at the point of use.** The Finder menu offers named destinations. It does not offer settings.
 
-**Fail loudly.** Every refusal returns a typed error that explains itself. This domain produces failures that look like success, and a metric that returns a plausible number when it has no valid answer is worse than one that stops.
+**Fail loudly.** Every refusal returns a typed error that explains itself. This domain produces failures that look like success, and a metric that returns a plausible number when it has no valid answer is worse than one that stops. Nothing is allowed to unwind out of the engine into the application: a panic crossing that boundary aborts the process, so a defect in one file would take every other file in the batch with it.
+
+**Refuse what cannot be opened safely.** A small file can declare an enormous picture. The declared size is checked before anything is allocated, and a decoder allocation ceiling sits behind that, so a forty kilobyte file claiming sixty thousand pixels square is a typed error rather than fourteen gigabytes of allocation.
 
 ## Engine
 

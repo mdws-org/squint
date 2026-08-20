@@ -7,7 +7,7 @@ final class Job: ObservableObject, Identifiable {
         case waiting
         case working
         /// Finished and smaller.
-        case done(bytes: Int, originalBytes: Int, score: Double?, hdr: Engine.Hdr)
+        case done(bytes: Int, originalBytes: Int, score: Double?, hdr: Engine.Hdr, quantized: Bool)
         /// Finished, but the file was already as small as it can be.
         case alreadyOptimal
         case failed(String)
@@ -15,10 +15,16 @@ final class Job: ObservableObject, Identifiable {
 
     let id = UUID()
     let url: URL
+    /// Fixed when the job is queued. A right-click carries its own instruction,
+    /// and the window's picker must not be able to change it afterwards.
+    let mode: Engine.Mode
+    let target: Double
     @Published var state: State = .waiting
 
-    init(url: URL) {
+    init(url: URL, mode: Engine.Mode, target: Double) {
         self.url = url
+        self.mode = mode
+        self.target = target
     }
 
     var name: String { url.lastPathComponent }
@@ -29,7 +35,7 @@ final class Job: ObservableObject, Identifiable {
         case .working: return "working"
         case .alreadyOptimal: return "already optimal"
         case .failed(let message): return message
-        case .done(let bytes, let original, let score, let hdr):
+        case .done(let bytes, let original, let score, let hdr, let quantized):
             let saved = 100 - (100 * Double(bytes) / Double(original))
             var text = "\(format(original)) to \(format(bytes)), \(Int(saved.rounded()))% smaller"
             if let score {
@@ -42,6 +48,12 @@ final class Job: ObservableObject, Identifiable {
             case .absent: break
             case .preserved: text += ", HDR kept"
             case .dropped: text += ", HDR removed"
+            }
+            // PNG's lossy mode reduces the colour count rather than turning a
+            // quality dial, and it is on by default. Saying so is the difference
+            // between a smaller file and a changed picture.
+            if quantized {
+                text += ", colours reduced"
             }
             return text
         }
