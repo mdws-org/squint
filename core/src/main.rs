@@ -22,9 +22,14 @@ fn usage() -> ! {
   fast     encode once at a fixed quality, measure nothing (the default)
   quality  search for the smallest file scoring at or above the target
 
-  --target   perceptual target, 70 general web, 80 high, 90 visually lossless (default 80)
-  --quality  fixed quality for fast mode (default 75)
-  --probes   maximum encodes during a search (default 6)"
+  strip    remove metadata, leaving the pixels exactly as they were
+
+  --target       perceptual target, 70 general web, 80 high, 90 visually lossless (default 80)
+  --quality      fixed quality for fast mode (default 75)
+  --probes       maximum encodes during a search (default 6)
+  --png-quality  palette quality floor for PNG, negative for lossless (default 70)
+  --out          write the result to this path
+  --against      score this image against another instead of encoding"
     );
     std::process::exit(2)
 }
@@ -41,7 +46,10 @@ fn main() {
     let mut probes = 6usize;
     let mut against: Option<String> = None;
     let mut out_path: Option<String> = None;
-    let mut png_min_quality: Option<u8> = None;
+    // The same default the application sends. It used to be lossless here and
+    // quantized there, so every PNG number ever measured on this harness
+    // described something the application does not do.
+    let mut png_min_quality: Option<u8> = Some(70);
 
     let mut i = 1;
     while i < args.len() {
@@ -53,7 +61,13 @@ fn main() {
             "--probes" => probes = next.and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             "--against" => against = Some(next.unwrap_or_else(|| usage()).clone()),
             "--out" => out_path = Some(next.unwrap_or_else(|| usage()).clone()),
-            "--png-quality" => png_min_quality = next.and_then(|v| v.parse().ok()),
+            // Negative means lossless, matching the C interface. A value that
+            // does not parse is a mistake worth stopping for, not a silent
+            // switch to a different kind of compression.
+            "--png-quality" => {
+                let v: i32 = next.and_then(|v| v.parse().ok()).unwrap_or_else(|| usage());
+                png_min_quality = (v >= 0).then(|| v.min(100) as u8);
+            }
             _ => usage(),
         }
         i += 2;

@@ -53,8 +53,11 @@ final class ServiceProvider: NSObject {
             // Bring the window forward so progress is visible. Work started from
             // Finder is otherwise invisible until it finishes.
             NSApp.activate(ignoringOtherApps: true)
-            JobQueue.shared.mode = mode
-            JobQueue.shared.add(images)
+            // The mode goes with the files rather than onto the queue. Setting
+            // it here used to move the window's picker too, so the next file
+            // dropped on the window was treated as whatever was last
+            // right-clicked.
+            JobQueue.shared.add(images, mode: mode)
         }
     }
 

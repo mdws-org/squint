@@ -26,6 +26,8 @@ enum Engine {
         /// Absent in fast mode, and for images too small to judge.
         let score: Double?
         let hdr: Hdr
+        /// True when the colour count was reduced, which PNG does by default.
+        let quantized: Bool
         let originalBytes: Int
 
         var ratio: Double { Double(data.count) / Double(originalBytes) }
@@ -65,6 +67,7 @@ enum Engine {
             data: data,
             score: result.score.isNaN ? nil : result.score,
             hdr: Hdr(rawValue: result.hdr) ?? .absent,
+            quantized: result.quantized != 0,
             originalBytes: result.original_len
         )
     }
