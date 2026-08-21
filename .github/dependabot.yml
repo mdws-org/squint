@@ -1,0 +1,22 @@
+version: 2
+
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/core"
+    schedule:
+      interval: "weekly"
+    # A malicious crate version is usually deleted within hours of publication:
+    # the 2026-08-20 arrayref compromise was live for 86 minutes. Waiting seven
+    # days before adopting a release puts takedown ahead of adoption.
+    # Cooldown does not apply to Dependabot security updates, so a disclosed
+    # vulnerability still gets a pull request immediately.
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
