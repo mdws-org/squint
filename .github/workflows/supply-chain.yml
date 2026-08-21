@@ -1,0 +1,39 @@
+name: supply-chain
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Advisories are published against dependencies that have not changed, so
+    # this runs on a timer as well as on push.
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          # cargo-deny reads core/deny.toml, beside this manifest.
+          manifest-path: core/Cargo.toml
+          # The licenses check is excluded on purpose; see core/deny.toml.
+          command: check advisories bans sources
+
+  locked:
+    name: lockfile is current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Verify Cargo.lock matches Cargo.toml
+        working-directory: core
+        # Fails if resolving would change the lockfile, which catches a lock
+        # that was left behind by a manifest edit.
+        run: cargo metadata --locked --format-version 1 > /dev/null

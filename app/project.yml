@@ -85,4 +85,4 @@ targets:
         script: |
           export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
           cd "$SRCROOT/../core"
-          cargo build --release
+          cargo build --release --locked
