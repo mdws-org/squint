@@ -519,7 +519,12 @@ pub fn optimize(
             // percent.
             Mode::Fast | Mode::Strip => png::Effort::Quick,
         };
-        let r = png::optimize_png(bytes, png_min_quality, mode == Mode::Quality, effort)?;
+        let r = png::optimize_png(
+            bytes,
+            png_min_quality,
+            (mode == Mode::Quality).then_some(target),
+            effort,
+        )?;
         return Ok(Optimized {
             data: r.data,
             score: r.score,
@@ -640,6 +645,50 @@ mod tests {
         img.apply_orientation(99);
         assert_eq!((img.width, img.height), (2, 3));
         assert_eq!(at(&img, 0, 0), 0);
+    }
+
+    /// A real PNG large enough to score, with enough colours that reducing them
+    /// is a measurable loss rather than a no-op.
+    fn photographic_png(side: usize) -> Vec<u8> {
+        let pixels = (0..side * side)
+            .map(|i| {
+                let (x, y) = (i % side, i / side);
+                rgb::RGBA8::new(
+                    (x * 255 / side) as u8,
+                    (y * 255 / side) as u8,
+                    ((x * y) % 256) as u8,
+                    255,
+                )
+            })
+            .collect();
+        png::RgbaImage { pixels, width: side, height: side }.encode_png().unwrap()
+    }
+
+    #[test]
+    fn a_png_quality_search_meets_the_target_it_was_given() {
+        let source = photographic_png(160);
+        let r = png::optimize_png(&source, Some(70), Some(70.0), png::Effort::Quick)
+            .expect("a reachable target");
+        let score = r.score.expect("quality mode reports what it measured");
+        assert!(score >= 70.0, "returned {score}, below the target it was given");
+    }
+
+    /// PNG can always leave the pixels alone, which scores 100 by construction,
+    /// so a perceptual target on a PNG is never unreachable.
+    #[test]
+    fn a_png_target_no_reduction_can_meet_falls_back_to_leaving_the_pixels_alone() {
+        let source = photographic_png(160);
+        let r = png::optimize_png(&source, Some(70), Some(99.0), png::Effort::Quick)
+            .expect("lossless always satisfies");
+        assert!(!r.quantized, "colours were reduced despite a target none could meet");
+        assert!(r.score.unwrap() >= 99.0);
+    }
+
+    #[test]
+    fn a_png_too_small_to_score_is_refused_in_quality_mode() {
+        let source = photographic_png(64);
+        let refused = png::optimize_png(&source, Some(70), Some(80.0), png::Effort::Quick);
+        assert!(matches!(refused, Err(Error::TooSmall { .. })));
     }
 
     /// A minimal PNG carrying one text chunk, which must not survive stripping.

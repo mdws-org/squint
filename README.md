@@ -61,7 +61,9 @@ Note that an already-open Get Info window will keep showing camera and location 
 
 **Fast** is the default. It encodes once at a fixed quality and evaluates no metric, which matches ImageOptim's speed.
 
-**Quality** searches at full resolution and returns the smallest file that still meets the perceptual target.
+**Quality** searches at full resolution and returns the smallest file that still meets the perceptual target. For JPEG the lever is the encoder's quality setting; for PNG it is the number of colours, since that is what PNG trades away. Neither scale predicts a perceptual score, so both are searched rather than assumed.
+
+PNG has an option JPEG does not: leaving the pixels alone, which is identical to the source and so meets any target by construction. A perceptual target on a PNG is therefore never unreachable, only expensive — where no reduction in colours will meet it, the result is the lossless one. Measured on a 400x300 Display P3 screenshot: at a target of 80 the search returns 55 KB scoring 88.3, smaller than fast mode's 61 KB; at a target of 90 no reduction qualifies and the answer is the 121 KB lossless file.
 
 **Strip** removes metadata and nothing else. The pixels are copied unchanged, so the result is identical to the input image, and only the container shrinks. An HDR gain map is kept, because it is part of the picture rather than a record of where it was taken.
 

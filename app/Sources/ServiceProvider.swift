@@ -50,9 +50,11 @@ final class ServiceProvider: NSObject {
         }
 
         Task { @MainActor in
-            // Bring the window forward so progress is visible. Work started from
-            // Finder is otherwise invisible until it finishes.
-            NSApp.activate(ignoringOtherApps: true)
+            // Put the window on screen before queueing. Work started from Finder
+            // is otherwise invisible: the application keeps running with no
+            // window so the services stay available, and activating it alone
+            // shows nothing at all.
+            MainWindow.show()
             // The mode goes with the files rather than onto the queue. Setting
             // it here used to move the window's picker too, so the next file
             // dropped on the window was treated as whatever was last

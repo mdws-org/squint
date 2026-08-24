@@ -220,14 +220,23 @@ pub struct PngResult {
 pub fn optimize_png(
     bytes: &[u8],
     min_quality: Option<u8>,
-    measure: bool,
+    target: Option<f64>,
     effort: Effort,
 ) -> Result<PngResult, Error> {
     let source = RgbaImage::decode(bytes)?;
 
-    let (candidate, quantized) = match min_quality {
-        Some(min) => (quantize(&source, min, 100)?, true),
-        None => (RgbaImage::decode(bytes)?, false),
+    let (candidate, quantized) = match target {
+        // Quality mode. The colour floor is searched rather than taken on trust,
+        // because it is imagequant's own scale and says nothing about how the
+        // result will score.
+        Some(t) => match search_colours(&source, t)? {
+            Some(floor) => (quantize(&source, floor, 100)?, true),
+            None => (RgbaImage::decode(bytes)?, false),
+        },
+        None => match min_quality {
+            Some(min) => (quantize(&source, min, 100)?, true),
+            None => (RgbaImage::decode(bytes)?, false),
+        },
     };
 
     let encoded = candidate.encode_png()?;
@@ -246,13 +255,64 @@ pub fn optimize_png(
         });
     }
 
-    let score = if measure && source.shorter_side() >= crate::MIN_PERCEPTUAL_DIM {
-        Some(score_rgba(&source, &candidate)?)
-    } else {
-        None
+    // Quality mode reports what this result actually scored. Fast mode measures
+    // nothing, which is what makes it fast.
+    let score = match target {
+        Some(_) => Some(score_rgba(&source, &candidate)?),
+        None => None,
     };
 
     Ok(PngResult { data: optimized, score, quantized })
+}
+
+/// Probes the search may spend. Each one quantizes, encodes and scores.
+const MAX_COLOUR_PROBES: usize = 6;
+
+/// Find the fewest colours that still meet the perceptual target.
+///
+/// The lever is imagequant's quality floor, which is its own scale and predicts
+/// nothing about SSIMULACRA2 — so it is searched rather than assumed, the way
+/// the JPEG path searches its quality setting. Fewer colours means a smaller
+/// file, so the search wants the lowest floor that still satisfies.
+///
+/// The floor is not reliably monotonic in the score, so the best satisfying
+/// probe is kept rather than the endpoint of the bracket, for the same reason
+/// the JPEG search keeps its own.
+///
+/// PNG has an option JPEG does not: leaving the pixels alone. That is
+/// pixel-identical to the source and so meets any target by construction, which
+/// makes it the answer when no reduction does. A perceptual target on a PNG can
+/// therefore never be unreachable, only expensive.
+fn search_colours(source: &RgbaImage, target: f64) -> Result<Option<u8>, Error> {
+    if source.shorter_side() < crate::MIN_PERCEPTUAL_DIM {
+        return Err(Error::TooSmall { shorter_side: source.shorter_side() });
+    }
+
+    let (mut lo, mut hi) = (0u8, 100u8);
+    let mut best: Option<u8> = None;
+
+    for _ in 0..MAX_COLOUR_PROBES {
+        if lo > hi {
+            break;
+        }
+        let floor = lo + (hi - lo) / 2;
+        // imagequant refuses outright when it cannot reach the floor it was
+        // given. That is a failure of this probe, not of the search: a lower
+        // floor may still satisfy, so it is treated as a floor that did not.
+        match quantize(source, floor, 100) {
+            Ok(reduced) if score_rgba(source, &reduced)? >= target => {
+                best = Some(floor);
+                match floor.checked_sub(1) {
+                    Some(next) => hi = next,
+                    None => break, // nothing below zero left to try
+                }
+            }
+            _ => lo = floor.saturating_add(1),
+        }
+    }
+
+    // `None` means nothing reduced far enough, and the pixels are left alone.
+    Ok(best)
 }
 
 
