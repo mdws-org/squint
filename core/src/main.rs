@@ -109,7 +109,7 @@ fn main() {
         let t0 = Instant::now();
         let measure = mode == "quality";
         let effort = if mode == "quality" { png::Effort::Thorough } else { png::Effort::Quick };
-        match png::optimize_png(&bytes, png_min_quality, measure, effort) {
+        match png::optimize_png(&bytes, png_min_quality, measure.then_some(target), effort) {
             Ok(r) => {
                 println!(
                     "{}  {:>7.0} KB -> {:>7.0} KB  {:>5.1}%  {}{}  {:.3}s",

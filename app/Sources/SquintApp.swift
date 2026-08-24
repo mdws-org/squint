@@ -5,8 +5,9 @@ struct SquintApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     var body: some Scene {
-        Window("Squint", id: "main") {
+        Window("Squint", id: MainWindow.id) {
             ContentView()
+                .capturesItsOpener()
         }
         .windowResizability(.contentSize)
     }
