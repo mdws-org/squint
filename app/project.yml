@@ -17,8 +17,8 @@ targets:
       base:
         PRODUCT_NAME: Squint
         PRODUCT_BUNDLE_IDENTIFIER: net.mdws.squint
-        MARKETING_VERSION: "0.1.2"
-        CURRENT_PROJECT_VERSION: "3"
+        MARKETING_VERSION: "0.1.3"
+        CURRENT_PROJECT_VERSION: "4"
         SWIFT_VERSION: "5.0"
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Squint-Bridging-Header.h
         HEADER_SEARCH_PATHS: $(SRCROOT)/../core/include
