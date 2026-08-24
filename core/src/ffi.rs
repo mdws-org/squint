@@ -40,10 +40,15 @@ pub struct SquintResult {
     /// Non-zero when the colour count was reduced to shrink the file.
     pub quantized: c_int,
     pub error: c_int,
+    /// Human-readable error details allocated by Rust, or null when no message is set.
+    pub error_message: *mut c_char,
 }
 
 impl SquintResult {
-    fn failure(error: c_int, original_len: usize) -> Self {
+    fn failure(error: c_int, original_len: usize, message: Option<&str>) -> Self {
+        let error_message = message
+            .and_then(|s| std::ffi::CString::new(s).ok())
+            .map_or(std::ptr::null_mut(), |c| c.into_raw());
         SquintResult {
             data: std::ptr::null_mut(),
             len: 0,
@@ -52,6 +57,7 @@ impl SquintResult {
             hdr: SQUINT_HDR_ABSENT,
             quantized: 0,
             error,
+            error_message,
         }
     }
 }
@@ -87,7 +93,7 @@ pub unsafe extern "C" fn squint_optimize(
     png_min_quality: c_int,
 ) -> SquintResult {
     if input.is_null() || input_len == 0 {
-        return SquintResult::failure(SQUINT_ERR_NULL_INPUT, 0);
+        return SquintResult::failure(SQUINT_ERR_NULL_INPUT, 0, None);
     }
     let bytes = std::slice::from_raw_parts(input, input_len);
     // Every mode is named here. Collapsing the unrecognised case into fast is
@@ -127,9 +133,10 @@ pub unsafe extern "C" fn squint_optimize(
                 },
                 quantized: c_int::from(out.quantized),
                 error: SQUINT_OK,
+                error_message: std::ptr::null_mut(),
             }
         }
-        Err(e) => SquintResult::failure(code_for(&e), input_len),
+        Err(e) => SquintResult::failure(code_for(&e), input_len, Some(&e.to_string())),
     }
 }
 
@@ -143,6 +150,9 @@ pub unsafe extern "C" fn squint_result_free(result: SquintResult) {
     if !result.data.is_null() && result.len > 0 {
         drop(Vec::from_raw_parts(result.data, result.len, result.len));
     }
+    if !result.error_message.is_null() {
+        drop(std::ffi::CString::from_raw(result.error_message));
+    }
 }
 
 /// A static, human-readable description of an error code. Never null, never freed.
@@ -150,11 +160,11 @@ pub unsafe extern "C" fn squint_result_free(result: SquintResult) {
 pub extern "C" fn squint_error_message(code: c_int) -> *const c_char {
     let s: &'static [u8] = match code {
         SQUINT_OK => b"ok\0",
-        SQUINT_ERR_DECODE => b"the image could not be decoded\0",
-        SQUINT_ERR_ENCODE => b"the image could not be encoded\0",
-        SQUINT_ERR_METRIC => b"the perceptual metric failed\0",
-        SQUINT_ERR_TOO_SMALL => b"too small to judge perceptually; use fast mode\0",
-        SQUINT_ERR_UNREACHABLE => b"the quality target cannot be reached for this image\0",
+        SQUINT_ERR_DECODE => b"the image could not be decoded; the file was not changed\0",
+        SQUINT_ERR_ENCODE => b"the image could not be encoded; the file was not changed\0",
+        SQUINT_ERR_METRIC => b"the perceptual metric failed; the file was not changed\0",
+        SQUINT_ERR_TOO_SMALL => b"too small to judge perceptually. Use fast mode; the file was not changed\0",
+        SQUINT_ERR_UNREACHABLE => b"the quality target cannot be reached for this image; the file was not changed\0",
         SQUINT_ERR_NO_SMALLER => b"already optimal; a smaller file is not possible\0",
         SQUINT_ERR_NULL_INPUT => b"no input was provided\0",
         SQUINT_ERR_TOO_LARGE => b"this image is too large to open safely; the file was not changed\0",

@@ -37,6 +37,11 @@ typedef struct {
     int      hdr;     // one of the SQUINT_HDR_ values
     int      quantized; // non-zero when the colour count was reduced
     int      error;   // SQUINT_OK, or one of the SQUINT_ERR_ values
+    // This failure's own sentence, carrying whatever numbers it measured, or
+    // null when there is none. Owned by Rust and released by squint_result_free
+    // along with the data buffer. When it is null, squint_error_message(error)
+    // is the description to show.
+    const char *error_message;
 } SquintResult;
 
 // Format is detected from the bytes. png_min_quality below 0 disables quantization.

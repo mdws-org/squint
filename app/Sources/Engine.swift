@@ -57,7 +57,12 @@ enum Engine {
         defer { squint_result_free(result) }
 
         guard result.error == SQUINT_OK, let bytes = result.data else {
-            let message = String(cString: squint_error_message(result.error))
+            let message: String
+            if let msgPtr = result.error_message, msgPtr.pointee != 0 {
+                message = String(cString: msgPtr)
+            } else {
+                message = String(cString: squint_error_message(result.error))
+            }
             throw Failure(code: result.error, message: message)
         }
 

@@ -82,16 +82,16 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Decode(m) => write!(f, "decode failed: {m}"),
-            Error::Encode(m) => write!(f, "encode failed: {m}"),
-            Error::Metric(m) => write!(f, "metric failed: {m}"),
+            Error::Decode(m) => write!(f, "decode failed: {m}; the file was not changed"),
+            Error::Encode(m) => write!(f, "encode failed: {m}; the file was not changed"),
+            Error::Metric(m) => write!(f, "metric failed: {m}; the file was not changed"),
             Error::TooSmall { shorter_side } => write!(
                 f,
-                "image is {shorter_side}px on its shorter side; perceptual targeting requires at least {MIN_PERCEPTUAL_DIM}px"
+                "image is {shorter_side}px on its shorter side. Perceptual targeting requires at least {MIN_PERCEPTUAL_DIM}px; the file was not changed"
             ),
             Error::Unreachable { best_score } => write!(
                 f,
-                "target unreachable; best achievable score was {best_score:.2}"
+                "target unreachable; best achievable score was {best_score:.2}; the file was not changed"
             ),
             Error::NoSmallerResult { best_bytes, original_bytes } => write!(
                 f,
@@ -99,7 +99,7 @@ impl std::fmt::Display for Error {
             ),
             Error::TooLarge { width, height } => write!(
                 f,
-                "image declares {width}x{height} pixels, beyond the {MAX_PIXELS} the engine will decode"
+                "image declares {width}x{height} pixels, beyond the {MAX_PIXELS} the engine will decode; the file was not changed"
             ),
             Error::Panicked => write!(f, "the engine failed unexpectedly; the file was not changed"),
         }
@@ -783,6 +783,82 @@ mod tests {
         match search(&img, 80.0, 4, 999_999, None) {
             Err(Error::TooSmall { shorter_side }) => assert_eq!(shorter_side, 100),
             other => panic!("expected TooSmall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_display_includes_file_unmodified_statement_and_specifics() {
+        let err_too_small = Error::TooSmall { shorter_side: 100 };
+        assert_eq!(
+            err_too_small.to_string(),
+            "image is 100px on its shorter side. Perceptual targeting requires at least 113px; the file was not changed"
+        );
+
+        let err_unreachable = Error::Unreachable { best_score: 88.20 };
+        assert_eq!(
+            err_unreachable.to_string(),
+            "target unreachable; best achievable score was 88.20; the file was not changed"
+        );
+
+        let err_no_smaller = Error::NoSmallerResult { best_bytes: 612000, original_bytes: 480000 };
+        assert_eq!(
+            err_no_smaller.to_string(),
+            "target is only reachable at 612000 bytes, larger than the original 480000; keeping the original"
+        );
+
+        let err_too_large = Error::TooLarge { width: 60000, height: 60000 };
+        assert_eq!(
+            err_too_large.to_string(),
+            "image declares 60000x60000 pixels, beyond the 250000000 the engine will decode; the file was not changed"
+        );
+
+        let err_decode = Error::Decode("invalid header".into());
+        assert_eq!(err_decode.to_string(), "decode failed: invalid header; the file was not changed");
+
+        let err_encode = Error::Encode("out of memory".into());
+        assert_eq!(err_encode.to_string(), "encode failed: out of memory; the file was not changed");
+
+        let err_metric = Error::Metric("dimension mismatch".into());
+        assert_eq!(err_metric.to_string(), "metric failed: dimension mismatch; the file was not changed");
+
+        let err_panic = Error::Panicked;
+        assert_eq!(err_panic.to_string(), "the engine failed unexpectedly; the file was not changed");
+    }
+
+    #[test]
+    fn ffi_error_reporting_provides_specific_message_and_static_fallbacks() {
+        use std::ffi::CStr;
+
+        unsafe {
+            let msg_ptr = ffi::squint_error_message(ffi::SQUINT_ERR_DECODE);
+            let msg = CStr::from_ptr(msg_ptr).to_str().unwrap();
+            assert_eq!(msg, "the image could not be decoded; the file was not changed");
+
+            let msg_opt_ptr = ffi::squint_error_message(ffi::SQUINT_ERR_NO_SMALLER);
+            let msg_opt = CStr::from_ptr(msg_opt_ptr).to_str().unwrap();
+            assert_eq!(msg_opt, "already optimal; a smaller file is not possible");
+        }
+
+        let bad_input = b"not an image";
+        let res = unsafe {
+            ffi::squint_optimize(
+                bad_input.as_ptr(),
+                bad_input.len(),
+                ffi::SQUINT_MODE_FAST,
+                80.0,
+                75.0,
+                70,
+            )
+        };
+        assert_ne!(res.error, ffi::SQUINT_OK);
+        assert!(!res.error_message.is_null());
+        unsafe {
+            let cstr = CStr::from_ptr(res.error_message).to_str().unwrap();
+            assert!(
+                cstr.contains("the file was not changed"),
+                "expected failure message to state the file was not changed, got: {cstr}"
+            );
+            ffi::squint_result_free(res);
         }
     }
 }
