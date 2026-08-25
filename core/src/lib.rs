@@ -133,6 +133,21 @@ pub struct Image {
     pub height: usize,
 }
 
+/// Fit a decoded picture inside a long-edge cap, if one applies.
+///
+/// Lanczos, because the cap exists to make a picture that will be looked at
+/// rather than archived, and a cheap filter shows on exactly the fine detail a
+/// roof photograph is sent to show. A picture already inside the cap is
+/// returned untouched: this never enlarges.
+fn capped(img: image::DynamicImage, max_dimension: Option<u32>) -> image::DynamicImage {
+    match max_dimension {
+        Some(cap) if img.width().max(img.height()) > cap => {
+            img.resize(cap, cap, image::imageops::FilterType::Lanczos3)
+        }
+        _ => img,
+    }
+}
+
 impl Image {
     pub fn from_rgb8(bytes: &[u8], width: usize, height: usize) -> Self {
         let pixels = bytes.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
@@ -140,7 +155,11 @@ impl Image {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        let img = decode_limited(bytes)?.to_rgb8();
+        Self::decode_capped(bytes, None)
+    }
+
+    pub fn decode_capped(bytes: &[u8], max_dimension: Option<u32>) -> Result<Self, Error> {
+        let img = capped(decode_limited(bytes)?, max_dimension).to_rgb8();
         let (w, h) = (img.width() as usize, img.height() as usize);
         Ok(Image::from_rgb8(&img.into_raw(), w, h))
     }
@@ -472,6 +491,7 @@ pub fn optimize(
     fixed_quality: f32,
     png_min_quality: Option<u8>,
     max_probes: usize,
+    max_dimension: Option<u32>,
 ) -> Result<Optimized, Error> {
     if mode == Mode::Strip {
         // A HEIF is stripped by destroying its metadata where it lies rather
@@ -581,6 +601,7 @@ pub fn optimize(
             png_min_quality,
             (mode == Mode::Quality).then_some(target),
             effort,
+            max_dimension,
         )?;
         return Ok(Optimized {
             data: r.data,
@@ -592,7 +613,7 @@ pub fn optimize(
         });
     }
 
-    let mut image = Image::decode(bytes)?;
+    let mut image = Image::decode_capped(bytes, max_dimension)?;
     let icc = extract_icc(bytes);
     let orientation = extract_orientation(bytes);
     image.apply_orientation(orientation);
@@ -727,7 +748,7 @@ mod tests {
     #[test]
     fn a_png_quality_search_meets_the_target_it_was_given() {
         let source = photographic_png(160);
-        let r = png::optimize_png(&source, Some(70), Some(70.0), png::Effort::Quick)
+        let r = png::optimize_png(&source, Some(70), Some(70.0), png::Effort::Quick, None)
             .expect("a reachable target");
         let score = r.score.expect("quality mode reports what it measured");
         assert!(score >= 70.0, "returned {score}, below the target it was given");
@@ -738,7 +759,7 @@ mod tests {
     #[test]
     fn a_png_target_no_reduction_can_meet_falls_back_to_leaving_the_pixels_alone() {
         let source = photographic_png(160);
-        let r = png::optimize_png(&source, Some(70), Some(99.0), png::Effort::Quick)
+        let r = png::optimize_png(&source, Some(70), Some(99.0), png::Effort::Quick, None)
             .expect("lossless always satisfies");
         assert!(!r.quantized, "colours were reduced despite a target none could meet");
         assert!(r.score.unwrap() >= 99.0);
@@ -747,7 +768,7 @@ mod tests {
     #[test]
     fn a_png_too_small_to_score_is_refused_in_quality_mode() {
         let source = photographic_png(64);
-        let refused = png::optimize_png(&source, Some(70), Some(80.0), png::Effort::Quick);
+        let refused = png::optimize_png(&source, Some(70), Some(80.0), png::Effort::Quick, None);
         assert!(matches!(refused, Err(Error::TooSmall { .. })));
     }
 
@@ -957,6 +978,7 @@ mod tests {
                 80.0,
                 75.0,
                 70,
+                0,
             )
         };
         assert_ne!(res.error, ffi::SQUINT_OK);

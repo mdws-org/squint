@@ -8,9 +8,9 @@ Most optimizers ask you to choose a quality setting once and then apply it to ev
 
 Working. JPEG and PNG are implemented. Builds are published on the releases page, but none of them is signed by a paid developer account, so macOS blocks the first launch.
 
-What runs today: a drag and drop window, three Finder Services entries, in-place replacement that preserves Finder tags, and a command line harness for measurement.
+What runs today: a drag and drop window, four Finder Services entries, in-place replacement that preserves Finder tags, and a command line harness for measurement.
 
-What does not exist yet: WebP, AVIF, GIF and SVG input; shrinking a HEIC or a TIFF, either of which can currently only have its metadata removed; Balanced mode; recipes; WebP and AVIF output; PDF; automatic updates; HDR gain maps through a re-encode, which Strip keeps but Fast and Quality report as removed.
+What does not exist yet: WebP, AVIF, GIF and SVG input; shrinking a HEIC or a TIFF, either of which can currently only have its metadata removed; Balanced mode; further recipes beyond the email preset; WebP and AVIF output; PDF; automatic updates; HDR gain maps through a re-encode, which Strip keeps but Fast and Quality report as removed.
 
 ## Why this exists
 
@@ -71,6 +71,7 @@ The application is unsandboxed by design. Replacing arbitrary files in place is 
 Drop images on the window, or right-click them in Finder and choose **Services**, then one of:
 
 - **Squint: Shrink** does the everyday job. It encodes once at a fixed quality and measures nothing.
+- **Squint: Shrink for Email** resizes to 2048 pixels on the long edge and writes the result beside the original as `name-email.jpg`. The original is not touched: the cap throws resolution away, and a photograph kept as documentation should not lose it because a copy was being made for an email. Measured on a 4032x3024 photograph, the copy is 129 KB, so about thirty fit under any provider's attachment limit.
 - **Squint: Shrink to a Quality Target** searches for the smallest file that still meets a perceptual score.
 - **Squint: Remove Location Data** takes out where and when a photograph was taken, and what took it, without touching the pixels.
 

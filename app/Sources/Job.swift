@@ -17,13 +17,15 @@ final class Job: ObservableObject, Identifiable {
     let url: URL
     /// Fixed when the job is queued. A right-click carries its own instruction,
     /// and the window's picker must not be able to change it afterwards.
-    let mode: Engine.Mode
+    let preset: Preset
     let target: Double
     @Published var state: State = .waiting
 
-    init(url: URL, mode: Engine.Mode, target: Double) {
+    var mode: Engine.Mode { preset.mode }
+
+    init(url: URL, preset: Preset, target: Double) {
         self.url = url
-        self.mode = mode
+        self.preset = preset
         self.target = target
     }
 
@@ -67,6 +69,11 @@ final class Job: ObservableObject, Identifiable {
             }
             if mode == .strip {
                 text += ", \(format(bytes))"
+            }
+            // A preset that wrote beside the original says where, since the
+            // point of the run is the new file rather than the old one.
+            if preset.suffix != nil {
+                text = "wrote \(preset.destination(for: url).lastPathComponent), " + text
             }
             return text
         }

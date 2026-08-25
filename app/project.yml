@@ -73,6 +73,17 @@ targets:
               NSTextContent: FilePath
             NSServiceDescription: Shrink images in place, keeping the colour profile
           - NSMenuItem:
+              default: "Squint: Shrink for Email"
+            NSMessage: shrinkForEmail
+            NSPortName: Squint
+            NSSendFileTypes:
+              - public.jpeg
+              - public.png
+            NSRequiredContext:
+              NSApplicationIdentifier: com.apple.finder
+              NSTextContent: FilePath
+            NSServiceDescription: Shrink to 2048 pixels beside the original, sized for sending
+          - NSMenuItem:
               default: "Squint: Shrink to a Quality Target"
             NSMessage: optimizeQuality
             NSPortName: Squint

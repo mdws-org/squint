@@ -28,6 +28,7 @@ fn usage() -> ! {
   --quality      fixed quality for fast mode (default 75)
   --probes       maximum encodes during a search (default 6)
   --png-quality  palette quality floor for PNG, negative for lossless (default 70)
+  --max-dimension  cap the long edge in pixels; never enlarges (default none)
   --out          write the result to this path
   --against      score this image against another instead of encoding"
     );
@@ -46,6 +47,7 @@ fn main() {
     let mut probes = 6usize;
     let mut against: Option<String> = None;
     let mut out_path: Option<String> = None;
+    let mut max_dimension: Option<u32> = None;
     // The same default the application sends. It used to be lossless here and
     // quantized there, so every PNG number ever measured on this harness
     // described something the application does not do.
@@ -64,6 +66,10 @@ fn main() {
             // Negative means lossless, matching the C interface. A value that
             // does not parse is a mistake worth stopping for, not a silent
             // switch to a different kind of compression.
+            "--max-dimension" => {
+                let v: u32 = next.and_then(|v| v.parse().ok()).unwrap_or_else(|| usage());
+                max_dimension = (v > 0).then_some(v);
+            }
             "--png-quality" => {
                 let v: i32 = next.and_then(|v| v.parse().ok()).unwrap_or_else(|| usage());
                 png_min_quality = (v >= 0).then(|| v.min(100) as u8);
@@ -82,7 +88,7 @@ fn main() {
     };
     if mode == "strip" {
         let t0 = Instant::now();
-        match optimize(&bytes, Mode::Strip, 0.0, 0.0, None, probes) {
+        match optimize(&bytes, Mode::Strip, 0.0, 0.0, None, probes, None) {
             Ok(r) => {
                 println!(
                     "{}  {:>7.0} KB -> {:>7.0} KB  {:>5.1}%  metadata removed, pixels untouched{}  {:.3}s",
@@ -109,7 +115,7 @@ fn main() {
         let t0 = Instant::now();
         let measure = mode == "quality";
         let effort = if mode == "quality" { png::Effort::Thorough } else { png::Effort::Quick };
-        match png::optimize_png(&bytes, png_min_quality, measure.then_some(target), effort) {
+        match png::optimize_png(&bytes, png_min_quality, measure.then_some(target), effort, max_dimension) {
             Ok(r) => {
                 println!(
                     "{}  {:>7.0} KB -> {:>7.0} KB  {:>5.1}%  {}{}  {:.3}s",
@@ -135,7 +141,7 @@ fn main() {
     // the reason should be the one the engine gives rather than a decoder's
     // complaint about a format it was never taught.
     if squint_core::heif::is_heif(&bytes) || squint_core::tiff::is_tiff(&bytes) {
-        match optimize(&bytes, Mode::Fast, target, fixed_quality, png_min_quality, probes) {
+        match optimize(&bytes, Mode::Fast, target, fixed_quality, png_min_quality, probes, None) {
             Ok(_) => unreachable!("neither format can be re-encoded"),
             Err(e) => { eprintln!("{e}"); std::process::exit(1) }
         }
@@ -198,7 +204,7 @@ fn main() {
                 );
                 std::process::exit(1)
             }
-            let r = optimize(&bytes, requested, target, fixed_quality, png_min_quality, probes)
+            let r = optimize(&bytes, requested, target, fixed_quality, png_min_quality, probes, max_dimension)
                 .unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(1) });
             let elapsed = started.elapsed().as_secs_f64();
 

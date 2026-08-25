@@ -46,9 +46,12 @@ typedef struct {
     const char *error_message;
 } SquintResult;
 
-// Format is detected from the bytes. png_min_quality below 0 disables quantization.
+// Format is detected from the bytes. png_min_quality below 0 disables
+// quantization. max_dimension caps the long edge in pixels; 0 leaves the
+// picture its own size. The cap never enlarges.
 SquintResult squint_optimize(const uint8_t *input, size_t input_len, int mode,
-                             double target, float fixed_quality, int png_min_quality);
+                             double target, float fixed_quality, int png_min_quality,
+                             int max_dimension);
 
 void squint_result_free(SquintResult result);
 
