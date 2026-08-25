@@ -33,13 +33,23 @@ final class Job: ObservableObject, Identifiable {
         switch state {
         case .waiting: return "waiting"
         case .working: return "working"
-        case .alreadyOptimal: return "already optimal"
+        // Strip found nothing to take out, which is a statement about privacy
+        // rather than size. "Already optimal" would be the wrong claim: a file
+        // can be as small as it will go and still carry a location.
+        case .alreadyOptimal:
+            return mode == .strip ? "nothing to remove" : "already optimal"
         case .failed(let message): return message
         case .done(let bytes, let original, let score, let hdr, let quantized):
             let saved = 100 - (100 * Double(bytes) / Double(original))
-            var text = "\(format(original)) to \(format(bytes)), \(Int(saved.rounded()))% smaller"
+            // Strip is run to answer a question about the file's contents, not
+            // its size, so it leads with what came out. A byte count is the
+            // wrong headline for a mode whose whole point is that the pixels
+            // did not change.
+            var text = mode == .strip
+                ? "location and camera data removed"
+                : "\(format(original)) to \(format(bytes)), \(Int(saved.rounded()))% smaller"
             if let score {
-                text += String(format: ", score %.1f", score)
+                text += String(format: ", score %.1f (%@)", score, Self.band(score))
             }
             // Losing the extra range changes how the picture looks on a display
             // that can show it, so it is said out loud rather than left to be
@@ -55,7 +65,21 @@ final class Job: ObservableObject, Identifiable {
             if quantized {
                 text += ", colours reduced"
             }
+            if mode == .strip {
+                text += ", \(format(bytes))"
+            }
             return text
+        }
+    }
+
+    /// What a SSIMULACRA2 score means, since the number alone says nothing to
+    /// anyone who has not read the metric's calibration.
+    private static func band(_ score: Double) -> String {
+        switch score {
+        case 90...: return "visually lossless"
+        case 80..<90: return "high"
+        case 70..<80: return "good for web"
+        default: return "low"
         }
     }
 
