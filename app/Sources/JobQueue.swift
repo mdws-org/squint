@@ -62,8 +62,12 @@ final class JobQueue: ObservableObject {
     /// queued as Strip must not be re-encoded because something else changed the
     /// window's picker in between.
     func add(_ urls: [URL], mode: Engine.Mode, target: Double? = nil) {
+        add(urls, preset: .plain(mode), target: target)
+    }
+
+    func add(_ urls: [URL], preset: Preset, target: Double? = nil) {
         let requested = target ?? self.target
-        jobs.append(contentsOf: urls.map { Job(url: $0, mode: mode, target: requested) })
+        jobs.append(contentsOf: urls.map { Job(url: $0, preset: preset, target: requested) })
 
         // Claimed here, synchronously, rather than inside the task. `run` is
         // enqueued and not executed, so two calls landing before it starts would
@@ -107,8 +111,8 @@ final class JobQueue: ObservableObject {
                     pending = pending.dropFirst()
                     active += 1
                     job.state = .working
-                    let (mode, target) = (job.mode, job.target)
-                    group.addTask { await Self.process(job, mode: mode, target: target) }
+                    let (preset, target) = (job.preset, job.target)
+                    group.addTask { await Self.process(job, preset: preset, target: target) }
                 }
                 if active > 0 {
                     await group.next()
@@ -120,13 +124,25 @@ final class JobQueue: ObservableObject {
 
     /// Read, optimize, and replace. The work happens off the main actor; only the
     /// state update comes back to it.
-    private static func process(_ job: Job, mode: Engine.Mode, target: Double) async {
+    private static func process(_ job: Job, preset: Preset, target: Double) async {
         let url = await job.url
         let outcome: Job.State = await Task.detached(priority: .userInitiated) {
             do {
                 let input = try Data(contentsOf: url)
-                let result = try Engine.optimize(input, mode: mode, target: target)
-                try Writer.replaceInPlace(url, with: result.data)
+                let result = try Engine.optimize(
+                    input,
+                    mode: preset.mode,
+                    target: target,
+                    maxDimension: preset.maxDimension
+                )
+                let destination = preset.destination(for: url)
+                if destination == url {
+                    try Writer.replaceInPlace(url, with: result.data)
+                } else {
+                    // A derived copy: the original is not touched, and a copy
+                    // from an earlier run of the same preset is replaced.
+                    try result.data.write(to: destination, options: .atomic)
+                }
                 return .done(
                     bytes: result.data.count,
                     originalBytes: result.originalBytes,

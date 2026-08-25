@@ -20,6 +20,14 @@ final class ServiceProvider: NSObject {
         run(pasteboard, mode: .fast, error: error)
     }
 
+    @objc func shrinkForEmail(
+        _ pasteboard: NSPasteboard,
+        userData: String?,
+        error: AutoreleasingUnsafeMutablePointer<NSString>
+    ) {
+        run(pasteboard, preset: .email, error: error)
+    }
+
     @objc func optimizeQuality(
         _ pasteboard: NSPasteboard,
         userData: String?,
@@ -41,6 +49,14 @@ final class ServiceProvider: NSObject {
         mode: Engine.Mode,
         error: AutoreleasingUnsafeMutablePointer<NSString>
     ) {
+        run(pasteboard, preset: .plain(mode), error: error)
+    }
+
+    private func run(
+        _ pasteboard: NSPasteboard,
+        preset: Preset,
+        error: AutoreleasingUnsafeMutablePointer<NSString>
+    ) {
         let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] ?? []
         let images = urls.filter { Self.isSupported($0) }
 
@@ -59,7 +75,7 @@ final class ServiceProvider: NSObject {
             // it here used to move the window's picker too, so the next file
             // dropped on the window was treated as whatever was last
             // right-clicked.
-            JobQueue.shared.add(images, mode: mode)
+            JobQueue.shared.add(images, preset: preset)
         }
     }
 

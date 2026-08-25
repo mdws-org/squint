@@ -19,7 +19,11 @@ pub struct RgbaImage {
 
 impl RgbaImage {
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        let img = crate::decode_limited(bytes)?.to_rgba8();
+        Self::decode_capped(bytes, None)
+    }
+
+    pub fn decode_capped(bytes: &[u8], max_dimension: Option<u32>) -> Result<Self, Error> {
+        let img = crate::capped(crate::decode_limited(bytes)?, max_dimension).to_rgba8();
         let (width, height) = (img.width() as usize, img.height() as usize);
         let pixels = img
             .into_raw()
@@ -222,8 +226,9 @@ pub fn optimize_png(
     min_quality: Option<u8>,
     target: Option<f64>,
     effort: Effort,
+    max_dimension: Option<u32>,
 ) -> Result<PngResult, Error> {
-    let source = RgbaImage::decode(bytes)?;
+    let source = RgbaImage::decode_capped(bytes, max_dimension)?;
 
     let (candidate, quantized) = match target {
         // Quality mode. The colour floor is searched rather than taken on trust,
@@ -231,11 +236,11 @@ pub fn optimize_png(
         // result will score.
         Some(t) => match search_colours(&source, t)? {
             Some(floor) => (quantize(&source, floor, 100)?, true),
-            None => (RgbaImage::decode(bytes)?, false),
+            None => (RgbaImage::decode_capped(bytes, max_dimension)?, false),
         },
         None => match min_quality {
             Some(min) => (quantize(&source, min, 100)?, true),
-            None => (RgbaImage::decode(bytes)?, false),
+            None => (RgbaImage::decode_capped(bytes, max_dimension)?, false),
         },
     };
 

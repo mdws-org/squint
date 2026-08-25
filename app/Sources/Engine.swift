@@ -48,11 +48,15 @@ enum Engine {
         mode: Mode,
         target: Double = 80,
         fixedQuality: Float = 75,
-        pngMinQuality: Int32 = 70
+        pngMinQuality: Int32 = 70,
+        maxDimension: Int32? = nil
     ) throws -> Result {
         var result = input.withUnsafeBytes { raw -> SquintResult in
             let base = raw.bindMemory(to: UInt8.self).baseAddress
-            return squint_optimize(base, input.count, mode.rawValue, target, fixedQuality, pngMinQuality)
+            return squint_optimize(
+                base, input.count, mode.rawValue, target, fixedQuality, pngMinQuality,
+                maxDimension ?? 0
+            )
         }
         defer { squint_result_free(result) }
 

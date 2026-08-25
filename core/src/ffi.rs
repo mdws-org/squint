@@ -99,6 +99,7 @@ pub unsafe extern "C" fn squint_optimize(
     target: f64,
     fixed_quality: f32,
     png_min_quality: c_int,
+    max_dimension: c_int,
 ) -> SquintResult {
     if input.is_null() || input_len == 0 {
         return SquintResult::failure(SQUINT_ERR_NULL_INPUT, 0, None);
@@ -113,13 +114,15 @@ pub unsafe extern "C" fn squint_optimize(
         _ => Mode::Fast,
     };
     let png_min = if png_min_quality < 0 { None } else { Some(png_min_quality.min(100) as u8) };
+    // Zero or below means no cap, matching how the header describes it.
+    let cap = (max_dimension > 0).then_some(max_dimension as u32);
 
     // Nothing may unwind past this frame. It is `extern "C"`, so a panic crossing
     // it aborts the process, which in a batch means every other file in flight
     // dies with no error reported to anyone. A panic is a defect either way; the
     // difference is whether one file fails or all of them do.
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        optimize(bytes, mode, target, fixed_quality, png_min, DEFAULT_PROBES)
+        optimize(bytes, mode, target, fixed_quality, png_min, DEFAULT_PROBES, cap)
     }))
     .unwrap_or(Err(Error::Panicked));
 
