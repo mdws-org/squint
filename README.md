@@ -6,7 +6,7 @@ Most optimizers ask you to choose a quality setting once and then apply it to ev
 
 ## Status
 
-Working, unreleased. JPEG and PNG are implemented. There is no signed build and no download yet.
+Working. JPEG and PNG are implemented. Builds are published on the releases page, but none of them is signed by a paid developer account, so macOS blocks the first launch.
 
 What runs today: a drag and drop window, three Finder Services entries, in-place replacement that preserves Finder tags, and a command line harness for measurement.
 
@@ -36,22 +36,45 @@ One hundred files through fast mode, eight at a time, took 9 seconds on an 8 cor
 
 ## Install
 
-There is no release yet. Build it:
+Download the `.dmg` from [Releases](https://github.com/mdws-org/squint/releases), or build it from source below. Either way it needs macOS 14 or later.
+
+The build is not signed by a paid developer account, so macOS refuses to open it the first time and says it cannot check the app for malicious software. Since macOS Sequoia, Control-clicking the app no longer offers a way past that. Instead:
+
+1. Move `Squint.app` to Applications and try to open it. It is blocked.
+2. Open System Settings, then Privacy and Security.
+3. Scroll to Security. A line about Squint appears there. Choose **Open Anyway**.
+4. Open the app again and confirm.
+
+That is once, not once per version.
+
+**Launch it once before looking for it in Finder.** The right-click entries are registered by the application itself, and they do not appear until it has run.
+
+### Building from source
+
+Needs Xcode, [XcodeGen](https://github.com/yonaskolb/XcodeGen), and a Rust toolchain. The Xcode build invokes `cargo` to build the engine.
 
 ```
 git clone https://github.com/mdws-org/squint.git
 cd squint/app
 xcodegen generate
-xcodebuild -project Squint.xcodeproj -scheme Squint -configuration Release build
+xcodebuild -scheme Squint -configuration Release -derivedDataPath build build
+cp -R build/Build/Products/Release/Squint.app /Applications
+open /Applications/Squint.app
 ```
 
-Requirements: Xcode, [XcodeGen](https://github.com/yonaskolb/XcodeGen), and a Rust toolchain. The Xcode build invokes `cargo` to build the engine.
+Without `-derivedDataPath` the built application lands somewhere under `~/Library/Developer/Xcode/DerivedData` and is easy to lose.
 
-The application is unsandboxed by design. Replacing arbitrary files in place is not possible under the App Sandbox, which is also why ImageOptim ships unsandboxed.
+The application is unsandboxed by design. Replacing arbitrary files in place is not possible under the App Sandbox, which is also why ImageOptim is distributed unsandboxed.
 
 ## Use
 
-Drop images on the window, or right-click them in Finder and choose **Services**, then **Squint (Fast)** or **Squint (Quality)**.
+Drop images on the window, or right-click them in Finder and choose **Services**, then one of:
+
+- **Squint: Shrink** does the everyday job. It encodes once at a fixed quality and measures nothing.
+- **Squint: Shrink to a Quality Target** searches for the smallest file that still meets a perceptual score.
+- **Squint: Remove Location Data** takes out where and when a photograph was taken, and what took it, without touching the pixels.
+
+The entries appear only when everything selected is a JPEG or a PNG. Select a folder, or include a HEIC, which is what an iPhone camera writes by default, and Squint is absent from the Services menu entirely with nothing to say why. That is Finder filtering on the file types each entry declares, not a broken install.
 
 Files are replaced in place. Keep copies until you trust it.
 
@@ -63,9 +86,11 @@ Note that an already-open Get Info window will keep showing camera and location 
 
 **Quality** searches at full resolution and returns the smallest file that still meets the perceptual target. For JPEG the lever is the encoder's quality setting; for PNG it is the number of colours, since that is what PNG trades away. Neither scale predicts a perceptual score, so both are searched rather than assumed.
 
-PNG has an option JPEG does not: leaving the pixels alone, which is identical to the source and so meets any target by construction. A perceptual target on a PNG is therefore never unreachable, only expensive — where no reduction in colours will meet it, the result is the lossless one. Measured on a 400x300 Display P3 screenshot: at a target of 80 the search returns 55 KB scoring 88.3, smaller than fast mode's 61 KB; at a target of 90 no reduction qualifies and the answer is the 121 KB lossless file.
+PNG has an option JPEG does not: leaving the pixels alone, which is identical to the source and so meets any target by construction. A perceptual target on a PNG is never unreachable, only expensive: where no reduction in colours will meet it, the result is the lossless one. Measured on a 400x300 Display P3 screenshot, a target of 80 returns 55 KB scoring 88.3, smaller than fast mode's 61 KB. A target of 90 finds no reduction that qualifies, and the answer is the 121 KB lossless file.
 
 **Strip** removes metadata and nothing else. The pixels are copied unchanged, so the result is identical to the input image, and only the container shrinks. An HDR gain map is kept, because it is part of the picture rather than a record of where it was taken.
+
+What it takes out includes **the date the photograph was taken**. That is deliberate, since when a photograph was taken discloses about as much as where. But it is worth naming, because it is the one field a photograph kept as documentation cannot do without, and it is not recoverable once the file has been overwritten. Strip a copy, not the master.
 
 **Balanced** is designed but not implemented. It will search a downscaled proxy and then encode at full resolution.
 

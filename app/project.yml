@@ -27,7 +27,10 @@ targets:
         # Deliberately unsandboxed. Overwriting arbitrary files in place, which is
         # the whole point of the app, is not possible under the App Sandbox.
         ENABLE_APP_SANDBOX: NO
-        ENABLE_HARDENED_RUNTIME: YES
+        # Hardened runtime is a property of a signature, so this does nothing
+        # while signing is off. It is left here, and named as inert, so that
+        # setting up notarization does not mistake it for work already done.
+        ENABLE_HARDENED_RUNTIME: YES  # inert until CODE_SIGNING_ALLOWED is YES
         CODE_SIGN_IDENTITY: "-"
         CODE_SIGNING_REQUIRED: NO
         CODE_SIGNING_ALLOWED: NO
@@ -49,11 +52,17 @@ targets:
         # alphabetically by title; there is no ordering key, so placement in the
         # menu cannot be controlled beyond the name itself.
         #
+        # Each is named for what it does rather than for how hard it works.
+        # NSServiceDescription is written below but macOS never renders it, so
+        # the title is the only thing anyone reads, and "Fast" against "Quality"
+        # asks for a decision at the moment of use that the preset should be
+        # making instead.
+        #
         # NSMessage must match the @objc method name on ServiceProvider. A
         # mismatch fails silently: the item appears and does nothing.
         NSServices:
           - NSMenuItem:
-              default: Squint (Fast)
+              default: "Squint: Shrink"
             NSMessage: optimizeFast
             NSPortName: Squint
             NSSendFileTypes:
@@ -64,7 +73,7 @@ targets:
               NSTextContent: FilePath
             NSServiceDescription: Shrink images in place, keeping the colour profile
           - NSMenuItem:
-              default: Squint (Quality)
+              default: "Squint: Shrink to a Quality Target"
             NSMessage: optimizeQuality
             NSPortName: Squint
             NSSendFileTypes:
@@ -75,7 +84,7 @@ targets:
               NSTextContent: FilePath
             NSServiceDescription: Shrink images to a perceptual quality target
           - NSMenuItem:
-              default: Squint (Strip Metadata)
+              default: "Squint: Remove Location Data"
             NSMessage: stripMetadata
             NSPortName: Squint
             NSSendFileTypes:
