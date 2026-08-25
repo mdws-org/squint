@@ -98,7 +98,7 @@ pub fn quantize(image: &RgbaImage, min_quality: u8, max_quality: u8) -> Result<R
 
     let mut res = liq
         .quantize(&mut src)
-        .map_err(|_| Error::Unreachable { best_score: min_quality as f64 })?;
+        .map_err(|_| Error::ColoursUnreachable { floor: min_quality })?;
     res.set_dithering_level(1.0).ok();
 
     let (palette, indices) = res

@@ -3,7 +3,7 @@
 //! This drives the engine without a user interface so that quality and speed can
 //! be measured against real photographs before any application exists.
 
-use squint_core::{search, encode_jpeg, score, extract_icc, extract_orientation, has_gain_map, optimize, png, Hdr, Image, Mode, JPEG_SCORE_CEILING};
+use squint_core::{score, extract_icc, extract_orientation, optimize, png, Hdr, Image, Mode, JPEG_SCORE_CEILING};
 use std::time::Instant;
 
 /// How the gain map fared, for the line the harness prints.
@@ -82,7 +82,7 @@ fn main() {
     };
     if mode == "strip" {
         let t0 = Instant::now();
-        match optimize(&bytes, Mode::Strip, 0.0, 0.0, None) {
+        match optimize(&bytes, Mode::Strip, 0.0, 0.0, None, probes) {
             Ok(r) => {
                 println!(
                     "{}  {:>7.0} KB -> {:>7.0} KB  {:>5.1}%  metadata removed, pixels untouched{}  {:.3}s",
@@ -174,67 +174,47 @@ fn main() {
 
     let started = Instant::now();
     match mode.as_str() {
-        "fast" => {
-            let out = encode_jpeg(&image, fixed_quality, icc.as_deref()).unwrap_or_else(|e| {
-                eprintln!("{e}");
-                std::process::exit(1)
-            });
-            let hdr = if has_gain_map(&bytes) { Hdr::Dropped } else { Hdr::Absent };
-            let elapsed = started.elapsed().as_secs_f64();
-            println!(
-                "fast     q{:<5.1} {:>7.0} KB  {:>5.1}% of original  {:.3}s  (no metric evaluated){}",
-                fixed_quality,
-                out.len() as f64 / 1024.0,
-                100.0 * out.len() as f64 / bytes.len() as f64,
-                elapsed,
-                hdr_note(hdr)
-            );
-            if let Some(o) = &out_path {
-                std::fs::write(o, &out).unwrap_or_else(|e| { eprintln!("write failed: {e}"); std::process::exit(1) });
-                println!("         wrote {o}");
-            }
-        }
-        "quality" => {
-            if target > JPEG_SCORE_CEILING {
+        // Both encoding modes run through `optimize`, the same call the
+        // application makes. Running a private copy of the work here is how the
+        // harness came to measure something the application does not do: its
+        // fast path had no never-grow check, so it would happily write a file
+        // larger than its input where the application refused.
+        "fast" | "quality" => {
+            let requested = if mode == "quality" { Mode::Quality } else { Mode::Fast };
+            if requested == Mode::Quality && target > JPEG_SCORE_CEILING {
                 eprintln!(
                     "target {target:.0} is above the JPEG ceiling of about {JPEG_SCORE_CEILING:.0}; \
                      the search cannot converge"
                 );
                 std::process::exit(1)
             }
-            match search(&image, target, probes, bytes.len(), icc.as_deref()) {
-                Ok(r) => {
-                    let elapsed = started.elapsed().as_secs_f64();
-                    for p in &r.probes {
-                        println!(
-                            "  probe   q{:<5.1} score {:>7.3}  {:>7.0} KB{}",
-                            p.quality,
-                            p.score,
-                            p.bytes as f64 / 1024.0,
-                            if p.quality == r.chosen.quality { "   <- chosen" } else { "" }
-                        );
-                    }
-                    let out = r.data;
-                    let hdr = if has_gain_map(&bytes) { Hdr::Dropped } else { Hdr::Absent };
-                    println!(
-                        "quality  q{:<5.1} {:>7.0} KB  {:>5.1}% of original  score {:.3}  {} probes  {:.3}s{}",
-                        r.chosen.quality,
-                        out.len() as f64 / 1024.0,
-                        100.0 * out.len() as f64 / bytes.len() as f64,
-                        r.chosen.score,
-                        r.probes.len(),
-                        elapsed,
-                        hdr_note(hdr)
-                    );
-                    if let Some(o) = &out_path {
-                        std::fs::write(o, &out).unwrap_or_else(|e| { eprintln!("write failed: {e}"); std::process::exit(1) });
-                        println!("         wrote {o}");
-                    }
-                }
-                Err(e) => {
-                    eprintln!("{e}");
-                    std::process::exit(1)
-                }
+            let r = optimize(&bytes, requested, target, fixed_quality, png_min_quality, probes)
+                .unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(1) });
+            let elapsed = started.elapsed().as_secs_f64();
+
+            for p in &r.probes {
+                println!(
+                    "  probe   q{:<5.1} score {:>7.3}  {:>7.0} KB{}",
+                    p.quality,
+                    p.score,
+                    p.bytes as f64 / 1024.0,
+                    if Some(p.score) == r.score { "   <- chosen" } else { "" }
+                );
+            }
+            println!(
+                "{:<8} q{:<5.1} {:>7.0} KB  {:>5.1}% of original{}  {} probes  {:.3}s{}",
+                mode,
+                r.probes.last().map_or(fixed_quality, |p| p.quality),
+                r.data.len() as f64 / 1024.0,
+                100.0 * r.data.len() as f64 / bytes.len() as f64,
+                match r.score { Some(s) => format!("  score {s:.3}"), None => "  (no metric evaluated)".into() },
+                r.probes.len(),
+                elapsed,
+                hdr_note(r.hdr)
+            );
+            if let Some(o) = &out_path {
+                std::fs::write(o, &r.data).unwrap_or_else(|e| { eprintln!("write failed: {e}"); std::process::exit(1) });
+                println!("         wrote {o}");
             }
         }
         "score" => {

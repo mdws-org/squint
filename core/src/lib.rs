@@ -74,6 +74,10 @@ pub enum Error {
     NoSmallerResult { best_bytes: usize, original_bytes: usize },
     /// The picture declares more pixels than the engine will decode.
     TooLarge { width: usize, height: usize },
+    /// The colour count could not be brought down to the floor that was asked
+    /// for. The floor is imagequant's own scale and is unrelated to a perceptual
+    /// score, so it is carried in its own variant rather than borrowed into one.
+    ColoursUnreachable { floor: u8 },
     /// Something below panicked. Reported rather than allowed to unwind into C,
     /// where it would abort the process and take every other job with it.
     Panicked,
@@ -100,6 +104,10 @@ impl std::fmt::Display for Error {
             Error::TooLarge { width, height } => write!(
                 f,
                 "image declares {width}x{height} pixels, beyond the {MAX_PIXELS} the engine will decode; the file was not changed"
+            ),
+            Error::ColoursUnreachable { floor } => write!(
+                f,
+                "this image cannot be reduced to a colour quality of {floor}; the file was not changed"
             ),
             Error::Panicked => write!(f, "the engine failed unexpectedly; the file was not changed"),
         }
@@ -431,6 +439,10 @@ pub enum Hdr {
 /// The outcome of optimizing one file.
 pub struct Optimized {
     pub data: Vec<u8>,
+    /// Every encode the search measured, in the order it took them. Empty on
+    /// the paths that do no searching. Carried so the command line harness can
+    /// report a search without running its own copy of one.
+    pub probes: Vec<Probe>,
     /// Absent in fast mode, and for images too small to score.
     pub score: Option<f64>,
     pub hdr: Hdr,
@@ -451,6 +463,7 @@ pub fn optimize(
     target: f64,
     fixed_quality: f32,
     png_min_quality: Option<u8>,
+    max_probes: usize,
 ) -> Result<Optimized, Error> {
     if mode == Mode::Strip {
         let (stripped, hdr) = if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
@@ -504,6 +517,7 @@ pub fn optimize(
         }
         return Ok(Optimized {
             data: stripped,
+            probes: Vec::new(),
             score: None,
             hdr,
             quantized: false,
@@ -527,6 +541,7 @@ pub fn optimize(
         )?;
         return Ok(Optimized {
             data: r.data,
+            probes: Vec::new(),
             score: r.score,
             hdr: Hdr::Absent,
             quantized: r.quantized,
@@ -539,15 +554,17 @@ pub fn optimize(
     let orientation = extract_orientation(bytes);
     image.apply_orientation(orientation);
 
-    let (data, score) = match mode {
+    let (data, score, probes) = match mode {
         // Strip is handled above and never reaches this match.
-        Mode::Fast | Mode::Strip => (encode_jpeg(&image, fixed_quality, icc.as_deref())?, None),
+        Mode::Fast | Mode::Strip => {
+            (encode_jpeg(&image, fixed_quality, icc.as_deref())?, None, Vec::new())
+        }
         Mode::Quality => {
             if target > JPEG_SCORE_CEILING {
                 return Err(Error::Unreachable { best_score: JPEG_SCORE_CEILING });
             }
-            let r = search(&image, target, 6, bytes.len(), icc.as_deref())?;
-            (r.data, Some(r.chosen.score))
+            let r = search(&image, target, max_probes, bytes.len(), icc.as_deref())?;
+            (r.data, Some(r.chosen.score), r.probes)
         }
     };
 
@@ -574,7 +591,7 @@ pub fn optimize(
             original_bytes: bytes.len(),
         });
     }
-    Ok(Optimized { data, score, hdr, quantized: false, original_bytes: bytes.len() })
+    Ok(Optimized { data, probes, score, hdr, quantized: false, original_bytes: bytes.len() })
 }
 
 #[cfg(test)]

@@ -14,6 +14,10 @@ pub const SQUINT_HDR_ABSENT: c_int = 0;
 pub const SQUINT_HDR_PRESERVED: c_int = 1;
 pub const SQUINT_HDR_DROPPED: c_int = 2;
 
+/// Encodes the search may spend on one image. The application does not choose
+/// this; only the command line harness varies it, for measurement.
+const DEFAULT_PROBES: usize = 6;
+
 pub const SQUINT_OK: c_int = 0;
 pub const SQUINT_ERR_DECODE: c_int = 1;
 pub const SQUINT_ERR_ENCODE: c_int = 2;
@@ -24,6 +28,7 @@ pub const SQUINT_ERR_NO_SMALLER: c_int = 6;
 pub const SQUINT_ERR_NULL_INPUT: c_int = 7;
 pub const SQUINT_ERR_TOO_LARGE: c_int = 8;
 pub const SQUINT_ERR_PANIC: c_int = 9;
+pub const SQUINT_ERR_COLOURS: c_int = 10;
 
 /// The result of one optimization.
 ///
@@ -71,6 +76,7 @@ fn code_for(e: &Error) -> c_int {
         Error::Unreachable { .. } => SQUINT_ERR_UNREACHABLE,
         Error::NoSmallerResult { .. } => SQUINT_ERR_NO_SMALLER,
         Error::TooLarge { .. } => SQUINT_ERR_TOO_LARGE,
+        Error::ColoursUnreachable { .. } => SQUINT_ERR_COLOURS,
         Error::Panicked => SQUINT_ERR_PANIC,
     }
 }
@@ -111,7 +117,7 @@ pub unsafe extern "C" fn squint_optimize(
     // dies with no error reported to anyone. A panic is a defect either way; the
     // difference is whether one file fails or all of them do.
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        optimize(bytes, mode, target, fixed_quality, png_min)
+        optimize(bytes, mode, target, fixed_quality, png_min, DEFAULT_PROBES)
     }))
     .unwrap_or(Err(Error::Panicked));
 
@@ -169,6 +175,7 @@ pub extern "C" fn squint_error_message(code: c_int) -> *const c_char {
         SQUINT_ERR_NULL_INPUT => b"no input was provided\0",
         SQUINT_ERR_TOO_LARGE => b"this image is too large to open safely; the file was not changed\0",
         SQUINT_ERR_PANIC => b"the engine failed unexpectedly; the file was not changed\0",
+        SQUINT_ERR_COLOURS => b"this image's colours cannot be reduced that far; the file was not changed\0",
         _ => b"unknown error\0",
     };
     s.as_ptr() as *const c_char
