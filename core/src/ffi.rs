@@ -29,6 +29,7 @@ pub const SQUINT_ERR_NULL_INPUT: c_int = 7;
 pub const SQUINT_ERR_TOO_LARGE: c_int = 8;
 pub const SQUINT_ERR_PANIC: c_int = 9;
 pub const SQUINT_ERR_COLOURS: c_int = 10;
+pub const SQUINT_ERR_READ_ONLY: c_int = 11;
 
 /// The result of one optimization.
 ///
@@ -77,6 +78,7 @@ fn code_for(e: &Error) -> c_int {
         Error::NoSmallerResult { .. } => SQUINT_ERR_NO_SMALLER,
         Error::TooLarge { .. } => SQUINT_ERR_TOO_LARGE,
         Error::ColoursUnreachable { .. } => SQUINT_ERR_COLOURS,
+        Error::ReadOnlyFormat { .. } => SQUINT_ERR_READ_ONLY,
         Error::Panicked => SQUINT_ERR_PANIC,
     }
 }
@@ -176,6 +178,7 @@ pub extern "C" fn squint_error_message(code: c_int) -> *const c_char {
         SQUINT_ERR_TOO_LARGE => b"this image is too large to open safely; the file was not changed\0",
         SQUINT_ERR_PANIC => b"the engine failed unexpectedly; the file was not changed\0",
         SQUINT_ERR_COLOURS => b"this image's colours cannot be reduced that far; the file was not changed\0",
+        SQUINT_ERR_READ_ONLY => b"this format can have its location data removed but cannot be shrunk yet; the file was not changed\0",
         _ => b"unknown error\0",
     };
     s.as_ptr() as *const c_char
