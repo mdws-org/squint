@@ -63,7 +63,13 @@ final class ServiceProvider: NSObject {
         }
     }
 
+    /// A second filter behind Finder's own, since a service can be invoked with
+    /// a selection Finder was willing to pass along.
+    ///
+    /// HEIC belongs here because its location data can be removed. It is not
+    /// offered to the two shrinking entries, which cannot re-encode it, and the
+    /// engine refuses it there with a message saying so.
     private static func isSupported(_ url: URL) -> Bool {
-        ["jpg", "jpeg", "png"].contains(url.pathExtension.lowercased())
+        ["jpg", "jpeg", "png", "heic", "heif"].contains(url.pathExtension.lowercased())
     }
 }

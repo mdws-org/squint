@@ -90,6 +90,11 @@ targets:
             NSSendFileTypes:
               - public.jpeg
               - public.png
+              # HEIC is what an iPhone camera writes, and removing its location
+              # data is the one thing squint can do to it. The two shrinking
+              # entries above cannot, so they do not offer to.
+              - public.heic
+              - public.heif
             NSRequiredContext:
               NSApplicationIdentifier: com.apple.finder
               NSTextContent: FilePath

@@ -6,6 +6,7 @@
 
 mod metadata;
 pub mod ffi;
+pub mod heif;
 pub mod gainmap;
 pub mod png;
 pub use metadata::{extract_icc, extract_orientation};
@@ -78,6 +79,8 @@ pub enum Error {
     /// for. The floor is imagequant's own scale and is unrelated to a perceptual
     /// score, so it is carried in its own variant rather than borrowed into one.
     ColoursUnreachable { floor: u8 },
+    /// The format can have its metadata removed but cannot be re-encoded.
+    ReadOnlyFormat { format: &'static str },
     /// Something below panicked. Reported rather than allowed to unwind into C,
     /// where it would abort the process and take every other job with it.
     Panicked,
@@ -108,6 +111,10 @@ impl std::fmt::Display for Error {
             Error::ColoursUnreachable { floor } => write!(
                 f,
                 "this image cannot be reduced to a colour quality of {floor}; the file was not changed"
+            ),
+            Error::ReadOnlyFormat { format } => write!(
+                f,
+                "{format} can have its location and camera data removed, but squint cannot re-encode it yet; the file was not changed"
             ),
             Error::Panicked => write!(f, "the engine failed unexpectedly; the file was not changed"),
         }
@@ -466,6 +473,29 @@ pub fn optimize(
     max_probes: usize,
 ) -> Result<Optimized, Error> {
     if mode == Mode::Strip {
+        // A HEIF is stripped by destroying its metadata where it lies rather
+        // than cutting it out, so the result is exactly as long as the input.
+        // Whether anything was removed is answered by how much was destroyed,
+        // not by the file having shrunk.
+        if heif::is_heif(bytes) {
+            let (stripped, wiped) = heif::strip_heif(bytes)
+                .ok_or_else(|| Error::Decode("this HEIF is not laid out as expected".into()))?;
+            if wiped == 0 {
+                return Err(Error::NoSmallerResult {
+                    best_bytes: bytes.len(),
+                    original_bytes: bytes.len(),
+                });
+            }
+            return Ok(Optimized {
+                data: stripped,
+                probes: Vec::new(),
+                score: None,
+                hdr: Hdr::Absent,
+                quantized: false,
+                original_bytes: bytes.len(),
+            });
+        }
+
         let (stripped, hdr) = if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
             (png::strip_png(bytes), Hdr::Absent)
         } else {
@@ -523,6 +553,10 @@ pub fn optimize(
             quantized: false,
             original_bytes: bytes.len(),
         });
+    }
+
+    if heif::is_heif(bytes) {
+        return Err(Error::ReadOnlyFormat { format: "HEIC" });
     }
 
     if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
