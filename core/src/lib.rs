@@ -7,6 +7,7 @@
 mod metadata;
 pub mod ffi;
 pub mod heif;
+pub mod tiff;
 pub mod gainmap;
 pub mod png;
 pub use metadata::{extract_icc, extract_orientation};
@@ -477,9 +478,14 @@ pub fn optimize(
         // than cutting it out, so the result is exactly as long as the input.
         // Whether anything was removed is answered by how much was destroyed,
         // not by the file having shrunk.
-        if heif::is_heif(bytes) {
-            let (stripped, wiped) = heif::strip_heif(bytes)
-                .ok_or_else(|| Error::Decode("this HEIF is not laid out as expected".into()))?;
+        if heif::is_heif(bytes) || tiff::is_tiff(bytes) {
+            let (stripped, wiped) = if heif::is_heif(bytes) {
+                heif::strip_heif(bytes)
+                    .ok_or_else(|| Error::Decode("this HEIF is not laid out as expected".into()))?
+            } else {
+                tiff::strip_tiff(bytes)
+                    .ok_or_else(|| Error::Decode("this TIFF is not laid out as expected".into()))?
+            };
             if wiped == 0 {
                 return Err(Error::NoSmallerResult {
                     best_bytes: bytes.len(),
@@ -557,6 +563,9 @@ pub fn optimize(
 
     if heif::is_heif(bytes) {
         return Err(Error::ReadOnlyFormat { format: "HEIC" });
+    }
+    if tiff::is_tiff(bytes) {
+        return Err(Error::ReadOnlyFormat { format: "TIFF" });
     }
 
     if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {

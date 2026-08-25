@@ -134,9 +134,9 @@ fn main() {
     // Reported before decoding, because a HEIF cannot be decoded here at all and
     // the reason should be the one the engine gives rather than a decoder's
     // complaint about a format it was never taught.
-    if squint_core::heif::is_heif(&bytes) {
+    if squint_core::heif::is_heif(&bytes) || squint_core::tiff::is_tiff(&bytes) {
         match optimize(&bytes, Mode::Fast, target, fixed_quality, png_min_quality, probes) {
-            Ok(_) => unreachable!("a HEIF cannot be re-encoded"),
+            Ok(_) => unreachable!("neither format can be re-encoded"),
             Err(e) => { eprintln!("{e}"); std::process::exit(1) }
         }
     }
