@@ -38,7 +38,12 @@ walk desynced, and because that output was smaller than the original the
 never-grow check passed and it went over the photograph. That corpus was scratch
 and no longer exists, so these are committed.
 
-`corpus-run.py` exits non-zero when it finds that case, so it can gate a release.
+`corpus-run.py` exits 1 when it finds that case, so it can gate a release. It
+exits 2 when the run itself was not valid, which is a separate answer from a
+clean corpus and must not be read as one. Point it at a binary that is not there
+and perl's `exec` fails, the watchdog still exits 0, nothing is written, and
+every file passes: a flawless run against nothing. It refuses to start unless
+the binary is executable, and stops if no invocation wrote output.
 
 macOS has no `timeout(1)`. The watchdog is `perl -e 'alarm N; exec @ARGV'`, and a
 signalled child arrives in Python as `-14`, not the `142` a shell would print.

@@ -65,6 +65,14 @@ def main(argv):
     binary, corpus = argv[1], argv[2]
     report = argv[4] if len(argv) > 4 and argv[3] == "-o" else "corpus-report.json"
 
+    # A binary that never executes produces a flawless run: perl's exec fails,
+    # the watchdog still exits 0, nothing is written, and every file passes.
+    # That is the same silent success this tool exists to catch, so refuse to
+    # start rather than report a clean corpus against a path that is not there.
+    if not (os.path.isfile(binary) and os.access(binary, os.X_OK)):
+        print("not an executable file: %s" % binary)
+        return 2
+
     manifest = json.load(open(os.path.join(corpus, "manifest.json")))
     results, dangerous = [], []
 
@@ -94,9 +102,22 @@ def main(argv):
 
     total = len(manifest) * len(MODES)
     timeouts = sum(1 for r in results for x in r["runs"] if x.get("timed_out"))
+    wrote = sum(1 for r in results for x in r["runs"] if x.get("wrote_output"))
+    readable = sum(1 for r in results if r["input_decodes"])
     print("")
     print("%d files x %d modes = %d invocations" % (len(manifest), len(MODES), total))
+    print("inputs the system decoder opens: %d/%d" % (readable, len(manifest)))
+    print("runs that wrote output: %d" % wrote)
     print("timed out: %d" % timeouts)
+
+    # No output anywhere, on a corpus whose inputs the system can open, means
+    # the engine was never really invoked. Reporting that as a clean corpus is
+    # worse than reporting nothing.
+    if wrote == 0 and readable:
+        print("")
+        print("HARNESS FAILED: no invocation wrote output, so nothing was tested.")
+        return 2
+
     print("PARTIAL OUTPUT REPORTED AS SUCCESS: %d" % len(dangerous))
     for f, m in dangerous:
         print("  %s (%s)" % (f, m))
