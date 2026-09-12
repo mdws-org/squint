@@ -1,0 +1,926 @@
+diff --git a/README.md b/README.md
+index f270b58..b18f2d8 100644
+--- a/README.md
++++ b/README.md
+@@ -10,7 +10,7 @@ Working. JPEG and PNG are implemented. Builds are published on the releases page
+ 
+ What runs today: a drag and drop window, four Finder Services entries, in-place replacement that preserves Finder tags, and a command line harness for measurement.
+ 
+-What does not exist yet: WebP, AVIF, GIF and SVG input; shrinking a HEIC or a TIFF, either of which can currently only have its metadata removed; Balanced mode; further recipes beyond the email preset; WebP and AVIF output; PDF; automatic updates; HDR gain maps through a re-encode, which Strip keeps but Fast and Quality report as removed.
++What does not exist yet: WebP, AVIF, GIF and SVG input; a TIFF can only have its metadata removed; a HEIC can be shrunk only through Shrink for Email, which writes a JPEG beside it; Balanced mode; further recipes beyond the email preset; WebP and AVIF output; PDF; automatic updates; HDR gain maps through a re-encode, which Strip keeps but Fast and Quality report as removed.
+ 
+ ## Why this exists
+ 
+@@ -71,13 +71,13 @@ The application is unsandboxed by design. Replacing arbitrary files in place is
+ Drop images on the window, or right-click them in Finder and choose **Services**, then one of:
+ 
+ - **Squint: Shrink** does the everyday job. It encodes once at a fixed quality and measures nothing.
+-- **Squint: Shrink for Email** resizes to 2048 pixels on the long edge and writes the result beside the original as `name-email.jpg`. The original is not touched: the cap throws resolution away, and a photograph kept as documentation should not lose it because a copy was being made for an email. Measured on a 4032x3024 photograph, the copy is 129 KB, so about thirty fit under any provider's attachment limit.
++- **Squint: Shrink for Email** accepts HEIC and writes `name-email.jpg`, resizing to 2048 pixels on the long edge. The original is not touched: the cap throws resolution away, and a photograph kept as documentation should not lose it because a copy was being made for an email. Measured on a 4032x3024 photograph, the copy is 129 KB, so about thirty fit under any provider's attachment limit.
+ - **Squint: Shrink to a Quality Target** searches for the smallest file that still meets a perceptual score.
+ - **Squint: Remove Location Data** takes out where and when a photograph was taken, and what took it, without touching the pixels.
+ 
+-**Squint: Remove Location Data** also accepts HEIC, which is what an iPhone camera writes by default, and TIFF. The two shrinking entries do not, because squint cannot re-encode a HEIC yet, and an entry that appeared and then refused would be worse than one that did not appear.
++**Squint: Remove Location Data** also accepts HEIC, which is what an iPhone camera writes by default, and TIFF. The two in-place shrinking entries do not accept HEIC because squint writes JPEG, and a JPEG must not overwrite a `.heic`; Shrink for Email does accept it.
+ 
+-The entries show only when everything selected is a type that entry accepts. Select a folder, or mix a HEIC into a batch you are shrinking, and Squint is absent from the Services menu with nothing to say why. That is Finder filtering on declared types, not a broken install.
++The entries show only when everything selected is a type that entry accepts. Select a folder, or mix a HEIC into a batch for the in-place entries, and Squint is absent from the Services menu with nothing to say why. That is Finder filtering on declared types, not a broken install.
+ 
+ Files are replaced in place. Keep copies until you trust it.
+ 
+@@ -91,7 +91,7 @@ Note that an already-open Get Info window will keep showing camera and location
+ 
+ PNG has an option JPEG does not: leaving the pixels alone, which is identical to the source and so meets any target by construction. A perceptual target on a PNG is never unreachable, only expensive: where no reduction in colours will meet it, the result is the lossless one. Measured on a 400x300 Display P3 screenshot, a target of 80 returns 55 KB scoring 88.3, smaller than fast mode's 61 KB. A target of 90 finds no reduction that qualifies, and the answer is the 121 KB lossless file.
+ 
+-**Strip** removes metadata and nothing else, and is the only mode that reads HEIC or TIFF. The pixels are copied unchanged, so the result is identical to the input image, and only the container shrinks. An HDR gain map is kept, because it is part of the picture rather than a record of where it was taken.
++**Strip** removes metadata and nothing else, and is the only mode that reads TIFF; HEIC is read by every mode. The pixels are copied unchanged, so the result is identical to the input image, and only the container shrinks. An HDR gain map is kept, because it is part of the picture rather than a record of where it was taken.
+ 
+ What it takes out includes **the date the photograph was taken**. That is deliberate, since when a photograph was taken discloses about as much as where. But it is worth naming, because it is the one field a photograph kept as documentation cannot do without, and it is not recoverable once the file has been overwritten. Strip a copy, not the master.
+ 
+diff --git a/app/Sources/Engine.swift b/app/Sources/Engine.swift
+index a5d7b0b..47036f5 100644
+--- a/app/Sources/Engine.swift
++++ b/app/Sources/Engine.swift
+@@ -29,6 +29,7 @@ enum Engine {
+         /// True when the colour count was reduced, which PNG does by default.
+         let quantized: Bool
+         let originalBytes: Int
++        let converted: Bool
+ 
+         var ratio: Double { Double(data.count) / Double(originalBytes) }
+     }
+@@ -77,7 +78,8 @@ enum Engine {
+             score: result.score.isNaN ? nil : result.score,
+             hdr: Hdr(rawValue: result.hdr) ?? .absent,
+             quantized: result.quantized != 0,
+-            originalBytes: result.original_len
++            originalBytes: result.original_len,
++            converted: result.converted != 0
+         )
+     }
+ }
+diff --git a/app/Sources/Job.swift b/app/Sources/Job.swift
+index a6ff054..f3e995b 100644
+--- a/app/Sources/Job.swift
++++ b/app/Sources/Job.swift
+@@ -7,7 +7,7 @@ final class Job: ObservableObject, Identifiable {
+         case waiting
+         case working
+         /// Finished and smaller.
+-        case done(bytes: Int, originalBytes: Int, score: Double?, hdr: Engine.Hdr, quantized: Bool)
++        case done(bytes: Int, originalBytes: Int, score: Double?, hdr: Engine.Hdr, quantized: Bool, converted: Bool)
+         /// Finished, but the file was already as small as it can be.
+         case alreadyOptimal
+         case failed(String)
+@@ -41,7 +41,7 @@ final class Job: ObservableObject, Identifiable {
+         case .alreadyOptimal:
+             return mode == .strip ? "nothing to remove" : "already optimal"
+         case .failed(let message): return message
+-        case .done(let bytes, let original, let score, let hdr, let quantized):
++        case .done(let bytes, let original, let score, let hdr, let quantized, let converted):
+             let saved = 100 - (100 * Double(bytes) / Double(original))
+             // Strip is run to answer a question about the file's contents, not
+             // its size, so it leads with what came out. A byte count is the
+@@ -73,7 +73,7 @@ final class Job: ObservableObject, Identifiable {
+             // A preset that wrote beside the original says where, since the
+             // point of the run is the new file rather than the old one.
+             if preset.suffix != nil {
+-                text = "wrote \(preset.destination(for: url).lastPathComponent), " + text
++                text = "wrote \(preset.destination(for: url, converted: converted).lastPathComponent), " + text
+             }
+             return text
+         }
+diff --git a/app/Sources/JobQueue.swift b/app/Sources/JobQueue.swift
+index b8f462d..d41ddf3 100644
+--- a/app/Sources/JobQueue.swift
++++ b/app/Sources/JobQueue.swift
+@@ -128,6 +128,10 @@ final class JobQueue: ObservableObject {
+         let url = await job.url
+         let outcome: Job.State = await Task.detached(priority: .userInitiated) {
+             do {
++                let ext = url.pathExtension.lowercased()
++                if (ext == "heic" || ext == "heif") && preset.suffix == nil && preset.mode != .strip {
++                    return .failed("a HEIC can only be shrunk beside the original; use Squint: Shrink for Email")
++                }
+                 let input = try Data(contentsOf: url)
+                 let result = try Engine.optimize(
+                     input,
+@@ -135,7 +139,10 @@ final class JobQueue: ObservableObject {
+                     target: target,
+                     maxDimension: preset.maxDimension
+                 )
+-                let destination = preset.destination(for: url)
++                let destination = preset.destination(for: url, converted: result.converted)
++                if result.converted && destination == url {
++                    return .failed("a HEIC can only be shrunk beside the original; use Squint: Shrink for Email")
++                }
+                 if destination == url {
+                     try Writer.replaceInPlace(url, with: result.data)
+                 } else {
+@@ -148,7 +155,8 @@ final class JobQueue: ObservableObject {
+                     originalBytes: result.originalBytes,
+                     score: result.score,
+                     hdr: result.hdr,
+-                    quantized: result.quantized
++                    quantized: result.quantized,
++                    converted: result.converted
+                 )
+             } catch let failure as Engine.Failure {
+                 return failure.isAlreadyOptimal ? .alreadyOptimal : .failed(failure.message)
+diff --git a/app/Sources/Preset.swift b/app/Sources/Preset.swift
+index 79e5013..0813cb9 100644
+--- a/app/Sources/Preset.swift
++++ b/app/Sources/Preset.swift
+@@ -31,12 +31,13 @@ struct Preset {
+     static let email = Preset(mode: .fast, maxDimension: 2048, suffix: "-email")
+ 
+     /// Where this preset's output goes for a given input.
+-    func destination(for url: URL) -> URL {
++    func destination(for url: URL, converted: Bool) -> URL {
+         guard let suffix else { return url }
+         let stem = url.deletingPathExtension().lastPathComponent
++        let ext = converted ? "jpg" : url.pathExtension
+         return url
+             .deletingLastPathComponent()
+             .appendingPathComponent(stem + suffix)
+-            .appendingPathExtension(url.pathExtension)
++            .appendingPathExtension(ext)
+     }
+ }
+diff --git a/app/project.yml b/app/project.yml
+index 1539484..a90c5ae 100644
+--- a/app/project.yml
++++ b/app/project.yml
+@@ -79,10 +79,12 @@ targets:
+             NSSendFileTypes:
+               - public.jpeg
+               - public.png
++              - public.heic
++              - public.heif
+             NSRequiredContext:
+               NSApplicationIdentifier: com.apple.finder
+               NSTextContent: FilePath
+-            NSServiceDescription: Shrink to 2048 pixels beside the original, sized for sending
++            NSServiceDescription: "Shrink to 2048 pixels beside the original, sized for sending; a HEIC becomes a JPEG"
+           - NSMenuItem:
+               default: "Squint: Shrink to a Quality Target"
+             NSMessage: optimizeQuality
+diff --git a/core/include/squint.h b/core/include/squint.h
+index 2c5d6b6..3d1372e 100644
+--- a/core/include/squint.h
++++ b/core/include/squint.h
+@@ -44,11 +44,13 @@ typedef struct {
+     // along with the data buffer. When it is null, squint_error_message(error)
+     // is the description to show.
+     const char *error_message;
++    int converted; // non-zero when the output is a JPEG made from a source of another format (HEIC)
+ } SquintResult;
+ 
+-// Format is detected from the bytes. png_min_quality below 0 disables
+-// quantization. max_dimension caps the long edge in pixels; 0 leaves the
+-// picture its own size. The cap never enlarges.
++// Format is detected from the bytes. HEIC is decoded for fast and quality modes
++// and comes back as JPEG. png_min_quality below 0 disables quantization.
++// max_dimension caps the long edge in pixels; 0 leaves the picture its own size.
++// The cap never enlarges.
+ SquintResult squint_optimize(const uint8_t *input, size_t input_len, int mode,
+                              double target, float fixed_quality, int png_min_quality,
+                              int max_dimension);
+diff --git a/core/src/ffi.rs b/core/src/ffi.rs
+index 0b8c234..69aa51c 100644
+--- a/core/src/ffi.rs
++++ b/core/src/ffi.rs
+@@ -48,6 +48,7 @@ pub struct SquintResult {
+     pub error: c_int,
+     /// Human-readable error details allocated by Rust, or null when no message is set.
+     pub error_message: *mut c_char,
++    pub converted: c_int,
+ }
+ 
+ impl SquintResult {
+@@ -64,6 +65,7 @@ impl SquintResult {
+             quantized: 0,
+             error,
+             error_message,
++            converted: 0,
+         }
+     }
+ }
+@@ -145,6 +147,7 @@ pub unsafe extern "C" fn squint_optimize(
+                 quantized: c_int::from(out.quantized),
+                 error: SQUINT_OK,
+                 error_message: std::ptr::null_mut(),
++                converted: if out.converted_from.is_some() { 1 } else { 0 },
+             }
+         }
+         Err(e) => SquintResult::failure(code_for(&e), input_len, Some(&e.to_string())),
+diff --git a/core/src/heif.rs b/core/src/heif.rs
+index 69f95ed..ec01b85 100644
+--- a/core/src/heif.rs
++++ b/core/src/heif.rs
+@@ -252,6 +252,17 @@ pub fn strip_heif(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
+     Some((out, wiped))
+ }
+ 
++/// Whether this HEIF carries an HDR gain map, without lifting anything out.
++///
++/// Apple declares its map as an auxiliary image of type
++/// `urn:com:apple:photo:2020:aux:hdrgainmap`; the ISO 21496-1 form names its
++/// standard. Either string anywhere in the file is taken as the signal, which
++/// is enough for a report and costs one pass over the bytes.
++pub fn signals_hdr(bytes: &[u8]) -> bool {
++    const NEEDLES: [&[u8]; 2] = [b"hdrgainmap", b"urn:iso:std:iso:ts:21496"];
++    NEEDLES.iter().any(|n| bytes.windows(n.len()).any(|w| w == *n))
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -385,6 +396,13 @@ mod tests {
+         assert!(contains(&out[exif.clone()], b"GPS"), "and nothing should have been touched");
+     }
+ 
++    #[test]
++    fn a_gain_map_declaration_signals_hdr_and_a_bare_brand_does_not() {
++        assert!(signals_hdr(b"some prefix hdrgainmap some suffix"));
++        assert!(signals_hdr(b"prefix urn:iso:std:iso:ts:21496 suffix"));
++        assert!(!signals_hdr(b"ftypheic"));
++    }
++
+     #[test]
+     fn refuses_something_that_is_not_a_heif() {
+         assert!(strip_heif(b"not a heif at all, not even close").is_none());
+diff --git a/core/src/imageio.rs b/core/src/imageio.rs
+new file mode 100644
+index 0000000..f126028
+--- /dev/null
++++ b/core/src/imageio.rs
+@@ -0,0 +1,285 @@
++//! Decoding through the system's Image I/O, for the formats no crate reads.
++//!
++//! A HEIC is HEVC inside, and the only HEVC decoder on a Mac is the one macOS
++//! ships. It is reached here through hand-written bindings to the dozen C
++//! functions needed rather than through a bindings crate, so the dependency
++//! set stays at what `Cargo.lock` already carries.
++//!
++//! The pixels come back in the picture's own colour space, not converted to
++//! sRGB. The engine embeds the source profile in the JPEG it writes, so the
++//! numbers must still mean what that profile says they mean; an iPhone shoots
++//! Display P3, and converting to sRGB would clip its colours before the
++//! profile could describe them.
++
++use std::ffi::c_void;
++use std::ptr;
++
++use crate::Error;
++
++pub struct Decoded {
++    pub rgb: Vec<u8>,          // width*height*3, source colour space, NOT converted
++    pub width: usize,
++    pub height: usize,
++    pub icc: Option<Vec<u8>>,  // ICC profile of the source colour space
++    pub orientation: u16,      // EXIF orientation 1..=8, 1 if absent
++}
++
++type CFTypeRef = *const c_void;
++type CFDataRef = *const c_void;
++type CFDictionaryRef = *const c_void;
++type CFStringRef = *const c_void;
++type CFNumberRef = *const c_void;
++type CGImageSourceRef = *const c_void;
++type CGImageRef = *const c_void;
++type CGColorSpaceRef = *const c_void;
++type CGContextRef = *const c_void;
++
++#[repr(C)]
++#[derive(Clone, Copy, Debug)]
++struct CGPoint {
++    x: f64,
++    y: f64,
++}
++
++#[repr(C)]
++#[derive(Clone, Copy, Debug)]
++struct CGSize {
++    width: f64,
++    height: f64,
++}
++
++#[repr(C)]
++#[derive(Clone, Copy, Debug)]
++struct CGRect {
++    origin: CGPoint,
++    size: CGSize,
++}
++
++const K_CF_NUMBER_SINT64_TYPE: i32 = 4;
++const K_CG_COLOR_SPACE_MODEL_RGB: i32 = 1;
++const K_CG_IMAGE_ALPHA_NONE_SKIP_LAST: u32 = 5;
++const K_CG_BITMAP_BYTE_ORDER_DEFAULT: u32 = 0;
++
++#[link(name = "CoreFoundation", kind = "framework")]
++extern "C" {
++    fn CFRelease(cf: CFTypeRef);
++    fn CFDataCreate(allocator: CFTypeRef, bytes: *const u8, length: isize) -> CFDataRef;
++    fn CFDataGetLength(theData: CFDataRef) -> isize;
++    fn CFDataGetBytePtr(theData: CFDataRef) -> *const u8;
++    fn CFDictionaryGetValue(theDict: CFDictionaryRef, key: *const c_void) -> *const c_void;
++    fn CFNumberGetValue(number: CFNumberRef, theType: i32, valuePtr: *mut c_void) -> bool;
++}
++
++#[link(name = "CoreGraphics", kind = "framework")]
++extern "C" {
++    fn CGColorSpaceGetModel(space: CGColorSpaceRef) -> i32;
++    fn CGColorSpaceCreateDeviceRGB() -> CGColorSpaceRef;
++    fn CGColorSpaceCopyICCData(space: CGColorSpaceRef) -> CFDataRef;
++    fn CGImageGetWidth(image: CGImageRef) -> usize;
++    fn CGImageGetHeight(image: CGImageRef) -> usize;
++    fn CGImageGetColorSpace(image: CGImageRef) -> CGColorSpaceRef;
++    fn CGBitmapContextCreate(
++        data: *mut c_void,
++        width: usize,
++        height: usize,
++        bitsPerComponent: usize,
++        bytesPerRow: usize,
++        space: CGColorSpaceRef,
++        bitmapInfo: u32,
++    ) -> CGContextRef;
++    fn CGBitmapContextGetData(context: CGContextRef) -> *mut c_void;
++    fn CGContextDrawImage(c: CGContextRef, rect: CGRect, image: CGImageRef);
++}
++
++#[link(name = "ImageIO", kind = "framework")]
++extern "C" {
++    static kCGImagePropertyPixelWidth: CFStringRef;
++    static kCGImagePropertyPixelHeight: CFStringRef;
++    static kCGImagePropertyOrientation: CFStringRef;
++
++    fn CGImageSourceCreateWithData(data: CFDataRef, options: CFDictionaryRef) -> CGImageSourceRef;
++    fn CGImageSourceGetCount(isrc: CGImageSourceRef) -> usize;
++    fn CGImageSourceCopyPropertiesAtIndex(
++        isrc: CGImageSourceRef,
++        index: usize,
++        options: CFDictionaryRef,
++    ) -> CFDictionaryRef;
++    fn CGImageSourceCreateImageAtIndex(
++        isrc: CGImageSourceRef,
++        index: usize,
++        options: CFDictionaryRef,
++    ) -> CGImageRef;
++}
++
++struct Cf<T>(*const T);
++
++impl<T> Cf<T> {
++    fn wrap(ptr: *const T) -> Option<Self> {
++        if ptr.is_null() {
++            None
++        } else {
++            Some(Self(ptr))
++        }
++    }
++
++    fn as_ptr(&self) -> *const T {
++        self.0
++    }
++}
++
++impl<T> Drop for Cf<T> {
++    fn drop(&mut self) {
++        if !self.0.is_null() {
++            unsafe {
++                CFRelease(self.0 as CFTypeRef);
++            }
++        }
++    }
++}
++
++pub fn decode(bytes: &[u8], max_pixels: usize) -> Result<Decoded, Error> {
++    unsafe {
++        let cf_data = Cf::wrap(CFDataCreate(ptr::null(), bytes.as_ptr(), bytes.len() as isize))
++            .ok_or_else(|| Error::Decode("Image I/O could not create data buffer".into()))?;
++
++        let src = Cf::wrap(CGImageSourceCreateWithData(cf_data.as_ptr() as CFDataRef, ptr::null()))
++            .ok_or_else(|| Error::Decode("Image I/O could not open this file".into()))?;
++
++        let count = CGImageSourceGetCount(src.as_ptr() as CGImageSourceRef);
++        if count < 1 {
++            return Err(Error::Decode("Image I/O found no images in file".into()));
++        }
++
++        let props = Cf::wrap(CGImageSourceCopyPropertiesAtIndex(
++            src.as_ptr() as CGImageSourceRef,
++            0,
++            ptr::null(),
++        ));
++
++        let mut declared_width: i64 = 0;
++        let mut declared_height: i64 = 0;
++        let mut orientation: i64 = 1;
++
++        if let Some(props_ref) = &props {
++            let dict = props_ref.as_ptr() as CFDictionaryRef;
++            let w_num = CFDictionaryGetValue(dict, kCGImagePropertyPixelWidth as *const c_void);
++            if !w_num.is_null() {
++                CFNumberGetValue(
++                    w_num as CFNumberRef,
++                    K_CF_NUMBER_SINT64_TYPE,
++                    &mut declared_width as *mut i64 as *mut c_void,
++                );
++            }
++
++            let h_num = CFDictionaryGetValue(dict, kCGImagePropertyPixelHeight as *const c_void);
++            if !h_num.is_null() {
++                CFNumberGetValue(
++                    h_num as CFNumberRef,
++                    K_CF_NUMBER_SINT64_TYPE,
++                    &mut declared_height as *mut i64 as *mut c_void,
++                );
++            }
++
++            let o_num = CFDictionaryGetValue(dict, kCGImagePropertyOrientation as *const c_void);
++            if !o_num.is_null() {
++                CFNumberGetValue(
++                    o_num as CFNumberRef,
++                    K_CF_NUMBER_SINT64_TYPE,
++                    &mut orientation as *mut i64 as *mut c_void,
++                );
++            }
++        }
++
++        let dw = declared_width.max(0) as usize;
++        let dh = declared_height.max(0) as usize;
++        if dw.saturating_mul(dh) > max_pixels {
++            return Err(Error::TooLarge { width: dw, height: dh });
++        }
++
++        let image = Cf::wrap(CGImageSourceCreateImageAtIndex(
++            src.as_ptr() as CGImageSourceRef,
++            0,
++            ptr::null(),
++        ))
++        .ok_or_else(|| Error::Decode("Image I/O could not create image at index 0".into()))?;
++
++        let w = CGImageGetWidth(image.as_ptr() as CGImageRef);
++        let h = CGImageGetHeight(image.as_ptr() as CGImageRef);
++
++        if w.saturating_mul(h) > max_pixels {
++            return Err(Error::TooLarge { width: w, height: h });
++        }
++
++        if w == 0 || h == 0 {
++            return Err(Error::Decode("Image has zero width or height".into()));
++        }
++
++        let cs = CGImageGetColorSpace(image.as_ptr() as CGImageRef);
++        let (ctx_cs, icc, _cs_guard) = if !cs.is_null() && CGColorSpaceGetModel(cs) == K_CG_COLOR_SPACE_MODEL_RGB {
++            let icc_data = Cf::wrap(CGColorSpaceCopyICCData(cs));
++            let icc_bytes = icc_data.map(|d| {
++                let len = CFDataGetLength(d.as_ptr() as CFDataRef) as usize;
++                let ptr = CFDataGetBytePtr(d.as_ptr() as CFDataRef);
++                std::slice::from_raw_parts(ptr, len).to_vec()
++            });
++            (cs, icc_bytes, None)
++        } else {
++            let dev_rgb = Cf::wrap(CGColorSpaceCreateDeviceRGB())
++                .ok_or_else(|| Error::Decode("Could not create device RGB colour space".into()))?;
++            let dev_ptr = dev_rgb.as_ptr() as CGColorSpaceRef;
++            (dev_ptr, None, Some(dev_rgb))
++        };
++
++        let total_bytes = w.checked_mul(h)
++            .and_then(|px| px.checked_mul(4))
++            .ok_or_else(|| Error::TooLarge { width: w, height: h })?;
++
++        let bytes_per_row = w.checked_mul(4)
++            .ok_or_else(|| Error::TooLarge { width: w, height: h })?;
++
++        let ctx = Cf::wrap(CGBitmapContextCreate(
++            ptr::null_mut(),
++            w,
++            h,
++            8,
++            bytes_per_row,
++            ctx_cs,
++            K_CG_IMAGE_ALPHA_NONE_SKIP_LAST | K_CG_BITMAP_BYTE_ORDER_DEFAULT,
++        ))
++        .ok_or_else(|| Error::Decode("Could not create bitmap context".into()))?;
++
++        CGContextDrawImage(
++            ctx.as_ptr() as CGContextRef,
++            CGRect {
++                origin: CGPoint { x: 0.0, y: 0.0 },
++                size: CGSize { width: w as f64, height: h as f64 },
++            },
++            image.as_ptr() as CGImageRef,
++        );
++
++        let data_ptr = CGBitmapContextGetData(ctx.as_ptr() as CGContextRef) as *const u8;
++        if data_ptr.is_null() {
++            return Err(Error::Decode("Bitmap context data is null".into()));
++        }
++
++        let raw_slice = std::slice::from_raw_parts(data_ptr, total_bytes);
++        let mut rgb = Vec::with_capacity(w * h * 3);
++        for chunk in raw_slice.chunks_exact(4) {
++            rgb.extend_from_slice(&chunk[..3]);
++        }
++
++        let orient_u16 = if (1..=8).contains(&orientation) {
++            orientation as u16
++        } else {
++            1
++        };
++
++        Ok(Decoded {
++            rgb,
++            width: w,
++            height: h,
++            icc,
++            orientation: orient_u16,
++        })
++    }
++}
+diff --git a/core/src/lib.rs b/core/src/lib.rs
+index b5d5674..b366110 100644
+--- a/core/src/lib.rs
++++ b/core/src/lib.rs
+@@ -10,7 +10,11 @@ pub mod heif;
+ pub mod tiff;
+ pub mod gainmap;
+ pub mod png;
++pub mod source;
++#[cfg(target_os = "macos")]
++pub mod imageio;
+ pub use metadata::{extract_icc, extract_orientation};
++pub use source::Source;
+ 
+ use imgref::ImgVec;
+ 
+@@ -139,7 +143,7 @@ pub struct Image {
+ /// rather than archived, and a cheap filter shows on exactly the fine detail a
+ /// roof photograph is sent to show. A picture already inside the cap is
+ /// returned untouched: this never enlarges.
+-fn capped(img: image::DynamicImage, max_dimension: Option<u32>) -> image::DynamicImage {
++pub(crate) fn capped(img: image::DynamicImage, max_dimension: Option<u32>) -> image::DynamicImage {
+     match max_dimension {
+         Some(cap) if img.width().max(img.height()) > cap => {
+             img.resize(cap, cap, image::imageops::FilterType::Lanczos3)
+@@ -478,6 +482,7 @@ pub struct Optimized {
+     /// can come back visibly changed with no score to show for it.
+     pub quantized: bool,
+     pub original_bytes: usize,
++    pub converted_from: Option<&'static str>,
+ }
+ 
+ /// Optimize an encoded image, dispatching on its format.
+@@ -519,6 +524,7 @@ pub fn optimize(
+                 hdr: Hdr::Absent,
+                 quantized: false,
+                 original_bytes: bytes.len(),
++                converted_from: None,
+             });
+         }
+ 
+@@ -578,12 +584,10 @@ pub fn optimize(
+             hdr,
+             quantized: false,
+             original_bytes: bytes.len(),
++            converted_from: None,
+         });
+     }
+ 
+-    if heif::is_heif(bytes) {
+-        return Err(Error::ReadOnlyFormat { format: "HEIC" });
+-    }
+     if tiff::is_tiff(bytes) {
+         return Err(Error::ReadOnlyFormat { format: "TIFF" });
+     }
+@@ -610,13 +614,13 @@ pub fn optimize(
+             hdr: Hdr::Absent,
+             quantized: r.quantized,
+             original_bytes: bytes.len(),
++            converted_from: None,
+         });
+     }
+ 
+-    let mut image = Image::decode_capped(bytes, max_dimension)?;
+-    let icc = extract_icc(bytes);
+-    let orientation = extract_orientation(bytes);
+-    image.apply_orientation(orientation);
++    let src = Source::open(bytes, max_dimension)?;
++    let image = src.image;
++    let icc = src.icc;
+ 
+     let (data, score, probes) = match mode {
+         // Strip is handled above and never reaches this match.
+@@ -645,7 +649,11 @@ pub fn optimize(
+     // substituted in turn and none of them made the difference. An unopenable
+     // file is a worse outcome than one that has lost its extra range, so the
+     // map is left off until the picture can be encoded some other way.
+-    let hdr = if has_gain_map(bytes) { Hdr::Dropped } else { Hdr::Absent };
++    let hdr = if has_gain_map(bytes) || (src.converted_from.is_some() && heif::signals_hdr(bytes)) {
++        Hdr::Dropped
++    } else {
++        Hdr::Absent
++    };
+ 
+     // Checked on the finished file rather than the picture alone: carrying the
+     // gain map costs bytes, and an optimizer must never grow a file.
+@@ -655,13 +663,34 @@ pub fn optimize(
+             original_bytes: bytes.len(),
+         });
+     }
+-    Ok(Optimized { data, probes, score, hdr, quantized: false, original_bytes: bytes.len() })
++    Ok(Optimized {
++        data,
++        probes,
++        score,
++        hdr,
++        quantized: false,
++        original_bytes: bytes.len(),
++        converted_from: src.converted_from,
++    })
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
++    /// A HEIC now decodes for re-encoding; a TIFF still does not, and must keep
++    /// saying so in its own words rather than through a decoder's complaint.
++    #[test]
++    fn a_tiff_is_still_refused_for_re_encoding() {
++        let mut tiff_bytes = vec![0u8; 32];
++        tiff_bytes[0..4].copy_from_slice(&[b'I', b'I', 42, 0]);
++        match optimize(&tiff_bytes, Mode::Fast, 80.0, 75.0, Some(70), 6, None) {
++            Err(Error::ReadOnlyFormat { format: "TIFF" }) => {}
++            Err(e) => panic!("expected ReadOnlyFormat TIFF, got {e:?}"),
++            Ok(_) => panic!("expected ReadOnlyFormat TIFF, got a result"),
++        }
++    }
++
+     /// A 2 wide by 3 tall image whose pixels encode their own coordinates as
+     /// `y * 10 + x`, so a transform can be checked by reading values back.
+     fn coded() -> Image {
+@@ -982,6 +1011,7 @@ mod tests {
+             )
+         };
+         assert_ne!(res.error, ffi::SQUINT_OK);
++        assert_eq!(res.converted, 0);
+         assert!(!res.error_message.is_null());
+         unsafe {
+             let cstr = CStr::from_ptr(res.error_message).to_str().unwrap();
+diff --git a/core/src/main.rs b/core/src/main.rs
+index 380ab3c..62c1642 100644
+--- a/core/src/main.rs
++++ b/core/src/main.rs
+@@ -3,7 +3,7 @@
+ //! This drives the engine without a user interface so that quality and speed can
+ //! be measured against real photographs before any application exists.
+ 
+-use squint_core::{score, extract_icc, extract_orientation, optimize, png, Hdr, Image, Mode, JPEG_SCORE_CEILING};
++use squint_core::{score, optimize, png, Hdr, Mode, Source, JPEG_SCORE_CEILING};
+ use std::time::Instant;
+ 
+ /// How the gain map fared, for the line the harness prints.
+@@ -137,48 +137,49 @@ fn main() {
+         return;
+     }
+ 
+-    // Reported before decoding, because a HEIF cannot be decoded here at all and
++    // Reported before decoding, because a TIFF cannot be decoded here at all and
+     // the reason should be the one the engine gives rather than a decoder's
+     // complaint about a format it was never taught.
+-    if squint_core::heif::is_heif(&bytes) || squint_core::tiff::is_tiff(&bytes) {
++    if squint_core::tiff::is_tiff(&bytes) {
+         match optimize(&bytes, Mode::Fast, target, fixed_quality, png_min_quality, probes, None) {
+             Ok(_) => unreachable!("neither format can be re-encoded"),
+             Err(e) => { eprintln!("{e}"); std::process::exit(1) }
+         }
+     }
+ 
+-    let mut image = match Image::decode(&bytes) {
+-        Ok(i) => i,
++    let src = match Source::open(&bytes, None) {
++        Ok(s) => s,
+         Err(e) => {
+             eprintln!("{e}");
+             std::process::exit(1)
+         }
+     };
+-    let icc = extract_icc(&bytes);
+-    let orientation = extract_orientation(&bytes);
+-    image.apply_orientation(orientation);
++    let image = src.image;
+ 
+     println!(
+-        "{}  {}x{} = {:.2} MP  {:.0} KB",
++        "{}  {}x{} = {:.2} MP  {:.0} KB{}",
+         path,
+         image.width,
+         image.height,
+         image.megapixels(),
+-        bytes.len() as f64 / 1024.0
++        bytes.len() as f64 / 1024.0,
++        match src.converted_from {
++            Some(f) => format!("  converted from {f}"),
++            None => "".into(),
++        }
+     );
+     println!(
+         "         icc {}  orientation {}{}",
+-        match &icc { Some(p) => format!("{} bytes preserved", p.len()), None => "absent".into() },
+-        orientation,
+-        if orientation != 1 { " (baked into pixels)" } else { "" }
++        match &src.icc { Some(p) => format!("{} bytes preserved", p.len()), None => "absent".into() },
++        src.orientation,
++        if src.orientation != 1 { " (baked into pixels)" } else { "" }
+     );
+ 
+     // Scoring one file against another, which is how a fixed-quality result gets
+     // a perceptual number attached to it.
+-    let _ = &icc;
+     if let Some(other) = against {
+         let ob = std::fs::read(&other).unwrap_or_else(|e| { eprintln!("could not read {other}: {e}"); std::process::exit(1) });
+-        let oi = Image::decode(&ob).unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(1) });
++        let oi = Source::open(&ob, None).unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(1) }).image;
+         let t0 = Instant::now();
+         match score(&image, &oi) {
+             Ok(s) => println!("compare {} vs {}  score {:.4}  {:.0} KB -> {:.0} KB  {:.3}s",
+@@ -218,7 +219,7 @@ fn main() {
+                 );
+             }
+             println!(
+-                "{:<8} q{:<5.1} {:>7.0} KB  {:>5.1}% of original{}  {} probes  {:.3}s{}",
++                "{:<8} q{:<5.1} {:>7.0} KB  {:>5.1}% of original{}  {} probes  {:.3}s{}{}",
+                 mode,
+                 r.probes.last().map_or(fixed_quality, |p| p.quality),
+                 r.data.len() as f64 / 1024.0,
+@@ -226,7 +227,11 @@ fn main() {
+                 match r.score { Some(s) => format!("  score {s:.3}"), None => "  (no metric evaluated)".into() },
+                 r.probes.len(),
+                 elapsed,
+-                hdr_note(r.hdr)
++                hdr_note(r.hdr),
++                match r.converted_from {
++                    Some(f) => format!("  written as JPEG (from {f})"),
++                    None => "".into(),
++                }
+             );
+             if let Some(o) = &out_path {
+                 std::fs::write(o, &r.data).unwrap_or_else(|e| { eprintln!("write failed: {e}"); std::process::exit(1) });
+diff --git a/core/src/source.rs b/core/src/source.rs
+new file mode 100644
+index 0000000..47abba8
+--- /dev/null
++++ b/core/src/source.rs
+@@ -0,0 +1,148 @@
++//! One way in for every picture the engine can re-encode.
++//!
++//! JPEG and PNG are decoded by the `image` crate; a HEIF is handed to the
++//! system's Image I/O, which is the only HEVC decoder on the machine. Whichever
++//! path a picture takes, it arrives here the same way: RGB8 in its own colour
++//! space, orientation baked in, capped to the long edge that was asked for.
++//! Both sides of a perceptual comparison must come through this one door, since
++//! a reference and a candidate that were decoded differently do not score
++//! against each other honestly.
++
++use crate::{capped, extract_icc, extract_orientation, Error, Image, MAX_PIXELS};
++
++pub struct Source {
++    /// Pixels with the EXIF orientation already baked in, capped to `max_dimension` (Lanczos, never enlarged).
++    pub image: Image,
++    pub icc: Option<Vec<u8>>,
++    /// The EXIF orientation that was applied, 1 when the picture was already upright.
++    pub orientation: u16,
++    /// Set when the output format will differ from the input's: `Some("HEIC")` for a HEIF source. None for JPEG and PNG.
++    pub converted_from: Option<&'static str>,
++}
++
++impl Source {
++    pub fn open(bytes: &[u8], max_dimension: Option<u32>) -> Result<Source, Error> {
++        if crate::heif::is_heif(bytes) {
++            #[cfg(target_os = "macos")]
++            {
++                let decoded = crate::imageio::decode(bytes, MAX_PIXELS)?;
++                let rgb_buf = image::RgbImage::from_raw(
++                    decoded.width as u32,
++                    decoded.height as u32,
++                    decoded.rgb,
++                )
++                .ok_or_else(|| Error::Decode("Could not create RGB image buffer".into()))?;
++
++                let dyn_img = image::DynamicImage::ImageRgb8(rgb_buf);
++                let capped_img = capped(dyn_img, max_dimension).to_rgb8();
++                let (w, h) = (capped_img.width() as usize, capped_img.height() as usize);
++                let mut image = Image::from_rgb8(&capped_img.into_raw(), w, h);
++                image.apply_orientation(decoded.orientation);
++
++                Ok(Source {
++                    image,
++                    icc: decoded.icc,
++                    orientation: decoded.orientation,
++                    converted_from: Some("HEIC"),
++                })
++            }
++            #[cfg(not(target_os = "macos"))]
++            {
++                Err(Error::ReadOnlyFormat { format: "HEIC" })
++            }
++        } else {
++            let mut image = Image::decode_capped(bytes, max_dimension)?;
++            let icc = extract_icc(bytes);
++            let orientation = extract_orientation(bytes);
++            image.apply_orientation(orientation);
++
++            Ok(Source {
++                image,
++                icc,
++                orientation,
++                converted_from: None,
++            })
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    #[cfg(target_os = "macos")]
++    fn test_macos_heic_decode_and_optimize() {
++        use std::process::Command;
++        use crate::Mode;
++
++        if !std::path::Path::new("/usr/bin/sips").exists() {
++            return;
++        }
++
++        let temp_dir = std::env::temp_dir().join(format!("squint_test_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
++        std::fs::create_dir_all(&temp_dir).expect("create temp dir");
++        let png_path = temp_dir.join("in.png");
++        let heic_path = temp_dir.join("out.heic");
++
++        // A 1200x800 picture whose pixel at (x, y) is (x, y, 200) plus a few
++        // counts of deterministic noise. The coordinates make a vertical flip
++        // or a swapped channel show up in the corner checks below; the noise
++        // makes the HEVC-coded file large enough that a 150 px JPEG made from
++        // it is genuinely smaller. A smooth gradient codes to under 2 KB as
++        // HEIC, and the never-grow check then refuses the conversion — which is
++        // correct behaviour, and not what this test is for.
++        let (w, h) = (1200u32, 800u32);
++        let mut img_buf = image::RgbImage::new(w, h);
++        let mut seed = 0x9E37_79B9u32;
++        for y in 0..h {
++            for x in 0..w {
++                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
++                let noise = (seed >> 29) as i16 - 3; // -3..=4
++                let px = |base: i16| (base + noise).clamp(0, 255) as u8;
++                img_buf.put_pixel(x, y, image::Rgb([px(x as u8 as i16), px(y as u8 as i16), px(200)]));
++            }
++        }
++        img_buf.save(&png_path).expect("save png");
++
++        // Run sips -s format heic <in.png> --out <out.heic>
++        let status = Command::new("/usr/bin/sips")
++            .arg("-s")
++            .arg("format")
++            .arg("heic")
++            .arg(&png_path)
++            .arg("--out")
++            .arg(&heic_path)
++            .status()
++            .expect("execute sips");
++        assert!(status.success(), "sips failed");
++
++        let heic_bytes = std::fs::read(&heic_path).expect("read heic");
++        assert!(crate::heif::is_heif(&heic_bytes));
++
++        let src = Source::open(&heic_bytes, None).expect("Source::open failed");
++        assert_eq!((src.image.width, src.image.height), (w as usize, h as usize));
++        assert_eq!(src.converted_from, Some("HEIC"));
++        assert_eq!(src.orientation, 1);
++
++        // Near the top-left and bottom-left corners, each channel within a
++        // lossy encode's reach of what was written there.
++        let at = |x: usize, y: usize| src.image.pixels[y * w as usize + x];
++        for (p, want) in [(at(10, 10), [10i16, 10, 200]), (at(10, 790), [10, 790u32 as u8 as i16, 200])] {
++            for c in 0..3 {
++                assert!((p[c] as i16 - want[c]).abs() <= 16, "pixel {p:?} is not near {want:?}");
++            }
++        }
++
++        let opt = crate::optimize(&heic_bytes, Mode::Fast, 80.0, 75.0, Some(70), 6, Some(150))
++            .expect("optimize failed");
++        assert!(opt.data.len() >= 2 && opt.data[0] == 0xFF && opt.data[1] == 0xD8);
++        assert_eq!(opt.converted_from, Some("HEIC"));
++
++        let dec = Image::decode(&opt.data).expect("decode optimized jpeg");
++        assert_eq!(dec.width, 150);
++        assert_eq!(dec.height, 100);
++
++        let _ = std::fs::remove_dir_all(&temp_dir);
++    }
++}

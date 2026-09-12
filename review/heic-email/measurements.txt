@@ -1,0 +1,27 @@
+Measured 2026-09-12 on an Apple M5 (btm), CLI built from this branch, cargo test --release --locked.
+Inputs: two iPhone 16 Pro HEICs (5712x4284, Display P3, ISO 21496 gain map, GPS + EXIF + MakerApple), one of them orientation 6;
+plus a HEIC made by `sips -s format heic` from a 24 MP iPhone JPEG (no gain map).
+
+Baseline (origin/main 460a678) on any of them, fast mode:
+  "HEIC can have its location and camera data removed, but squint cannot re-encode it yet; the file was not changed"
+
+This branch, fast q75 with --max-dimension 2048 (the Shrink for Email preset):
+  iphone-a.heic  6,162,084 B -> 667 KB  (11.1%)  0.515 s  icc 536 bytes preserved  orientation 1   HDR GAIN MAP DROPPED  written as JPEG (from HEIC)
+  iphone-b.heic  5,446,125 B -> 532 KB  (10.0%)  0.490 s  icc 536 bytes preserved  orientation 6 (baked into pixels)  HDR GAIN MAP DROPPED
+  converted.heic 3,085,773 B -> 292 KB  ( 9.7%)  0.409 s  icc 536 bytes preserved  orientation 6 (baked into pixels)  (no HDR reported — correct, sips wrote none)
+
+Fast q75 at full resolution (no cap), iphone-a: 3,790 KB, 63.0% of original, 1.369 s — smaller than the HEIC, so the never-grow check did not fire on this photo.
+Quality target 80, cap 2048, iphone-a: q91, 1,175 KB, score 80.133, 4 probes, 2.645 s.
+Strip on iphone-a: unchanged behaviour (in-place destroy, same length).
+
+JPEG path regression check: the 24 MP JPEG through baseline and branch, fast cap 2048 -> byte-identical output.
+
+Outputs read back through ImageIO (CGImageSourceCopyPropertiesAtIndex):
+  iphone-a-email.jpg  2048x1536 orientation=1 profile=Display P3 exif=false gps=false makerApple=false hdr=none
+  iphone-b-email.jpg  1536x2048 orientation=1 profile=Display P3 exif=false gps=false makerApple=false hdr=none   (portrait came out upright)
+  converted-email.jpg 1536x2048 orientation=1 profile=Display P3 exif=false gps=false makerApple=false hdr=none
+JPEG segments of iphone-b-email.jpg: APP0 JFIF, APP2 ICC_PROFILE (552 B), DQT, SOF2, DHT, SOS — nothing else.
+
+Tests: 38 passed on macOS after the test-image change (the original 300x200 gradient coded to 1,609 B as HEIC and a 150 px JPEG of it was 4,191 B, so NoSmallerResult refused it — the test, not the engine, was wrong).
+
+After the council-round fixes (primary item index, refuse-without-dimensions, profile-or-sRGB, ImageIO gain-map lookup): 37 tests pass, zero warnings; iphone-a/iphone-b/converted outputs are byte-identical to the pre-fix build; the flip-proof test rows (10 and 700) pass, refuting the "drawn upside down" finding.

@@ -252,13 +252,6 @@ pub fn strip_heif(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
     Some((out, wiped))
 }
 
-/// Whether this HEIF carries an HDR gain map, without lifting anything out.
-pub fn signals_hdr(bytes: &[u8]) -> bool {
-    let hay = bytes;
-    hay.windows(b"hdrgainmap".len()).any(|w| w == b"hdrgainmap")
-        || hay.windows(b"urn:iso:std:iso:ts:21496".len()).any(|w| w == b"urn:iso:std:iso:ts:21496")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,13 +383,6 @@ mod tests {
         let (out, wiped) = strip_heif(&without).expect("still a heif");
         assert_eq!(wiped, 0, "nothing should have been removed");
         assert!(contains(&out[exif.clone()], b"GPS"), "and nothing should have been touched");
-    }
-
-    #[test]
-    fn test_signals_hdr() {
-        assert!(signals_hdr(b"some prefix hdrgainmap some suffix"));
-        assert!(signals_hdr(b"prefix urn:iso:std:iso:ts:21496 suffix"));
-        assert!(!signals_hdr(b"ftypheic"));
     }
 
     #[test]

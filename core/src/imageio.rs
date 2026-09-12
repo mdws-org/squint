@@ -1,7 +1,15 @@
-//! Image I/O decoding for macOS.
+//! Decoding through the system's Image I/O, for the formats no crate reads.
 //!
-//! Uses macOS Image I/O and Core Graphics frameworks directly to decode HEIF/HEIC
-//! and other system-supported image formats without external crate dependencies.
+//! A HEIC is HEVC inside, and the only HEVC decoder on a Mac is the one macOS
+//! ships. It is reached here through hand-written bindings to the dozen C
+//! functions needed rather than through a bindings crate, so the dependency
+//! set stays at what `Cargo.lock` already carries.
+//!
+//! The pixels come back in the picture's own colour space, not converted to
+//! sRGB. The engine embeds the source profile in the JPEG it writes, so the
+//! numbers must still mean what that profile says they mean; an iPhone shoots
+//! Display P3, and converting to sRGB would clip its colours before the
+//! profile could describe them.
 
 use std::ffi::c_void;
 use std::ptr;
@@ -9,11 +17,17 @@ use std::ptr;
 use crate::Error;
 
 pub struct Decoded {
-    pub rgb: Vec<u8>,          // width*height*3, source colour space, NOT converted
+    /// width*height*3, in the colour space `icc` describes, or sRGB when `icc` is None.
+    pub rgb: Vec<u8>,
     pub width: usize,
     pub height: usize,
-    pub icc: Option<Vec<u8>>,  // ICC profile of the source colour space
-    pub orientation: u16,      // EXIF orientation 1..=8, 1 if absent
+    /// ICC profile of the source colour space, when the system could produce one.
+    pub icc: Option<Vec<u8>>,
+    /// EXIF orientation 1..=8, 1 if absent.
+    pub orientation: u16,
+    /// Whether the container declares an HDR gain map for the primary image,
+    /// asked of Image I/O directly rather than guessed from the bytes.
+    pub has_gain_map: bool,
 }
 
 type CFTypeRef = *const c_void;
@@ -64,8 +78,10 @@ extern "C" {
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
+    static kCGColorSpaceSRGB: CFStringRef;
+
     fn CGColorSpaceGetModel(space: CGColorSpaceRef) -> i32;
-    fn CGColorSpaceCreateDeviceRGB() -> CGColorSpaceRef;
+    fn CGColorSpaceCreateWithName(name: CFStringRef) -> CGColorSpaceRef;
     fn CGColorSpaceCopyICCData(space: CGColorSpaceRef) -> CFDataRef;
     fn CGImageGetWidth(image: CGImageRef) -> usize;
     fn CGImageGetHeight(image: CGImageRef) -> usize;
@@ -88,9 +104,17 @@ extern "C" {
     static kCGImagePropertyPixelWidth: CFStringRef;
     static kCGImagePropertyPixelHeight: CFStringRef;
     static kCGImagePropertyOrientation: CFStringRef;
+    static kCGImageAuxiliaryDataTypeHDRGainMap: CFStringRef;
+    static kCGImageAuxiliaryDataTypeISOGainMap: CFStringRef;
 
     fn CGImageSourceCreateWithData(data: CFDataRef, options: CFDictionaryRef) -> CGImageSourceRef;
     fn CGImageSourceGetCount(isrc: CGImageSourceRef) -> usize;
+    fn CGImageSourceGetPrimaryImageIndex(isrc: CGImageSourceRef) -> usize;
+    fn CGImageSourceCopyAuxiliaryDataInfoAtIndex(
+        isrc: CGImageSourceRef,
+        index: usize,
+        auxiliary_image_data_type: CFStringRef,
+    ) -> CFDictionaryRef;
     fn CGImageSourceCopyPropertiesAtIndex(
         isrc: CGImageSourceRef,
         index: usize,
@@ -141,85 +165,90 @@ pub fn decode(bytes: &[u8], max_pixels: usize) -> Result<Decoded, Error> {
         if count < 1 {
             return Err(Error::Decode("Image I/O found no images in file".into()));
         }
+        // A HEIF holds several items: the picture, its thumbnail, a gain map, a
+        // depth map. Which one is the picture is declared by the container, and
+        // it is not always the first.
+        let primary = CGImageSourceGetPrimaryImageIndex(src.as_ptr() as CGImageSourceRef);
 
+        // The declared size is read from the header before the picture is
+        // created, so a file lying about its size costs a dictionary lookup
+        // rather than an allocation. A file that declares no size at all is
+        // refused for the same reason: the check cannot be made, so the
+        // allocation must not be either.
         let props = Cf::wrap(CGImageSourceCopyPropertiesAtIndex(
             src.as_ptr() as CGImageSourceRef,
-            0,
+            primary,
             ptr::null(),
-        ));
-
-        let mut declared_width: i64 = 0;
-        let mut declared_height: i64 = 0;
-        let mut orientation: i64 = 1;
-
-        if let Some(props_ref) = &props {
-            let dict = props_ref.as_ptr() as CFDictionaryRef;
-            let w_num = CFDictionaryGetValue(dict, kCGImagePropertyPixelWidth as *const c_void);
-            if !w_num.is_null() {
-                CFNumberGetValue(
-                    w_num as CFNumberRef,
-                    K_CF_NUMBER_SINT64_TYPE,
-                    &mut declared_width as *mut i64 as *mut c_void,
-                );
+        ))
+        .ok_or_else(|| Error::Decode("Image I/O reported no properties for this file".into()))?;
+        let dict = props.as_ptr() as CFDictionaryRef;
+        let number = |key: CFStringRef| -> Option<i64> {
+            let num = CFDictionaryGetValue(dict, key as *const c_void);
+            if num.is_null() {
+                return None;
             }
-
-            let h_num = CFDictionaryGetValue(dict, kCGImagePropertyPixelHeight as *const c_void);
-            if !h_num.is_null() {
-                CFNumberGetValue(
-                    h_num as CFNumberRef,
-                    K_CF_NUMBER_SINT64_TYPE,
-                    &mut declared_height as *mut i64 as *mut c_void,
-                );
-            }
-
-            let o_num = CFDictionaryGetValue(dict, kCGImagePropertyOrientation as *const c_void);
-            if !o_num.is_null() {
-                CFNumberGetValue(
-                    o_num as CFNumberRef,
-                    K_CF_NUMBER_SINT64_TYPE,
-                    &mut orientation as *mut i64 as *mut c_void,
-                );
-            }
-        }
-
-        let dw = declared_width.max(0) as usize;
-        let dh = declared_height.max(0) as usize;
+            let mut value: i64 = 0;
+            CFNumberGetValue(num as CFNumberRef, K_CF_NUMBER_SINT64_TYPE, &mut value as *mut i64 as *mut c_void)
+                .then_some(value)
+        };
+        let (dw, dh) = match (number(kCGImagePropertyPixelWidth), number(kCGImagePropertyPixelHeight)) {
+            (Some(w), Some(h)) if w > 0 && h > 0 => (w as usize, h as usize),
+            _ => return Err(Error::Decode("Image I/O reported no dimensions for this file".into())),
+        };
         if dw.saturating_mul(dh) > max_pixels {
             return Err(Error::TooLarge { width: dw, height: dh });
         }
+        let orientation = number(kCGImagePropertyOrientation).unwrap_or(1);
+
+        // Asked of the container rather than guessed from its bytes. Apple's
+        // map and the ISO 21496-1 map are separate auxiliary types; a
+        // photograph carries one or the other.
+        let has_gain_map = [kCGImageAuxiliaryDataTypeISOGainMap, kCGImageAuxiliaryDataTypeHDRGainMap]
+            .into_iter()
+            .any(|kind| {
+                Cf::wrap(CGImageSourceCopyAuxiliaryDataInfoAtIndex(src.as_ptr() as CGImageSourceRef, primary, kind))
+                    .is_some()
+            });
 
         let image = Cf::wrap(CGImageSourceCreateImageAtIndex(
             src.as_ptr() as CGImageSourceRef,
-            0,
+            primary,
             ptr::null(),
         ))
-        .ok_or_else(|| Error::Decode("Image I/O could not create image at index 0".into()))?;
+        .ok_or_else(|| Error::Decode("Image I/O could not decode the picture".into()))?;
 
         let w = CGImageGetWidth(image.as_ptr() as CGImageRef);
         let h = CGImageGetHeight(image.as_ptr() as CGImageRef);
-
+        if w == 0 || h == 0 {
+            return Err(Error::Decode("Image I/O decoded a picture with no pixels".into()));
+        }
         if w.saturating_mul(h) > max_pixels {
             return Err(Error::TooLarge { width: w, height: h });
         }
 
-        if w == 0 || h == 0 {
-            return Err(Error::Decode("Image has zero width or height".into()));
-        }
-
+        // The pixels are kept in the picture's own space only when its profile
+        // can travel with them. A wide-gamut picture written without its
+        // profile is read as sRGB and comes out dull, so when the system has
+        // no profile to give, the picture is converted to sRGB here and left
+        // untagged, which is the one untagged interpretation every reader
+        // agrees on. `cs` is owned by `image` (Get rule) and is not released.
         let cs = CGImageGetColorSpace(image.as_ptr() as CGImageRef);
-        let (ctx_cs, icc, _cs_guard) = if !cs.is_null() && CGColorSpaceGetModel(cs) == K_CG_COLOR_SPACE_MODEL_RGB {
-            let icc_data = Cf::wrap(CGColorSpaceCopyICCData(cs));
-            let icc_bytes = icc_data.map(|d| {
+        let icc = if !cs.is_null() && CGColorSpaceGetModel(cs) == K_CG_COLOR_SPACE_MODEL_RGB {
+            Cf::wrap(CGColorSpaceCopyICCData(cs)).map(|d| {
                 let len = CFDataGetLength(d.as_ptr() as CFDataRef) as usize;
                 let ptr = CFDataGetBytePtr(d.as_ptr() as CFDataRef);
                 std::slice::from_raw_parts(ptr, len).to_vec()
-            });
-            (cs, icc_bytes, None)
+            })
         } else {
-            let dev_rgb = Cf::wrap(CGColorSpaceCreateDeviceRGB())
-                .ok_or_else(|| Error::Decode("Could not create device RGB colour space".into()))?;
-            let dev_ptr = dev_rgb.as_ptr() as CGColorSpaceRef;
-            (dev_ptr, None, Some(dev_rgb))
+            None
+        };
+        let srgb;
+        let ctx_cs = if icc.is_some() {
+            cs
+        } else {
+            srgb = Cf::wrap(CGColorSpaceCreateWithName(kCGColorSpaceSRGB))
+                .ok_or_else(|| Error::Decode("could not create the sRGB colour space".into()))?;
+            srgb.as_ptr() as CGColorSpaceRef
         };
 
         let total_bytes = w.checked_mul(h)
@@ -272,6 +301,7 @@ pub fn decode(bytes: &[u8], max_pixels: usize) -> Result<Decoded, Error> {
             height: h,
             icc,
             orientation: orient_u16,
+            has_gain_map,
         })
     }
 }

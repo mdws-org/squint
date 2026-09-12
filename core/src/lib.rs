@@ -649,11 +649,7 @@ pub fn optimize(
     // substituted in turn and none of them made the difference. An unopenable
     // file is a worse outcome than one that has lost its extra range, so the
     // map is left off until the picture can be encoded some other way.
-    let hdr = if has_gain_map(bytes) || (src.converted_from.is_some() && heif::signals_hdr(bytes)) {
-        Hdr::Dropped
-    } else {
-        Hdr::Absent
-    };
+    let hdr = if has_gain_map(bytes) || src.has_gain_map { Hdr::Dropped } else { Hdr::Absent };
 
     // Checked on the finished file rather than the picture alone: carrying the
     // gain map costs bytes, and an optimizer must never grow a file.
@@ -676,19 +672,20 @@ pub fn optimize(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// A HEIC now decodes for re-encoding; a TIFF still does not, and must keep
+    /// saying so in its own words rather than through a decoder's complaint.
     #[test]
-    fn tiff_in_fast_mode_returns_readonly_format() {
+    fn a_tiff_is_still_refused_for_re_encoding() {
         let mut tiff_bytes = vec![0u8; 32];
         tiff_bytes[0..4].copy_from_slice(&[b'I', b'I', 42, 0]);
-        let res = optimize(&tiff_bytes, Mode::Fast, 80.0, 75.0, Some(70), 6, None);
-        match res {
+        match optimize(&tiff_bytes, Mode::Fast, 80.0, 75.0, Some(70), 6, None) {
             Err(Error::ReadOnlyFormat { format: "TIFF" }) => {}
-            Err(e) => panic!("expected ReadOnlyFormat TIFF, got error {e:?}"),
-            Ok(_) => panic!("expected ReadOnlyFormat TIFF, got Ok"),
+            Err(e) => panic!("expected ReadOnlyFormat TIFF, got {e:?}"),
+            Ok(_) => panic!("expected ReadOnlyFormat TIFF, got a result"),
         }
     }
-
-    use super::*;
 
     /// A 2 wide by 3 tall image whose pixels encode their own coordinates as
     /// `y * 10 + x`, so a transform can be checked by reading values back.

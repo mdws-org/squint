@@ -1,7 +1,12 @@
-//! Image source loading and orientation normalization.
+//! One way in for every picture the engine can re-encode.
 //!
-//! Provides a uniform entry point `Source::open` to load images (JPEG, PNG, HEIF)
-//! into RGB8 memory with orientation applied and dimensions capped if requested.
+//! JPEG and PNG are decoded by the `image` crate; a HEIF is handed to the
+//! system's Image I/O, which is the only HEVC decoder on the machine. Whichever
+//! path a picture takes, it arrives here the same way: RGB8 in its own colour
+//! space, orientation baked in, capped to the long edge that was asked for.
+//! Both sides of a perceptual comparison must come through this one door, since
+//! a reference and a candidate that were decoded differently do not score
+//! against each other honestly.
 
 use crate::{capped, extract_icc, extract_orientation, Error, Image, MAX_PIXELS};
 
@@ -9,6 +14,11 @@ pub struct Source {
     /// Pixels with the EXIF orientation already baked in, capped to `max_dimension` (Lanczos, never enlarged).
     pub image: Image,
     pub icc: Option<Vec<u8>>,
+    /// The EXIF orientation that was applied, 1 when the picture was already upright.
+    pub orientation: u16,
+    /// Whether a HEIF declared an HDR gain map. Always false for JPEG and PNG,
+    /// whose maps the caller detects from the bytes.
+    pub has_gain_map: bool,
     /// Set when the output format will differ from the input's: `Some("HEIC")` for a HEIF source. None for JPEG and PNG.
     pub converted_from: Option<&'static str>,
 }
@@ -35,6 +45,8 @@ impl Source {
                 Ok(Source {
                     image,
                     icc: decoded.icc,
+                    orientation: decoded.orientation,
+                    has_gain_map: decoded.has_gain_map,
                     converted_from: Some("HEIC"),
                 })
             }
@@ -51,6 +63,8 @@ impl Source {
             Ok(Source {
                 image,
                 icc,
+                orientation,
+                has_gain_map: false,
                 converted_from: None,
             })
         }
@@ -76,11 +90,22 @@ mod tests {
         let png_path = temp_dir.join("in.png");
         let heic_path = temp_dir.join("out.heic");
 
-        // Build a 300x200 RGB8 image whose pixel at (x, y) is (x as u8, y as u8, 200)
-        let mut img_buf = image::RgbImage::new(300, 200);
-        for y in 0..200u32 {
-            for x in 0..300u32 {
-                img_buf.put_pixel(x, y, image::Rgb([x as u8, y as u8, 200]));
+        // A 1200x800 picture whose pixel at (x, y) is (x, y, 200) plus a few
+        // counts of deterministic noise. The coordinates make a vertical flip
+        // or a swapped channel show up in the corner checks below; the noise
+        // makes the HEVC-coded file large enough that a 150 px JPEG made from
+        // it is genuinely smaller. A smooth gradient codes to under 2 KB as
+        // HEIC, and the never-grow check then refuses the conversion — which is
+        // correct behaviour, and not what this test is for.
+        let (w, h) = (1200u32, 800u32);
+        let mut img_buf = image::RgbImage::new(w, h);
+        let mut seed = 0x9E37_79B9u32;
+        for y in 0..h {
+            for x in 0..w {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = (seed >> 29) as i16 - 3; // -3..=4
+                let px = |base: i16| (base + noise).clamp(0, 255) as u8;
+                img_buf.put_pixel(x, y, image::Rgb([px(x as u8 as i16), px(y as u8 as i16), px(200)]));
             }
         }
         img_buf.save(&png_path).expect("save png");
@@ -101,25 +126,22 @@ mod tests {
         assert!(crate::heif::is_heif(&heic_bytes));
 
         let src = Source::open(&heic_bytes, None).expect("Source::open failed");
-        assert_eq!(src.image.width, 300);
-        assert_eq!(src.image.height, 200);
+        assert_eq!((src.image.width, src.image.height), (w as usize, h as usize));
         assert_eq!(src.converted_from, Some("HEIC"));
+        assert_eq!(src.orientation, 1);
+        assert!(!src.has_gain_map, "sips writes no gain map");
 
-        // assert the pixel at (10, 10) is within ±16 per channel of (10, 10, 200)
-        // and the pixel at (10, 190) within ±16 of (10, 190, 200).
-        let p_10_10 = src.image.pixels[10 * 300 + 10];
-        let p_10_190 = src.image.pixels[190 * 300 + 10];
+        // Two rows whose green values differ by far more than the tolerance,
+        // so a picture drawn upside down cannot pass. Row 700 is 188 after the
+        // u8 wrap; the bottom row would be 31, and a flip would put it at the
+        // top.
+        let at = |x: usize, y: usize| src.image.pixels[y * w as usize + x];
+        for (p, want) in [(at(10, 10), [10i16, 10, 200]), (at(10, 700), [10, 700u32 as u8 as i16, 200])] {
+            for c in 0..3 {
+                assert!((p[c] as i16 - want[c]).abs() <= 16, "pixel {p:?} is not near {want:?}");
+            }
+        }
 
-        assert!((p_10_10[0] as i16 - 10).abs() <= 16, "p_10_10 red out of range: {}", p_10_10[0]);
-        assert!((p_10_10[1] as i16 - 10).abs() <= 16, "p_10_10 green out of range: {}", p_10_10[1]);
-        assert!((p_10_10[2] as i16 - 200).abs() <= 16, "p_10_10 blue out of range: {}", p_10_10[2]);
-
-        assert!((p_10_190[0] as i16 - 10).abs() <= 16, "p_10_190 red out of range: {}", p_10_190[0]);
-        assert!((p_10_190[1] as i16 - 190).abs() <= 16, "p_10_190 green out of range: {}", p_10_190[1]);
-        assert!((p_10_190[2] as i16 - 200).abs() <= 16, "p_10_190 blue out of range: {}", p_10_190[2]);
-
-        // Then optimize(&heic, Mode::Fast, 80.0, 75.0, Some(70), 6, Some(150))
-        // → Ok, data starts with 0xFF 0xD8, converted_from == Some("HEIC"), and Image::decode(&data) is 150x100.
         let opt = crate::optimize(&heic_bytes, Mode::Fast, 80.0, 75.0, Some(70), 6, Some(150))
             .expect("optimize failed");
         assert!(opt.data.len() >= 2 && opt.data[0] == 0xFF && opt.data[1] == 0xD8);

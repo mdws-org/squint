@@ -169,13 +169,14 @@ fn main() {
         }
     );
     println!(
-        "         icc {}",
-        match &src.icc { Some(p) => format!("{} bytes preserved", p.len()), None => "absent".into() }
+        "         icc {}  orientation {}{}",
+        match &src.icc { Some(p) => format!("{} bytes preserved", p.len()), None => "absent".into() },
+        src.orientation,
+        if src.orientation != 1 { " (baked into pixels)" } else { "" }
     );
 
     // Scoring one file against another, which is how a fixed-quality result gets
     // a perceptual number attached to it.
-    let _ = &src.icc;
     if let Some(other) = against {
         let ob = std::fs::read(&other).unwrap_or_else(|e| { eprintln!("could not read {other}: {e}"); std::process::exit(1) });
         let oi = Source::open(&ob, None).unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(1) }).image;
