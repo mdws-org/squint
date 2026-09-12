@@ -3,7 +3,7 @@
 //! This drives the engine without a user interface so that quality and speed can
 //! be measured against real photographs before any application exists.
 
-use squint_core::{score, extract_icc, extract_orientation, optimize, png, Hdr, Image, Mode, JPEG_SCORE_CEILING};
+use squint_core::{score, optimize, png, Hdr, Mode, Source, JPEG_SCORE_CEILING};
 use std::time::Instant;
 
 /// How the gain map fared, for the line the harness prints.
@@ -137,48 +137,48 @@ fn main() {
         return;
     }
 
-    // Reported before decoding, because a HEIF cannot be decoded here at all and
+    // Reported before decoding, because a TIFF cannot be decoded here at all and
     // the reason should be the one the engine gives rather than a decoder's
     // complaint about a format it was never taught.
-    if squint_core::heif::is_heif(&bytes) || squint_core::tiff::is_tiff(&bytes) {
+    if squint_core::tiff::is_tiff(&bytes) {
         match optimize(&bytes, Mode::Fast, target, fixed_quality, png_min_quality, probes, None) {
             Ok(_) => unreachable!("neither format can be re-encoded"),
             Err(e) => { eprintln!("{e}"); std::process::exit(1) }
         }
     }
 
-    let mut image = match Image::decode(&bytes) {
-        Ok(i) => i,
+    let src = match Source::open(&bytes, None) {
+        Ok(s) => s,
         Err(e) => {
             eprintln!("{e}");
             std::process::exit(1)
         }
     };
-    let icc = extract_icc(&bytes);
-    let orientation = extract_orientation(&bytes);
-    image.apply_orientation(orientation);
+    let image = src.image;
 
     println!(
-        "{}  {}x{} = {:.2} MP  {:.0} KB",
+        "{}  {}x{} = {:.2} MP  {:.0} KB{}",
         path,
         image.width,
         image.height,
         image.megapixels(),
-        bytes.len() as f64 / 1024.0
+        bytes.len() as f64 / 1024.0,
+        match src.converted_from {
+            Some(f) => format!("  converted from {f}"),
+            None => "".into(),
+        }
     );
     println!(
-        "         icc {}  orientation {}{}",
-        match &icc { Some(p) => format!("{} bytes preserved", p.len()), None => "absent".into() },
-        orientation,
-        if orientation != 1 { " (baked into pixels)" } else { "" }
+        "         icc {}",
+        match &src.icc { Some(p) => format!("{} bytes preserved", p.len()), None => "absent".into() }
     );
 
     // Scoring one file against another, which is how a fixed-quality result gets
     // a perceptual number attached to it.
-    let _ = &icc;
+    let _ = &src.icc;
     if let Some(other) = against {
         let ob = std::fs::read(&other).unwrap_or_else(|e| { eprintln!("could not read {other}: {e}"); std::process::exit(1) });
-        let oi = Image::decode(&ob).unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(1) });
+        let oi = Source::open(&ob, None).unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(1) }).image;
         let t0 = Instant::now();
         match score(&image, &oi) {
             Ok(s) => println!("compare {} vs {}  score {:.4}  {:.0} KB -> {:.0} KB  {:.3}s",
@@ -218,7 +218,7 @@ fn main() {
                 );
             }
             println!(
-                "{:<8} q{:<5.1} {:>7.0} KB  {:>5.1}% of original{}  {} probes  {:.3}s{}",
+                "{:<8} q{:<5.1} {:>7.0} KB  {:>5.1}% of original{}  {} probes  {:.3}s{}{}",
                 mode,
                 r.probes.last().map_or(fixed_quality, |p| p.quality),
                 r.data.len() as f64 / 1024.0,
@@ -226,7 +226,11 @@ fn main() {
                 match r.score { Some(s) => format!("  score {s:.3}"), None => "  (no metric evaluated)".into() },
                 r.probes.len(),
                 elapsed,
-                hdr_note(r.hdr)
+                hdr_note(r.hdr),
+                match r.converted_from {
+                    Some(f) => format!("  written as JPEG (from {f})"),
+                    None => "".into(),
+                }
             );
             if let Some(o) = &out_path {
                 std::fs::write(o, &r.data).unwrap_or_else(|e| { eprintln!("write failed: {e}"); std::process::exit(1) });

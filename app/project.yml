@@ -79,10 +79,12 @@ targets:
             NSSendFileTypes:
               - public.jpeg
               - public.png
+              - public.heic
+              - public.heif
             NSRequiredContext:
               NSApplicationIdentifier: com.apple.finder
               NSTextContent: FilePath
-            NSServiceDescription: Shrink to 2048 pixels beside the original, sized for sending
+            NSServiceDescription: "Shrink to 2048 pixels beside the original, sized for sending; a HEIC becomes a JPEG"
           - NSMenuItem:
               default: "Squint: Shrink to a Quality Target"
             NSMessage: optimizeQuality

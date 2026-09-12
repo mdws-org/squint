@@ -10,7 +10,7 @@ Working. JPEG and PNG are implemented. Builds are published on the releases page
 
 What runs today: a drag and drop window, four Finder Services entries, in-place replacement that preserves Finder tags, and a command line harness for measurement.
 
-What does not exist yet: WebP, AVIF, GIF and SVG input; shrinking a HEIC or a TIFF, either of which can currently only have its metadata removed; Balanced mode; further recipes beyond the email preset; WebP and AVIF output; PDF; automatic updates; HDR gain maps through a re-encode, which Strip keeps but Fast and Quality report as removed.
+What does not exist yet: WebP, AVIF, GIF and SVG input; a TIFF can only have its metadata removed; a HEIC can be shrunk only through Shrink for Email, which writes a JPEG beside it; Balanced mode; further recipes beyond the email preset; WebP and AVIF output; PDF; automatic updates; HDR gain maps through a re-encode, which Strip keeps but Fast and Quality report as removed.
 
 ## Why this exists
 
@@ -71,13 +71,13 @@ The application is unsandboxed by design. Replacing arbitrary files in place is 
 Drop images on the window, or right-click them in Finder and choose **Services**, then one of:
 
 - **Squint: Shrink** does the everyday job. It encodes once at a fixed quality and measures nothing.
-- **Squint: Shrink for Email** resizes to 2048 pixels on the long edge and writes the result beside the original as `name-email.jpg`. The original is not touched: the cap throws resolution away, and a photograph kept as documentation should not lose it because a copy was being made for an email. Measured on a 4032x3024 photograph, the copy is 129 KB, so about thirty fit under any provider's attachment limit.
+- **Squint: Shrink for Email** accepts HEIC and writes `name-email.jpg`, resizing to 2048 pixels on the long edge. The original is not touched: the cap throws resolution away, and a photograph kept as documentation should not lose it because a copy was being made for an email. Measured on a 4032x3024 photograph, the copy is 129 KB, so about thirty fit under any provider's attachment limit.
 - **Squint: Shrink to a Quality Target** searches for the smallest file that still meets a perceptual score.
 - **Squint: Remove Location Data** takes out where and when a photograph was taken, and what took it, without touching the pixels.
 
-**Squint: Remove Location Data** also accepts HEIC, which is what an iPhone camera writes by default, and TIFF. The two shrinking entries do not, because squint cannot re-encode a HEIC yet, and an entry that appeared and then refused would be worse than one that did not appear.
+**Squint: Remove Location Data** also accepts HEIC, which is what an iPhone camera writes by default, and TIFF. The two in-place shrinking entries do not accept HEIC because squint writes JPEG, and a JPEG must not overwrite a `.heic`; Shrink for Email does accept it.
 
-The entries show only when everything selected is a type that entry accepts. Select a folder, or mix a HEIC into a batch you are shrinking, and Squint is absent from the Services menu with nothing to say why. That is Finder filtering on declared types, not a broken install.
+The entries show only when everything selected is a type that entry accepts. Select a folder, or mix a HEIC into a batch for the in-place entries, and Squint is absent from the Services menu with nothing to say why. That is Finder filtering on declared types, not a broken install.
 
 Files are replaced in place. Keep copies until you trust it.
 
@@ -91,7 +91,7 @@ Note that an already-open Get Info window will keep showing camera and location 
 
 PNG has an option JPEG does not: leaving the pixels alone, which is identical to the source and so meets any target by construction. A perceptual target on a PNG is never unreachable, only expensive: where no reduction in colours will meet it, the result is the lossless one. Measured on a 400x300 Display P3 screenshot, a target of 80 returns 55 KB scoring 88.3, smaller than fast mode's 61 KB. A target of 90 finds no reduction that qualifies, and the answer is the 121 KB lossless file.
 
-**Strip** removes metadata and nothing else, and is the only mode that reads HEIC or TIFF. The pixels are copied unchanged, so the result is identical to the input image, and only the container shrinks. An HDR gain map is kept, because it is part of the picture rather than a record of where it was taken.
+**Strip** removes metadata and nothing else, and is the only mode that reads TIFF; HEIC is read by every mode. The pixels are copied unchanged, so the result is identical to the input image, and only the container shrinks. An HDR gain map is kept, because it is part of the picture rather than a record of where it was taken.
 
 What it takes out includes **the date the photograph was taken**. That is deliberate, since when a photograph was taken discloses about as much as where. But it is worth naming, because it is the one field a photograph kept as documentation cannot do without, and it is not recoverable once the file has been overwritten. Strip a copy, not the master.
 

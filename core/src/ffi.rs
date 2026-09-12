@@ -48,6 +48,7 @@ pub struct SquintResult {
     pub error: c_int,
     /// Human-readable error details allocated by Rust, or null when no message is set.
     pub error_message: *mut c_char,
+    pub converted: c_int,
 }
 
 impl SquintResult {
@@ -64,6 +65,7 @@ impl SquintResult {
             quantized: 0,
             error,
             error_message,
+            converted: 0,
         }
     }
 }
@@ -145,6 +147,7 @@ pub unsafe extern "C" fn squint_optimize(
                 quantized: c_int::from(out.quantized),
                 error: SQUINT_OK,
                 error_message: std::ptr::null_mut(),
+                converted: if out.converted_from.is_some() { 1 } else { 0 },
             }
         }
         Err(e) => SquintResult::failure(code_for(&e), input_len, Some(&e.to_string())),

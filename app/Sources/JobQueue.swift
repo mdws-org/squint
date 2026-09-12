@@ -128,6 +128,10 @@ final class JobQueue: ObservableObject {
         let url = await job.url
         let outcome: Job.State = await Task.detached(priority: .userInitiated) {
             do {
+                let ext = url.pathExtension.lowercased()
+                if (ext == "heic" || ext == "heif") && preset.suffix == nil && preset.mode != .strip {
+                    return .failed("a HEIC can only be shrunk beside the original; use Squint: Shrink for Email")
+                }
                 let input = try Data(contentsOf: url)
                 let result = try Engine.optimize(
                     input,
@@ -135,7 +139,10 @@ final class JobQueue: ObservableObject {
                     target: target,
                     maxDimension: preset.maxDimension
                 )
-                let destination = preset.destination(for: url)
+                let destination = preset.destination(for: url, converted: result.converted)
+                if result.converted && destination == url {
+                    return .failed("a HEIC can only be shrunk beside the original; use Squint: Shrink for Email")
+                }
                 if destination == url {
                     try Writer.replaceInPlace(url, with: result.data)
                 } else {
@@ -148,7 +155,8 @@ final class JobQueue: ObservableObject {
                     originalBytes: result.originalBytes,
                     score: result.score,
                     hdr: result.hdr,
-                    quantized: result.quantized
+                    quantized: result.quantized,
+                    converted: result.converted
                 )
             } catch let failure as Engine.Failure {
                 return failure.isAlreadyOptimal ? .alreadyOptimal : .failed(failure.message)

@@ -31,12 +31,13 @@ struct Preset {
     static let email = Preset(mode: .fast, maxDimension: 2048, suffix: "-email")
 
     /// Where this preset's output goes for a given input.
-    func destination(for url: URL) -> URL {
+    func destination(for url: URL, converted: Bool) -> URL {
         guard let suffix else { return url }
         let stem = url.deletingPathExtension().lastPathComponent
+        let ext = converted ? "jpg" : url.pathExtension
         return url
             .deletingLastPathComponent()
             .appendingPathComponent(stem + suffix)
-            .appendingPathExtension(url.pathExtension)
+            .appendingPathExtension(ext)
     }
 }

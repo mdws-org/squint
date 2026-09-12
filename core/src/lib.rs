@@ -10,7 +10,11 @@ pub mod heif;
 pub mod tiff;
 pub mod gainmap;
 pub mod png;
+pub mod source;
+#[cfg(target_os = "macos")]
+pub mod imageio;
 pub use metadata::{extract_icc, extract_orientation};
+pub use source::Source;
 
 use imgref::ImgVec;
 
@@ -139,7 +143,7 @@ pub struct Image {
 /// rather than archived, and a cheap filter shows on exactly the fine detail a
 /// roof photograph is sent to show. A picture already inside the cap is
 /// returned untouched: this never enlarges.
-fn capped(img: image::DynamicImage, max_dimension: Option<u32>) -> image::DynamicImage {
+pub(crate) fn capped(img: image::DynamicImage, max_dimension: Option<u32>) -> image::DynamicImage {
     match max_dimension {
         Some(cap) if img.width().max(img.height()) > cap => {
             img.resize(cap, cap, image::imageops::FilterType::Lanczos3)
@@ -478,6 +482,7 @@ pub struct Optimized {
     /// can come back visibly changed with no score to show for it.
     pub quantized: bool,
     pub original_bytes: usize,
+    pub converted_from: Option<&'static str>,
 }
 
 /// Optimize an encoded image, dispatching on its format.
@@ -519,6 +524,7 @@ pub fn optimize(
                 hdr: Hdr::Absent,
                 quantized: false,
                 original_bytes: bytes.len(),
+                converted_from: None,
             });
         }
 
@@ -578,12 +584,10 @@ pub fn optimize(
             hdr,
             quantized: false,
             original_bytes: bytes.len(),
+            converted_from: None,
         });
     }
 
-    if heif::is_heif(bytes) {
-        return Err(Error::ReadOnlyFormat { format: "HEIC" });
-    }
     if tiff::is_tiff(bytes) {
         return Err(Error::ReadOnlyFormat { format: "TIFF" });
     }
@@ -610,13 +614,13 @@ pub fn optimize(
             hdr: Hdr::Absent,
             quantized: r.quantized,
             original_bytes: bytes.len(),
+            converted_from: None,
         });
     }
 
-    let mut image = Image::decode_capped(bytes, max_dimension)?;
-    let icc = extract_icc(bytes);
-    let orientation = extract_orientation(bytes);
-    image.apply_orientation(orientation);
+    let src = Source::open(bytes, max_dimension)?;
+    let image = src.image;
+    let icc = src.icc;
 
     let (data, score, probes) = match mode {
         // Strip is handled above and never reaches this match.
@@ -645,7 +649,11 @@ pub fn optimize(
     // substituted in turn and none of them made the difference. An unopenable
     // file is a worse outcome than one that has lost its extra range, so the
     // map is left off until the picture can be encoded some other way.
-    let hdr = if has_gain_map(bytes) { Hdr::Dropped } else { Hdr::Absent };
+    let hdr = if has_gain_map(bytes) || (src.converted_from.is_some() && heif::signals_hdr(bytes)) {
+        Hdr::Dropped
+    } else {
+        Hdr::Absent
+    };
 
     // Checked on the finished file rather than the picture alone: carrying the
     // gain map costs bytes, and an optimizer must never grow a file.
@@ -655,11 +663,31 @@ pub fn optimize(
             original_bytes: bytes.len(),
         });
     }
-    Ok(Optimized { data, probes, score, hdr, quantized: false, original_bytes: bytes.len() })
+    Ok(Optimized {
+        data,
+        probes,
+        score,
+        hdr,
+        quantized: false,
+        original_bytes: bytes.len(),
+        converted_from: src.converted_from,
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tiff_in_fast_mode_returns_readonly_format() {
+        let mut tiff_bytes = vec![0u8; 32];
+        tiff_bytes[0..4].copy_from_slice(&[b'I', b'I', 42, 0]);
+        let res = optimize(&tiff_bytes, Mode::Fast, 80.0, 75.0, Some(70), 6, None);
+        match res {
+            Err(Error::ReadOnlyFormat { format: "TIFF" }) => {}
+            Err(e) => panic!("expected ReadOnlyFormat TIFF, got error {e:?}"),
+            Ok(_) => panic!("expected ReadOnlyFormat TIFF, got Ok"),
+        }
+    }
+
     use super::*;
 
     /// A 2 wide by 3 tall image whose pixels encode their own coordinates as
@@ -982,6 +1010,7 @@ mod tests {
             )
         };
         assert_ne!(res.error, ffi::SQUINT_OK);
+        assert_eq!(res.converted, 0);
         assert!(!res.error_message.is_null());
         unsafe {
             let cstr = CStr::from_ptr(res.error_message).to_str().unwrap();

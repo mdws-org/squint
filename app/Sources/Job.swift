@@ -7,7 +7,7 @@ final class Job: ObservableObject, Identifiable {
         case waiting
         case working
         /// Finished and smaller.
-        case done(bytes: Int, originalBytes: Int, score: Double?, hdr: Engine.Hdr, quantized: Bool)
+        case done(bytes: Int, originalBytes: Int, score: Double?, hdr: Engine.Hdr, quantized: Bool, converted: Bool)
         /// Finished, but the file was already as small as it can be.
         case alreadyOptimal
         case failed(String)
@@ -41,7 +41,7 @@ final class Job: ObservableObject, Identifiable {
         case .alreadyOptimal:
             return mode == .strip ? "nothing to remove" : "already optimal"
         case .failed(let message): return message
-        case .done(let bytes, let original, let score, let hdr, let quantized):
+        case .done(let bytes, let original, let score, let hdr, let quantized, let converted):
             let saved = 100 - (100 * Double(bytes) / Double(original))
             // Strip is run to answer a question about the file's contents, not
             // its size, so it leads with what came out. A byte count is the
@@ -73,7 +73,7 @@ final class Job: ObservableObject, Identifiable {
             // A preset that wrote beside the original says where, since the
             // point of the run is the new file rather than the old one.
             if preset.suffix != nil {
-                text = "wrote \(preset.destination(for: url).lastPathComponent), " + text
+                text = "wrote \(preset.destination(for: url, converted: converted).lastPathComponent), " + text
             }
             return text
         }

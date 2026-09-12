@@ -44,11 +44,13 @@ typedef struct {
     // along with the data buffer. When it is null, squint_error_message(error)
     // is the description to show.
     const char *error_message;
+    int converted; // non-zero when the output is a JPEG made from a source of another format (HEIC)
 } SquintResult;
 
-// Format is detected from the bytes. png_min_quality below 0 disables
-// quantization. max_dimension caps the long edge in pixels; 0 leaves the
-// picture its own size. The cap never enlarges.
+// Format is detected from the bytes. HEIC is decoded for fast and quality modes
+// and comes back as JPEG. png_min_quality below 0 disables quantization.
+// max_dimension caps the long edge in pixels; 0 leaves the picture its own size.
+// The cap never enlarges.
 SquintResult squint_optimize(const uint8_t *input, size_t input_len, int mode,
                              double target, float fixed_quality, int png_min_quality,
                              int max_dimension);
