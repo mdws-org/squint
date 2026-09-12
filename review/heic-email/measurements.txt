@@ -25,3 +25,5 @@ JPEG segments of iphone-b-email.jpg: APP0 JFIF, APP2 ICC_PROFILE (552 B), DQT, S
 Tests: 38 passed on macOS after the test-image change (the original 300x200 gradient coded to 1,609 B as HEIC and a 150 px JPEG of it was 4,191 B, so NoSmallerResult refused it — the test, not the engine, was wrong).
 
 After the council-round fixes (primary item index, refuse-without-dimensions, profile-or-sRGB, ImageIO gain-map lookup): 37 tests pass, zero warnings; iphone-a/iphone-b/converted outputs are byte-identical to the pre-fix build; the flip-proof test rows (10 and 700) pass, refuting the "drawn upside down" finding.
+
+Round 2 (SWE-2 findings): 38 tests, zero warnings. Odd width: a 750x1001 sips HEIC decodes clean (row stride 4004 B, not 64-aligned). Truncation: the real HEIC cut to 3,000,000 B (of 6,162,084) was NOT caught by CGImageSourceGetStatus (drew a 10 KB JPEG, SQUINT_OK); heif::is_complete refuses it, and the same file cut at 6,100,000 B (99%) is refused too. Real outputs still byte-identical to the first build.

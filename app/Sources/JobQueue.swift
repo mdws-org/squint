@@ -128,20 +128,27 @@ final class JobQueue: ObservableObject {
         let url = await job.url
         let outcome: Job.State = await Task.detached(priority: .userInitiated) {
             do {
-                let ext = url.pathExtension.lowercased()
-                if (ext == "heic" || ext == "heif") && preset.suffix == nil && preset.mode != .strip {
-                    return .failed("a HEIC can only be shrunk beside the original; use Squint: Shrink for Email")
-                }
                 let input = try Data(contentsOf: url)
+                // Judged from the bytes, not the name: a JPEG that arrived
+                // as `.heic` is a JPEG and may be replaced in place as one,
+                // and a HEIC named `.jpg` is still a HEIC. The engine writes
+                // JPEG, so the only place a HEIC may go is beside itself.
+                let besideOnly = "a HEIC can only be shrunk beside the original; use Squint: Shrink for Email"
+                let isHeif = input.count >= 12 && input[4..<8].elementsEqual("ftyp".utf8)
+                if isHeif && preset.suffix == nil && preset.mode != .strip {
+                    return .failed(besideOnly)
+                }
                 let result = try Engine.optimize(
                     input,
                     mode: preset.mode,
                     target: target,
                     maxDimension: preset.maxDimension
                 )
-                let destination = preset.destination(for: url, converted: result.converted)
+                let destination = preset.destination(for: url, outputExtension: result.outputExtension)
+                // The check that actually guards the write: whatever the name
+                // said, a result of another format never lands on the source.
                 if result.converted && destination == url {
-                    return .failed("a HEIC can only be shrunk beside the original; use Squint: Shrink for Email")
+                    return .failed(besideOnly)
                 }
                 if destination == url {
                     try Writer.replaceInPlace(url, with: result.data)
@@ -156,7 +163,7 @@ final class JobQueue: ObservableObject {
                     score: result.score,
                     hdr: result.hdr,
                     quantized: result.quantized,
-                    converted: result.converted
+                    outputExtension: result.outputExtension
                 )
             } catch let failure as Engine.Failure {
                 return failure.isAlreadyOptimal ? .alreadyOptimal : .failed(failure.message)

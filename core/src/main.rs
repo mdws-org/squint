@@ -142,7 +142,7 @@ fn main() {
     // complaint about a format it was never taught.
     if squint_core::tiff::is_tiff(&bytes) {
         match optimize(&bytes, Mode::Fast, target, fixed_quality, png_min_quality, probes, None) {
-            Ok(_) => unreachable!("neither format can be re-encoded"),
+            Ok(_) => unreachable!("a TIFF cannot be re-encoded"),
             Err(e) => { eprintln!("{e}"); std::process::exit(1) }
         }
     }

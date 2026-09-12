@@ -31,13 +31,17 @@ struct Preset {
     static let email = Preset(mode: .fast, maxDimension: 2048, suffix: "-email")
 
     /// Where this preset's output goes for a given input.
-    func destination(for url: URL, converted: Bool) -> URL {
+    ///
+    /// The extension names what the engine wrote, not what the input was
+    /// called. A JPEG that arrived as `IMG_1234.heic` (Dropbox's camera upload
+    /// does exactly this) comes out as `IMG_1234-email.jpg`, and a HEIC comes
+    /// out as a `.jpg` because that is what it became.
+    func destination(for url: URL, outputExtension: String) -> URL {
         guard let suffix else { return url }
         let stem = url.deletingPathExtension().lastPathComponent
-        let ext = converted ? "jpg" : url.pathExtension
         return url
             .deletingLastPathComponent()
             .appendingPathComponent(stem + suffix)
-            .appendingPathExtension(ext)
+            .appendingPathExtension(outputExtension)
     }
 }

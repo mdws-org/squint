@@ -10,6 +10,11 @@
 //! numbers must still mean what that profile says they mean; an iPhone shoots
 //! Display P3, and converting to sRGB would clip its colours before the
 //! profile could describe them.
+//!
+//! What is not caught here: a HEIF whose range lives in a PQ or HLG transfer
+//! function rather than a gain map. An iPhone writes gain maps, so the gain
+//! map is what is asked about; a single-image PQ file would be flattened to
+//! 8 bits by the draw and reported as having had no range to lose.
 
 use std::ffi::c_void;
 use std::ptr;
@@ -62,6 +67,10 @@ struct CGRect {
 }
 
 const K_CF_NUMBER_SINT64_TYPE: i32 = 4;
+/// `kCGImageStatusComplete`. Anything else means the container is truncated,
+/// unreadable or still being parsed, and a draw from it would come out black
+/// or half-filled with no error raised anywhere.
+const K_CG_IMAGE_STATUS_COMPLETE: i32 = 0;
 const K_CG_COLOR_SPACE_MODEL_RGB: i32 = 1;
 const K_CG_IMAGE_ALPHA_NONE_SKIP_LAST: u32 = 5;
 const K_CG_BITMAP_BYTE_ORDER_DEFAULT: u32 = 0;
@@ -96,6 +105,7 @@ extern "C" {
         bitmapInfo: u32,
     ) -> CGContextRef;
     fn CGBitmapContextGetData(context: CGContextRef) -> *mut c_void;
+    fn CGBitmapContextGetBytesPerRow(context: CGContextRef) -> usize;
     fn CGContextDrawImage(c: CGContextRef, rect: CGRect, image: CGImageRef);
 }
 
@@ -110,6 +120,8 @@ extern "C" {
     fn CGImageSourceCreateWithData(data: CFDataRef, options: CFDictionaryRef) -> CGImageSourceRef;
     fn CGImageSourceGetCount(isrc: CGImageSourceRef) -> usize;
     fn CGImageSourceGetPrimaryImageIndex(isrc: CGImageSourceRef) -> usize;
+    fn CGImageSourceGetStatus(isrc: CGImageSourceRef) -> i32;
+    fn CGImageSourceGetStatusAtIndex(isrc: CGImageSourceRef, index: usize) -> i32;
     fn CGImageSourceCopyAuxiliaryDataInfoAtIndex(
         isrc: CGImageSourceRef,
         index: usize,
@@ -161,6 +173,13 @@ pub fn decode(bytes: &[u8], max_pixels: usize) -> Result<Decoded, Error> {
         let src = Cf::wrap(CGImageSourceCreateWithData(cf_data.as_ptr() as CFDataRef, ptr::null()))
             .ok_or_else(|| Error::Decode("Image I/O could not open this file".into()))?;
 
+        // `CGContextDrawImage` returns nothing. A stream that dies part way
+        // through decoding leaves the context zero-filled and the draw reports
+        // success, so the container's own status is the only place a
+        // truncated file can be caught before it becomes a black photograph.
+        if CGImageSourceGetStatus(src.as_ptr() as CGImageSourceRef) != K_CG_IMAGE_STATUS_COMPLETE {
+            return Err(Error::Decode("Image I/O could not read this file to the end".into()));
+        }
         let count = CGImageSourceGetCount(src.as_ptr() as CGImageSourceRef);
         if count < 1 {
             return Err(Error::Decode("Image I/O found no images in file".into()));
@@ -169,6 +188,9 @@ pub fn decode(bytes: &[u8], max_pixels: usize) -> Result<Decoded, Error> {
         // depth map. Which one is the picture is declared by the container, and
         // it is not always the first.
         let primary = CGImageSourceGetPrimaryImageIndex(src.as_ptr() as CGImageSourceRef);
+        if CGImageSourceGetStatusAtIndex(src.as_ptr() as CGImageSourceRef, primary) != K_CG_IMAGE_STATUS_COMPLETE {
+            return Err(Error::Decode("Image I/O could not read the picture to the end".into()));
+        }
 
         // The declared size is read from the header before the picture is
         // created, so a file lying about its size costs a dictionary lookup
@@ -234,10 +256,10 @@ pub fn decode(bytes: &[u8], max_pixels: usize) -> Result<Decoded, Error> {
         // agrees on. `cs` is owned by `image` (Get rule) and is not released.
         let cs = CGImageGetColorSpace(image.as_ptr() as CGImageRef);
         let icc = if !cs.is_null() && CGColorSpaceGetModel(cs) == K_CG_COLOR_SPACE_MODEL_RGB {
-            Cf::wrap(CGColorSpaceCopyICCData(cs)).map(|d| {
+            Cf::wrap(CGColorSpaceCopyICCData(cs)).and_then(|d| {
                 let len = CFDataGetLength(d.as_ptr() as CFDataRef) as usize;
                 let ptr = CFDataGetBytePtr(d.as_ptr() as CFDataRef);
-                std::slice::from_raw_parts(ptr, len).to_vec()
+                (len > 0 && !ptr.is_null()).then(|| std::slice::from_raw_parts(ptr, len).to_vec())
             })
         } else {
             None
@@ -283,10 +305,21 @@ pub fn decode(bytes: &[u8], max_pixels: usize) -> Result<Decoded, Error> {
             return Err(Error::Decode("Bitmap context data is null".into()));
         }
 
-        let raw_slice = std::slice::from_raw_parts(data_ptr, total_bytes);
-        let mut rgb = Vec::with_capacity(w * h * 3);
-        for chunk in raw_slice.chunks_exact(4) {
-            rgb.extend_from_slice(&chunk[..3]);
+        // The stride asked for is a request. With no buffer supplied, Quartz
+        // allocates its own and may pad each row to an alignment it prefers,
+        // so the rows are walked at the stride it reports rather than the one
+        // that was requested. Reading at the requested stride stays inside the
+        // buffer and shears the picture diagonally, with nothing to say so.
+        let stride = CGBitmapContextGetBytesPerRow(ctx.as_ptr() as CGContextRef);
+        if stride < bytes_per_row {
+            return Err(Error::Decode("bitmap context rows are narrower than the picture".into()));
+        }
+        let raw_slice = std::slice::from_raw_parts(data_ptr, stride.checked_mul(h).unwrap_or(total_bytes));
+        let mut rgb = Vec::with_capacity(total_bytes / 4 * 3);
+        for row in raw_slice.chunks_exact(stride) {
+            for px in row[..bytes_per_row].chunks_exact(4) {
+                rgb.extend_from_slice(&px[..3]);
+            }
         }
 
         let orient_u16 = if (1..=8).contains(&orientation) {

@@ -8,7 +8,9 @@
 //! a reference and a candidate that were decoded differently do not score
 //! against each other honestly.
 
-use crate::{capped, extract_icc, extract_orientation, Error, Image, MAX_PIXELS};
+use crate::{extract_icc, extract_orientation, Error, Image};
+#[cfg(target_os = "macos")]
+use crate::{capped, MAX_PIXELS};
 
 pub struct Source {
     /// Pixels with the EXIF orientation already baked in, capped to `max_dimension` (Lanczos, never enlarged).
@@ -28,6 +30,9 @@ impl Source {
         if crate::heif::is_heif(bytes) {
             #[cfg(target_os = "macos")]
             {
+                if !crate::heif::is_complete(bytes) {
+                    return Err(Error::Decode("this HEIC is cut short: its index points past the end of the file".into()));
+                }
                 let decoded = crate::imageio::decode(bytes, MAX_PIXELS)?;
                 let rgb_buf = image::RgbImage::from_raw(
                     decoded.width as u32,
@@ -97,7 +102,11 @@ mod tests {
         // it is genuinely smaller. A smooth gradient codes to under 2 KB as
         // HEIC, and the never-grow check then refuses the conversion — which is
         // correct behaviour, and not what this test is for.
-        let (w, h) = (1200u32, 800u32);
+        // 1201 wide so that a row is 4,804 bytes, which no alignment Quartz
+        // prefers divides: a decode that reads rows at the requested stride
+        // instead of the reported one shears the picture and fails the corner
+        // checks below.
+        let (w, h) = (1201u32, 800u32);
         let mut img_buf = image::RgbImage::new(w, h);
         let mut seed = 0x9E37_79B9u32;
         for y in 0..h {
@@ -150,6 +159,13 @@ mod tests {
         let dec = Image::decode(&opt.data).expect("decode optimized jpeg");
         assert_eq!(dec.width, 150);
         assert_eq!(dec.height, 100);
+
+        // Cut short, the file must be refused rather than drawn black.
+        let truncated = &heic_bytes[..heic_bytes.len() * 6 / 10];
+        assert!(
+            matches!(Source::open(truncated, None), Err(Error::Decode(_))),
+            "a truncated HEIC must be refused"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

@@ -213,6 +213,22 @@ fn item_extents(bytes: &[u8], iloc: &Box) -> Option<Vec<(u32, Vec<(usize, usize)
     Some(out)
 }
 
+/// Whether every item the container declares lies inside the bytes given.
+///
+/// A file cut short keeps its declarations, which sit at the front, and loses
+/// the tail of its picture data. Image I/O reports such a file as complete
+/// and draws what it can — a black or half-filled picture with no error — so
+/// completeness is judged here, from the index, before it is asked to decode.
+pub fn is_complete(bytes: &[u8]) -> bool {
+    if !is_heif(bytes) {
+        return false;
+    }
+    match find(bytes, b"iloc") {
+        Some(iloc) => item_extents(bytes, &iloc).is_some(),
+        None => false,
+    }
+}
+
 /// Overwrite a HEIF's metadata where it lies, leaving the picture untouched.
 ///
 /// Returns the result and how many bytes were destroyed. Zero means the file
@@ -383,6 +399,12 @@ mod tests {
         let (out, wiped) = strip_heif(&without).expect("still a heif");
         assert_eq!(wiped, 0, "nothing should have been removed");
         assert!(contains(&out[exif.clone()], b"GPS"), "and nothing should have been touched");
+    }
+
+    #[test]
+    fn completeness_is_judged_from_the_index() {
+        assert!(!is_complete(b"not a heif"));
+        assert!(!is_complete(b"\0\0\0\x18ftypheic\0\0\0\0mif1heic"), "a brand alone declares nothing");
     }
 
     #[test]
