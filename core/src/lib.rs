@@ -12,6 +12,7 @@ pub mod gainmap;
 pub mod gif;
 pub mod png;
 pub mod source;
+pub mod svg;
 #[cfg(target_os = "macos")]
 pub mod imageio;
 pub use metadata::{extract_icc, extract_orientation};
@@ -323,11 +324,22 @@ fn predict_quality(target: f64) -> f32 {
 /// Returns the best *satisfying probe* rather than the bracket endpoint, because
 /// quality is not monotonic in the encoder setting for synthetic content: text
 /// and interface screenshots have been measured to invert by up to 3.5 points.
+/// The size a result must beat, or `None` when nothing is being replaced.
+///
+/// Never growing a file is a rule about replacing one: an optimizer that hands
+/// back something bigger has failed, and the caller keeps what it had. It says
+/// nothing about a conversion, where the output is a different kind of thing
+/// written beside the original — a vector drawing is a few hundred bytes and
+/// any raster of it is thousands. Callers say which case they are in rather
+/// than leaving `optimize` to infer it, because the two answers used to differ
+/// by mode on the same file.
+pub type SizeToBeat = Option<usize>;
+
 pub fn search(
     reference: &Image,
     target: f64,
     max_probes: usize,
-    original_bytes: usize,
+    original_bytes: SizeToBeat,
     icc: Option<&[u8]>,
 ) -> Result<SearchResult, Error> {
     if reference.shorter_side() < MIN_PERCEPTUAL_DIM {
@@ -406,11 +418,13 @@ pub fn search(
         Some((chosen, data)) => {
             // An optimizer must never grow a file. A source that is already
             // compressed can require more bytes to match than it originally took.
-            if chosen.bytes >= original_bytes {
-                return Err(Error::NoSmallerResult {
-                    best_bytes: chosen.bytes,
-                    original_bytes,
-                });
+            if let Some(limit) = original_bytes {
+                if chosen.bytes >= limit {
+                    return Err(Error::NoSmallerResult {
+                        best_bytes: chosen.bytes,
+                        original_bytes: limit,
+                    });
+                }
             }
             Ok(SearchResult { chosen, data, probes })
         }
@@ -609,6 +623,11 @@ pub fn optimize(
         });
     }
 
+    // An SVG is not refused here. It rasterizes in `Source::open` and comes
+    // back with `converted_from` set, exactly as a HEIC does. What must not
+    // happen is the result landing on top of the drawing, and that is the
+    // caller's to prevent: the engine cannot see where its output will go.
+
     // A GIF is a palette format with frames and squint has no GIF encoder, so
     // Strip above is the only mode that reads one.
     if gif::is_gif(bytes) {
@@ -646,6 +665,9 @@ pub fn optimize(
     }
 
     let src = Source::open(bytes, max_dimension)?;
+    // Nothing is being replaced when the format changes, so there is no size
+    // to beat. Decided once, here, so that every mode answers the same way.
+    let size_to_beat: SizeToBeat = src.converted_from.is_none().then_some(bytes.len());
     let image = src.image;
     let icc = src.icc;
 
@@ -658,7 +680,7 @@ pub fn optimize(
             if target > JPEG_SCORE_CEILING {
                 return Err(Error::Unreachable { best_score: JPEG_SCORE_CEILING });
             }
-            let r = search(&image, target, max_probes, bytes.len(), icc.as_deref())?;
+            let r = search(&image, target, max_probes, size_to_beat, icc.as_deref())?;
             (r.data, Some(r.chosen.score), r.probes)
         }
     };
@@ -680,11 +702,13 @@ pub fn optimize(
 
     // Checked on the finished file rather than the picture alone: carrying the
     // gain map costs bytes, and an optimizer must never grow a file.
-    if data.len() >= bytes.len() {
-        return Err(Error::NoSmallerResult {
-            best_bytes: data.len(),
-            original_bytes: bytes.len(),
-        });
+    if let Some(limit) = size_to_beat {
+        if data.len() >= limit {
+            return Err(Error::NoSmallerResult {
+                best_bytes: data.len(),
+                original_bytes: limit,
+            });
+        }
     }
     Ok(Optimized {
         data,
@@ -962,7 +986,7 @@ mod tests {
     #[test]
     fn perceptual_targeting_is_refused_below_the_valid_size() {
         let img = Image { pixels: vec![[0, 0, 0]; 100 * 100], width: 100, height: 100 };
-        match search(&img, 80.0, 4, 999_999, None) {
+        match search(&img, 80.0, 4, Some(999_999), None) {
             Err(Error::TooSmall { shorter_side }) => assert_eq!(shorter_side, 100),
             other => panic!("expected TooSmall, got {other:?}"),
         }

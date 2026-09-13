@@ -8,9 +8,9 @@
 //! a reference and a candidate that were decoded differently do not score
 //! against each other honestly.
 
-use crate::{extract_icc, extract_orientation, Error, Image};
+use crate::{extract_icc, extract_orientation, Error, Image, MAX_PIXELS};
 #[cfg(target_os = "macos")]
-use crate::{capped, MAX_PIXELS};
+use crate::capped;
 
 pub struct Source {
     /// Pixels with the EXIF orientation already baked in, capped to `max_dimension` (Lanczos, never enlarged).
@@ -27,6 +27,22 @@ pub struct Source {
 
 impl Source {
     pub fn open(bytes: &[u8], max_dimension: Option<u32>) -> Result<Source, Error> {
+        if crate::svg::is_svg(bytes) {
+            // Drawn at the requested size rather than drawn and then resized:
+            // a vector has no native resolution to lose, so rendering straight
+            // to the cap is both sharper and cheaper than rasterizing large.
+            let (rgb, width, height) = crate::svg::rasterize(bytes, max_dimension, MAX_PIXELS)?;
+            return Ok(Source {
+                image: Image::from_rgb8(&rgb, width, height),
+                // An SVG carries no colour profile and the render is sRGB,
+                // which is what an untagged JPEG is read as.
+                icc: None,
+                orientation: 1,
+                has_gain_map: false,
+                converted_from: Some("SVG"),
+            });
+        }
+
         if crate::heif::is_heif(bytes) {
             #[cfg(target_os = "macos")]
             {
@@ -73,6 +89,31 @@ impl Source {
                 converted_from: None,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod svg_tests {
+    use super::*;
+
+    #[test]
+    fn an_svg_arrives_as_a_conversion() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="60" height="40">
+            <rect width="60" height="40" fill="#336699"/>
+        </svg>"##;
+        let src = Source::open(svg, None).expect("an SVG opens");
+        assert_eq!(src.converted_from, Some("SVG"));
+        assert_eq!((src.image.width, src.image.height), (60, 40));
+        assert_eq!(src.icc, None);
+    }
+
+    #[test]
+    fn an_svg_is_drawn_at_the_cap_rather_than_resized_afterwards() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="800" height="400">
+            <rect width="800" height="400" fill="#336699"/>
+        </svg>"##;
+        let src = Source::open(svg, Some(200)).expect("an SVG opens");
+        assert_eq!((src.image.width, src.image.height), (200, 100));
     }
 }
 

@@ -220,12 +220,20 @@ fn main() {
                     if Some(p.score) == r.score { "   <- chosen" } else { "" }
                 );
             }
+            // A percentage of the source says nothing once the format has
+            // changed: a vector drawing is a few hundred bytes and any raster
+            // of it is thousands, which prints as "3466% of original" and
+            // invites a reader to think something went wrong.
+            let against_source = match r.converted_from {
+                Some(_) => String::new(),
+                None => format!("  {:>5.1}% of original", 100.0 * r.data.len() as f64 / bytes.len() as f64),
+            };
             println!(
-                "{:<8} q{:<5.1} {:>7.0} KB  {:>5.1}% of original{}  {} probes  {:.3}s{}{}",
+                "{:<8} q{:<5.1} {:>7.0} KB{}{}  {} probes  {:.3}s{}{}",
                 mode,
                 r.probes.last().map_or(fixed_quality, |p| p.quality),
                 r.data.len() as f64 / 1024.0,
-                100.0 * r.data.len() as f64 / bytes.len() as f64,
+                against_source,
                 match r.score { Some(s) => format!("  score {s:.3}"), None => "  (no metric evaluated)".into() },
                 r.probes.len(),
                 elapsed,
@@ -236,6 +244,18 @@ fn main() {
                 }
             );
             if let Some(o) = &out_path {
+                // A converted result is a different kind of file from its
+                // source, so writing it back over that source destroys the
+                // original and leaves a name that lies about its contents.
+                // The application refuses this from the bytes; the harness has
+                // to refuse it too, since it writes wherever it is pointed.
+                if r.converted_from.is_some() && std::fs::canonicalize(o).ok() == std::fs::canonicalize(path).ok() {
+                    eprintln!(
+                        "{} became a JPEG, which must not be written over the original; choose another --out path",
+                        r.converted_from.unwrap_or("this file")
+                    );
+                    std::process::exit(1)
+                }
                 std::fs::write(o, &r.data).unwrap_or_else(|e| { eprintln!("write failed: {e}"); std::process::exit(1) });
                 println!("         wrote {o}");
             }

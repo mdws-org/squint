@@ -10,7 +10,7 @@ Working. JPEG and PNG are implemented. Builds are published on the releases page
 
 What runs today: a drag and drop window, five Finder Services entries, in-place replacement that preserves Finder tags, and a command line harness for measurement.
 
-What does not exist yet: WebP, AVIF and SVG input; a GIF and a TIFF can only have their metadata removed; a HEIC can be shrunk only through the two entries that write beside the original, which write a JPEG; Balanced mode; further recipes beyond the email and social presets; WebP and AVIF output; PDF; HDR gain maps through a re-encode, which Strip keeps but Fast and Quality report as removed.
+What does not exist yet: WebP and AVIF input; a GIF and a TIFF can only have their metadata removed; a HEIC can be shrunk only through the two entries that write beside the original, which write a JPEG; Balanced mode; further recipes beyond the email and social presets; WebP and AVIF output; PDF; HDR gain maps through a re-encode, which Strip keeps but Fast and Quality report as removed.
 
 ## Why this exists
 
@@ -91,6 +91,8 @@ Note that an already-open Get Info window will keep showing camera and location 
 **Quality** searches at full resolution and returns the smallest file that still meets the perceptual target. For JPEG the lever is the encoder's quality setting; for PNG it is the number of colours, since that is what PNG trades away. Neither scale predicts a perceptual score, so both are searched rather than assumed.
 
 PNG has an option JPEG does not: leaving the pixels alone, which is identical to the source and so meets any target by construction. A perceptual target on a PNG is never unreachable, only expensive: where no reduction in colours will meet it, the result is the lossless one. Measured on a 400x300 Display P3 screenshot, a target of 80 returns 55 KB scoring 88.3, smaller than fast mode's 61 KB. A target of 90 finds no reduction that qualifies, and the answer is the 121 KB lossless file.
+
+**An SVG** is rasterized rather than optimized: it has no pixels of its own, so the engine draws it at whatever size was asked for and writes a JPEG. That is a conversion, not an optimization, so the result goes beside the original and never over it — a drawing and a picture of a drawing are not the same file, and the drawing is the one you can still edit. Two things worth knowing. The renderer is told to ignore any file a document names, so an `<image href="file:///...">` fetches nothing: a picture handed to this program must not be able to make it read the disk. And the drawing is composited onto white before the alpha is dropped, because JPEG has none and a transparent background over black looks like a mistake. There is no Finder entry for SVG; the command line reads one.
 
 **Strip** removes metadata and nothing else, and is the only mode that reads GIF or TIFF; HEIC is read by every mode. From a GIF it takes out comments and every application block it was not told to keep, which is how XMP and anything a future encoder invents leave without being named. It keeps the frame timing, the animation loop count, any text a viewer draws into the frame, and the colour profile. The pixels are copied unchanged, so the result is identical to the input image, and only the container shrinks. An HDR gain map is kept, because it is part of the picture rather than a record of where it was taken.
 
