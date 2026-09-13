@@ -25,6 +25,8 @@
 #define SQUINT_MODE_FAST    0
 #define SQUINT_MODE_QUALITY 1
 #define SQUINT_MODE_STRIP   2
+// Search on a downscaled proxy, then encode the full image once at chosen quality.
+#define SQUINT_MODE_BALANCED 3
 
 // What became of a high dynamic range gain map.
 #define SQUINT_HDR_ABSENT    0

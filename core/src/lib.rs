@@ -8,6 +8,8 @@ mod metadata;
 pub mod ffi;
 pub mod heif;
 pub mod tiff;
+pub mod gif;
+pub mod svg;
 pub mod gainmap;
 pub mod png;
 pub mod source;
@@ -21,6 +23,11 @@ use imgref::ImgVec;
 /// SSIMULACRA2 misindexes its internal weight table below this size and returns
 /// scores that are not meaningful. Perceptual targeting must be refused here.
 pub const MIN_PERCEPTUAL_DIM: usize = 113;
+
+/// The long-edge target dimension for the search proxy used in Balanced mode.
+/// Searching on a downscaled copy finds the target quality setting at a fraction
+/// of the cost while keeping the final encode full-size.
+pub const PROXY_LONG_EDGE: u32 = 1024;
 
 /// JPEG cannot reach an arbitrary score. Above roughly this value the search
 /// cannot converge, so it must fail rather than exhaust its probe budget.
@@ -420,6 +427,35 @@ pub fn search(
     }
 }
 
+/// Find a quality on a smaller copy of the picture, then encode the real one once.
+pub fn search_by_proxy(
+    full: &Image,
+    proxy: &Image,
+    target: f64,
+    max_probes: usize,
+    original_bytes: usize,
+    icc: Option<&[u8]>,
+) -> Result<SearchResult, Error> {
+    let proxy_result = search(proxy, target, max_probes, proxy.pixels.len() * 3, icc)?;
+    let full_data = encode_jpeg(full, proxy_result.chosen.quality, icc)?;
+    if full_data.len() >= original_bytes {
+        return Err(Error::NoSmallerResult {
+            best_bytes: full_data.len(),
+            original_bytes,
+        });
+    }
+    let chosen = Probe {
+        quality: proxy_result.chosen.quality,
+        score: proxy_result.chosen.score,
+        bytes: full_data.len(),
+    };
+    Ok(SearchResult {
+        chosen,
+        data: full_data,
+        probes: proxy_result.probes,
+    })
+}
+
 /// Inverse linear interpolation on the two probes closest to the target.
 fn interpolate(probes: &[Probe], target: f64) -> Option<f32> {
     let mut below = None::<&Probe>;
@@ -450,6 +486,8 @@ pub enum Mode {
     /// Remove metadata without touching the pixels. The result is
     /// pixel-identical to the input and usually only slightly smaller.
     Strip,
+    /// Search for a perceptual quality setting on a downscaled proxy, then encode once at full size.
+    Balanced,
 }
 
 /// What became of a high dynamic range photograph's gain map.
@@ -503,13 +541,16 @@ pub fn optimize(
         // than cutting it out, so the result is exactly as long as the input.
         // Whether anything was removed is answered by how much was destroyed,
         // not by the file having shrunk.
-        if heif::is_heif(bytes) || tiff::is_tiff(bytes) {
+        if heif::is_heif(bytes) || tiff::is_tiff(bytes) || gif::is_gif(bytes) {
             let (stripped, wiped) = if heif::is_heif(bytes) {
                 heif::strip_heif(bytes)
                     .ok_or_else(|| Error::Decode("this HEIF is not laid out as expected".into()))?
-            } else {
+            } else if tiff::is_tiff(bytes) {
                 tiff::strip_tiff(bytes)
                     .ok_or_else(|| Error::Decode("this TIFF is not laid out as expected".into()))?
+            } else {
+                gif::strip_gif(bytes)
+                    .ok_or_else(|| Error::Decode("this GIF is not laid out as expected".into()))?
             };
             if wiped == 0 {
                 return Err(Error::NoSmallerResult {
@@ -588,13 +629,25 @@ pub fn optimize(
         });
     }
 
+    // A GIF is a palette format with frames, and squint has no GIF encoder.
+    // Strip returns above; everything else stops here.
+    if gif::is_gif(bytes) {
+        return Err(Error::ReadOnlyFormat { format: "GIF" });
+    }
+
     if tiff::is_tiff(bytes) {
         return Err(Error::ReadOnlyFormat { format: "TIFF" });
     }
 
+    // An SVG is not refused here. It rasterizes in `Source::open` and comes
+    // back with `converted_from` set, exactly as a HEIC does, and the caller
+    // is what refuses to put the result over the original: a drawing and a
+    // photograph of it are not the same file. The application decides that
+    // from the bytes, not from the name.
+
     if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
         let effort = match mode {
-            Mode::Quality => png::Effort::Thorough,
+            Mode::Quality | Mode::Balanced => png::Effort::Thorough,
             // Strip returns before reaching here; Fast must not pay the
             // thorough preset, which costs an order of magnitude for a few
             // percent.
@@ -603,7 +656,7 @@ pub fn optimize(
         let r = png::optimize_png(
             bytes,
             png_min_quality,
-            (mode == Mode::Quality).then_some(target),
+            (mode == Mode::Quality || mode == Mode::Balanced).then_some(target),
             effort,
             max_dimension,
         )?;
@@ -634,6 +687,33 @@ pub fn optimize(
             let r = search(&image, target, max_probes, bytes.len(), icc.as_deref())?;
             (r.data, Some(r.chosen.score), r.probes)
         }
+        Mode::Balanced => {
+            if target > JPEG_SCORE_CEILING {
+                return Err(Error::Unreachable { best_score: JPEG_SCORE_CEILING });
+            }
+            let long_edge = image.width.max(image.height);
+            if (long_edge as u32) <= PROXY_LONG_EDGE {
+                let r = search(&image, target, max_probes, bytes.len(), icc.as_deref())?;
+                (r.data, Some(r.chosen.score), r.probes)
+            } else {
+                let rgb_buf = image::RgbImage::from_raw(
+                    image.width as u32,
+                    image.height as u32,
+                    image.flat(),
+                ).ok_or_else(|| Error::Encode("could not create rgb buffer for proxy".into()))?;
+                let dyn_img = image::DynamicImage::ImageRgb8(rgb_buf);
+                let proxy_img = capped(dyn_img, Some(PROXY_LONG_EDGE)).to_rgb8();
+                let (pw, ph) = (proxy_img.width() as usize, proxy_img.height() as usize);
+                let proxy = Image::from_rgb8(&proxy_img.into_raw(), pw, ph);
+                if proxy.shorter_side() < MIN_PERCEPTUAL_DIM {
+                    let r = search(&image, target, max_probes, bytes.len(), icc.as_deref())?;
+                    (r.data, Some(r.chosen.score), r.probes)
+                } else {
+                    let r = search_by_proxy(&image, &proxy, target, max_probes, bytes.len(), icc.as_deref())?;
+                    (r.data, None, r.probes)
+                }
+            }
+        }
     };
 
     // A gain map cannot yet be carried onto a re-encoded picture, so say so
@@ -653,7 +733,17 @@ pub fn optimize(
 
     // Checked on the finished file rather than the picture alone: carrying the
     // gain map costs bytes, and an optimizer must never grow a file.
-    if data.len() >= bytes.len() {
+    //
+    // A conversion is not held to that. The rule protects a file from being
+    // replaced by a larger one, and a result in a different format is never
+    // written over its source — it goes beside it, under a name that says what
+    // it is. Comparing the two sizes there compares different things: a vector
+    // drawing is a few hundred bytes and any raster of it is thousands, so a
+    // never-grow check would refuse every SVG ever handed to the engine, and
+    // refuse a full-resolution photograph out of a HEIC for the ordinary reason
+    // that HEVC codes better than JPEG. What to do with a bigger copy is the
+    // caller's decision; the original is untouched either way.
+    if src.converted_from.is_none() && data.len() >= bytes.len() {
         return Err(Error::NoSmallerResult {
             best_bytes: data.len(),
             original_bytes: bytes.len(),
@@ -676,6 +766,20 @@ mod tests {
 
     /// A HEIC now decodes for re-encoding; a TIFF still does not, and must keep
     /// saying so in its own words rather than through a decoder's complaint.
+    #[test]
+    fn a_gif_is_refused_for_re_encoding() {
+        let mut gif_bytes = Vec::new();
+        gif_bytes.extend_from_slice(b"GIF89a");
+        gif_bytes.extend_from_slice(&[0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00]);
+        gif_bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF]);
+        gif_bytes.push(0x3B);
+        match optimize(&gif_bytes, Mode::Fast, 80.0, 75.0, Some(70), 6, None) {
+            Err(Error::ReadOnlyFormat { format: "GIF" }) => {}
+            Err(e) => panic!("expected ReadOnlyFormat GIF, got {e:?}"),
+            Ok(_) => panic!("expected ReadOnlyFormat GIF, got a result"),
+        }
+    }
+
     #[test]
     fn a_tiff_is_still_refused_for_re_encoding() {
         let mut tiff_bytes = vec![0u8; 32];
@@ -1017,5 +1121,69 @@ mod tests {
             );
             ffi::squint_result_free(res);
         }
+    }
+
+    fn make_synthetic_image(w: u32, h: u32) -> Image {
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        let mut seed = 0x9E37_79B9u32;
+        for y in 0..h {
+            for x in 0..w {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = (seed >> 29) as i16 - 3;
+                let px = |base: i16| (base + noise).clamp(0, 255) as u8;
+                pixels.push([px(x as u8 as i16), px(y as u8 as i16), px(200)]);
+            }
+        }
+        Image {
+            pixels,
+            width: w as usize,
+            height: h as usize,
+        }
+    }
+
+    fn make_synthetic_jpeg(w: u32, h: u32) -> Vec<u8> {
+        let img = make_synthetic_image(w, h);
+        encode_jpeg(&img, 90.0, None).expect("encode jpeg")
+    }
+
+    #[test]
+    fn test_search_by_proxy_synthetic() {
+        let full = make_synthetic_image(1600, 1200);
+        let rgb_buf = image::RgbImage::from_raw(
+            full.width as u32,
+            full.height as u32,
+            full.flat(),
+        ).expect("rgb buffer");
+        let dyn_img = image::DynamicImage::ImageRgb8(rgb_buf);
+        let proxy_img = capped(dyn_img, Some(PROXY_LONG_EDGE)).to_rgb8();
+        let (pw, ph) = (proxy_img.width() as usize, proxy_img.height() as usize);
+        let proxy = Image::from_rgb8(&proxy_img.into_raw(), pw, ph);
+
+        let original_bytes = 10_000_000; // Large bound to avoid NoSmallerResult
+        let res = search_by_proxy(&full, &proxy, 80.0, 6, original_bytes, None)
+            .expect("search_by_proxy should succeed");
+
+        assert_eq!(res.chosen.bytes, res.data.len());
+        assert!((20.0..=98.0).contains(&res.chosen.quality));
+    }
+
+    #[test]
+    fn test_optimize_balanced_synthetic() {
+        let jpeg_bytes = make_synthetic_jpeg(1600, 1200);
+        let opt = optimize(&jpeg_bytes, Mode::Balanced, 80.0, 75.0, Some(70), 6, None)
+            .expect("optimize balanced should succeed");
+
+        assert_eq!(opt.score, None);
+        assert!(!opt.probes.is_empty());
+    }
+
+    #[test]
+    fn test_optimize_balanced_small_skips_proxy() {
+        // Picture at or below PROXY_LONG_EDGE (e.g. 1024x768)
+        let jpeg_bytes = make_synthetic_jpeg(1024, 768);
+        let opt = optimize(&jpeg_bytes, Mode::Balanced, 80.0, 75.0, Some(70), 6, None)
+            .expect("optimize balanced on small picture should succeed");
+
+        assert!(opt.score.is_some());
     }
 }

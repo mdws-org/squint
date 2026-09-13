@@ -13,6 +13,7 @@ imagequant = "4.4"
 oxipng = { version = "10", default-features = false, features = ["parallel", "zopfli"] }
 rgb = "0.8"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+resvg = "0.48"
 
 [lib]
 name = "squint_core"

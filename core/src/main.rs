@@ -17,10 +17,11 @@ fn hdr_note(hdr: Hdr) -> &'static str {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: squint <image> [--mode fast|quality] [--target <score>] [--quality <n>] [--probes <n>]
+        "usage: squint <image> [--mode fast|quality|balanced] [--target <score>] [--quality <n>] [--probes <n>]
 
   fast     encode once at a fixed quality, measure nothing (the default)
   quality  search for the smallest file scoring at or above the target
+  balanced search on a downscaled proxy, then encode once at chosen quality
 
   strip    remove metadata, leaving the pixels exactly as they were
 
@@ -153,12 +154,12 @@ fn main() {
         return;
     }
 
-    // Reported before decoding, because a TIFF cannot be decoded here at all and
-    // the reason should be the one the engine gives rather than a decoder's
-    // complaint about a format it was never taught.
-    if squint_core::tiff::is_tiff(&bytes) {
+    // Reported before decoding, because TIFF and GIF cannot be decoded here for
+    // re-encoding and the reason should be the one the engine gives rather than
+    // a decoder's complaint about a format it was never taught.
+    if squint_core::tiff::is_tiff(&bytes) || squint_core::gif::is_gif(&bytes) {
         match optimize(&bytes, Mode::Fast, target, fixed_quality, png_min_quality, probes, None) {
-            Ok(_) => unreachable!("a TIFF cannot be re-encoded"),
+            Ok(_) => unreachable!("TIFF and GIF cannot be re-encoded"),
             Err(e) => { eprintln!("{e}"); std::process::exit(1) }
         }
     }
@@ -198,12 +199,15 @@ fn main() {
         // harness came to measure something the application does not do: its
         // fast path had no never-grow check, so it would happily write a file
         // larger than its input where the application refused.
-        "fast" | "quality" => {
-            let requested = if mode == "quality" { Mode::Quality } else { Mode::Fast };
-            if requested == Mode::Quality && target > JPEG_SCORE_CEILING {
+        "fast" | "quality" | "balanced" => {
+            let requested = match mode.as_str() {
+                "quality" => Mode::Quality,
+                "balanced" => Mode::Balanced,
+                _ => Mode::Fast,
+            };
+            if (requested == Mode::Quality || requested == Mode::Balanced) && target > JPEG_SCORE_CEILING {
                 eprintln!(
-                    "target {target:.0} is above the JPEG ceiling of about {JPEG_SCORE_CEILING:.0}; \
-                     the search cannot converge"
+                    "target {target:.0} is above the JPEG ceiling of about {JPEG_SCORE_CEILING:.0};                      the search cannot converge"
                 );
                 std::process::exit(1)
             }
@@ -220,13 +224,26 @@ fn main() {
                     if Some(p.score) == r.score { "   <- chosen" } else { "" }
                 );
             }
+            let metric_note = if mode == "balanced" {
+                format!(" (quality found on a {}px proxy)", squint_core::PROXY_LONG_EDGE)
+            } else {
+                match r.score { Some(s) => format!("  score {s:.3}"), None => "  (no metric evaluated)".into() }
+            };
+            // A percentage of the source is meaningless once the format has
+            // changed: a vector drawing is a few hundred bytes and any raster
+            // of it is thousands, which reads as "3466% of original" and says
+            // nothing about how well the picture was encoded.
+            let against_source = match r.converted_from {
+                Some(_) => String::new(),
+                None => format!("  {:>5.1}% of original", 100.0 * r.data.len() as f64 / bytes.len() as f64),
+            };
             println!(
-                "{:<8} q{:<5.1} {:>7.0} KB  {:>5.1}% of original{}  {} probes  {:.3}s{}{}",
+                "{:<8} q{:<5.1} {:>7.0} KB{}{}  {} probes  {:.3}s{}{}",
                 mode,
                 r.probes.last().map_or(fixed_quality, |p| p.quality),
                 r.data.len() as f64 / 1024.0,
-                100.0 * r.data.len() as f64 / bytes.len() as f64,
-                match r.score { Some(s) => format!("  score {s:.3}"), None => "  (no metric evaluated)".into() },
+                against_source,
+                metric_note,
                 r.probes.len(),
                 elapsed,
                 hdr_note(r.hdr),
