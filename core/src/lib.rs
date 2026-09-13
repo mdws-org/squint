@@ -22,6 +22,11 @@ use imgref::ImgVec;
 /// scores that are not meaningful. Perceptual targeting must be refused here.
 pub const MIN_PERCEPTUAL_DIM: usize = 113;
 
+/// The long-edge target dimension for the search proxy used in Balanced mode.
+/// Searching on a downscaled copy finds the target quality setting at a fraction
+/// of the cost while keeping the final encode full-size.
+pub const PROXY_LONG_EDGE: u32 = 1024;
+
 /// JPEG cannot reach an arbitrary score. Above roughly this value the search
 /// cannot converge, so it must fail rather than exhaust its probe budget.
 pub const JPEG_SCORE_CEILING: f64 = 91.0;
@@ -420,6 +425,35 @@ pub fn search(
     }
 }
 
+/// Find a quality on a smaller copy of the picture, then encode the real one once.
+pub fn search_by_proxy(
+    full: &Image,
+    proxy: &Image,
+    target: f64,
+    max_probes: usize,
+    original_bytes: usize,
+    icc: Option<&[u8]>,
+) -> Result<SearchResult, Error> {
+    let proxy_result = search(proxy, target, max_probes, proxy.pixels.len() * 3, icc)?;
+    let full_data = encode_jpeg(full, proxy_result.chosen.quality, icc)?;
+    if full_data.len() >= original_bytes {
+        return Err(Error::NoSmallerResult {
+            best_bytes: full_data.len(),
+            original_bytes,
+        });
+    }
+    let chosen = Probe {
+        quality: proxy_result.chosen.quality,
+        score: proxy_result.chosen.score,
+        bytes: full_data.len(),
+    };
+    Ok(SearchResult {
+        chosen,
+        data: full_data,
+        probes: proxy_result.probes,
+    })
+}
+
 /// Inverse linear interpolation on the two probes closest to the target.
 fn interpolate(probes: &[Probe], target: f64) -> Option<f32> {
     let mut below = None::<&Probe>;
@@ -450,6 +484,8 @@ pub enum Mode {
     /// Remove metadata without touching the pixels. The result is
     /// pixel-identical to the input and usually only slightly smaller.
     Strip,
+    /// Search for a perceptual quality setting on a downscaled proxy, then encode once at full size.
+    Balanced,
 }
 
 /// What became of a high dynamic range photograph's gain map.
@@ -594,7 +630,7 @@ pub fn optimize(
 
     if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
         let effort = match mode {
-            Mode::Quality => png::Effort::Thorough,
+            Mode::Quality | Mode::Balanced => png::Effort::Thorough,
             // Strip returns before reaching here; Fast must not pay the
             // thorough preset, which costs an order of magnitude for a few
             // percent.
@@ -603,7 +639,7 @@ pub fn optimize(
         let r = png::optimize_png(
             bytes,
             png_min_quality,
-            (mode == Mode::Quality).then_some(target),
+            (mode == Mode::Quality || mode == Mode::Balanced).then_some(target),
             effort,
             max_dimension,
         )?;
@@ -633,6 +669,33 @@ pub fn optimize(
             }
             let r = search(&image, target, max_probes, bytes.len(), icc.as_deref())?;
             (r.data, Some(r.chosen.score), r.probes)
+        }
+        Mode::Balanced => {
+            if target > JPEG_SCORE_CEILING {
+                return Err(Error::Unreachable { best_score: JPEG_SCORE_CEILING });
+            }
+            let long_edge = image.width.max(image.height);
+            if (long_edge as u32) <= PROXY_LONG_EDGE {
+                let r = search(&image, target, max_probes, bytes.len(), icc.as_deref())?;
+                (r.data, Some(r.chosen.score), r.probes)
+            } else {
+                let rgb_buf = image::RgbImage::from_raw(
+                    image.width as u32,
+                    image.height as u32,
+                    image.flat(),
+                ).ok_or_else(|| Error::Encode("could not create rgb buffer for proxy".into()))?;
+                let dyn_img = image::DynamicImage::ImageRgb8(rgb_buf);
+                let proxy_img = capped(dyn_img, Some(PROXY_LONG_EDGE)).to_rgb8();
+                let (pw, ph) = (proxy_img.width() as usize, proxy_img.height() as usize);
+                let proxy = Image::from_rgb8(&proxy_img.into_raw(), pw, ph);
+                if proxy.shorter_side() < MIN_PERCEPTUAL_DIM {
+                    let r = search(&image, target, max_probes, bytes.len(), icc.as_deref())?;
+                    (r.data, Some(r.chosen.score), r.probes)
+                } else {
+                    let r = search_by_proxy(&image, &proxy, target, max_probes, bytes.len(), icc.as_deref())?;
+                    (r.data, None, r.probes)
+                }
+            }
         }
     };
 
@@ -1017,5 +1080,69 @@ mod tests {
             );
             ffi::squint_result_free(res);
         }
+    }
+
+    fn make_synthetic_image(w: u32, h: u32) -> Image {
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        let mut seed = 0x9E37_79B9u32;
+        for y in 0..h {
+            for x in 0..w {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = (seed >> 29) as i16 - 3;
+                let px = |base: i16| (base + noise).clamp(0, 255) as u8;
+                pixels.push([px(x as u8 as i16), px(y as u8 as i16), px(200)]);
+            }
+        }
+        Image {
+            pixels,
+            width: w as usize,
+            height: h as usize,
+        }
+    }
+
+    fn make_synthetic_jpeg(w: u32, h: u32) -> Vec<u8> {
+        let img = make_synthetic_image(w, h);
+        encode_jpeg(&img, 90.0, None).expect("encode jpeg")
+    }
+
+    #[test]
+    fn test_search_by_proxy_synthetic() {
+        let full = make_synthetic_image(1600, 1200);
+        let rgb_buf = image::RgbImage::from_raw(
+            full.width as u32,
+            full.height as u32,
+            full.flat(),
+        ).expect("rgb buffer");
+        let dyn_img = image::DynamicImage::ImageRgb8(rgb_buf);
+        let proxy_img = capped(dyn_img, Some(PROXY_LONG_EDGE)).to_rgb8();
+        let (pw, ph) = (proxy_img.width() as usize, proxy_img.height() as usize);
+        let proxy = Image::from_rgb8(&proxy_img.into_raw(), pw, ph);
+
+        let original_bytes = 10_000_000; // Large bound to avoid NoSmallerResult
+        let res = search_by_proxy(&full, &proxy, 80.0, 6, original_bytes, None)
+            .expect("search_by_proxy should succeed");
+
+        assert_eq!(res.chosen.bytes, res.data.len());
+        assert!((20.0..=98.0).contains(&res.chosen.quality));
+    }
+
+    #[test]
+    fn test_optimize_balanced_synthetic() {
+        let jpeg_bytes = make_synthetic_jpeg(1600, 1200);
+        let opt = optimize(&jpeg_bytes, Mode::Balanced, 80.0, 75.0, Some(70), 6, None)
+            .expect("optimize balanced should succeed");
+
+        assert_eq!(opt.score, None);
+        assert!(!opt.probes.is_empty());
+    }
+
+    #[test]
+    fn test_optimize_balanced_small_skips_proxy() {
+        // Picture at or below PROXY_LONG_EDGE (e.g. 1024x768)
+        let jpeg_bytes = make_synthetic_jpeg(1024, 768);
+        let opt = optimize(&jpeg_bytes, Mode::Balanced, 80.0, 75.0, Some(70), 6, None)
+            .expect("optimize balanced on small picture should succeed");
+
+        assert!(opt.score.is_some());
     }
 }

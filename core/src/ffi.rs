@@ -9,6 +9,7 @@ use std::os::raw::{c_char, c_int};
 pub const SQUINT_MODE_FAST: c_int = 0;
 pub const SQUINT_MODE_QUALITY: c_int = 1;
 pub const SQUINT_MODE_STRIP: c_int = 2;
+pub const SQUINT_MODE_BALANCED: c_int = 3;
 
 pub const SQUINT_HDR_ABSENT: c_int = 0;
 pub const SQUINT_HDR_PRESERVED: c_int = 1;
@@ -113,6 +114,7 @@ pub unsafe extern "C" fn squint_optimize(
     let mode = match mode {
         SQUINT_MODE_QUALITY => Mode::Quality,
         SQUINT_MODE_STRIP => Mode::Strip,
+        SQUINT_MODE_BALANCED => Mode::Balanced,
         _ => Mode::Fast,
     };
     let png_min = if png_min_quality < 0 { None } else { Some(png_min_quality.min(100) as u8) };

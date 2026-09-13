@@ -17,10 +17,11 @@ fn hdr_note(hdr: Hdr) -> &'static str {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: squint <image> [--mode fast|quality] [--target <score>] [--quality <n>] [--probes <n>]
+        "usage: squint <image> [--mode fast|quality|balanced] [--target <score>] [--quality <n>] [--probes <n>]
 
   fast     encode once at a fixed quality, measure nothing (the default)
   quality  search for the smallest file scoring at or above the target
+  balanced search on a downscaled proxy, then encode once at chosen quality
 
   strip    remove metadata, leaving the pixels exactly as they were
 
@@ -198,12 +199,15 @@ fn main() {
         // harness came to measure something the application does not do: its
         // fast path had no never-grow check, so it would happily write a file
         // larger than its input where the application refused.
-        "fast" | "quality" => {
-            let requested = if mode == "quality" { Mode::Quality } else { Mode::Fast };
-            if requested == Mode::Quality && target > JPEG_SCORE_CEILING {
+        "fast" | "quality" | "balanced" => {
+            let requested = match mode.as_str() {
+                "quality" => Mode::Quality,
+                "balanced" => Mode::Balanced,
+                _ => Mode::Fast,
+            };
+            if (requested == Mode::Quality || requested == Mode::Balanced) && target > JPEG_SCORE_CEILING {
                 eprintln!(
-                    "target {target:.0} is above the JPEG ceiling of about {JPEG_SCORE_CEILING:.0}; \
-                     the search cannot converge"
+                    "target {target:.0} is above the JPEG ceiling of about {JPEG_SCORE_CEILING:.0};                      the search cannot converge"
                 );
                 std::process::exit(1)
             }
@@ -220,13 +224,18 @@ fn main() {
                     if Some(p.score) == r.score { "   <- chosen" } else { "" }
                 );
             }
+            let metric_note = if mode == "balanced" {
+                format!(" (quality found on a {}px proxy)", squint_core::PROXY_LONG_EDGE)
+            } else {
+                match r.score { Some(s) => format!("  score {s:.3}"), None => "  (no metric evaluated)".into() }
+            };
             println!(
                 "{:<8} q{:<5.1} {:>7.0} KB  {:>5.1}% of original{}  {} probes  {:.3}s{}{}",
                 mode,
                 r.probes.last().map_or(fixed_quality, |p| p.quality),
                 r.data.len() as f64 / 1024.0,
                 100.0 * r.data.len() as f64 / bytes.len() as f64,
-                match r.score { Some(s) => format!("  score {s:.3}"), None => "  (no metric evaluated)".into() },
+                metric_note,
                 r.probes.len(),
                 elapsed,
                 hdr_note(r.hdr),
