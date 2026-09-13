@@ -52,10 +52,17 @@ mkdir -p releases && cp Squint-<version>.zip releases/
 rm -P /tmp/sparkle.key
 ```
 
-`generate_appcast` writes `releases/appcast.xml`. Copy it to the repository
-root, commit it on `main`, and push before publishing the release, because the
-feed URL in the application reads that file from `main` and an entry pointing
-at a download that is not there yet is worse than no entry.
+`generate_appcast` writes `releases/appcast.xml`. Publish the release first,
+then copy that file to the repository root and push it on `main`. An entry
+naming a download that does not exist yet is worse than no entry, and the feed
+URL in the application reads the file from `main`, so the appcast is the last
+thing to move.
+
+`generate_appcast` writes the whole file, including a `sparkle:hardwareRequirements`
+line taken from the binary it signed. A build made on an Apple silicon Mac says
+`arm64`, and an Intel Mac is then never offered that update. That is correct for
+what is being shipped; it becomes wrong the day a release is built universal,
+and the appcast is where it will show.
 
 The Sparkle tools are in the release tarball at
 `https://github.com/sparkle-project/Sparkle/releases`, matching the version
