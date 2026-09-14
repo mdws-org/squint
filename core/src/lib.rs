@@ -538,10 +538,12 @@ pub fn optimize(
             });
         }
 
-        if heif::is_heif(bytes) || tiff::is_tiff(bytes) {
-            let (stripped, wiped) = if heif::is_heif(bytes) {
-                heif::strip_heif(bytes)
-                    .ok_or_else(|| Error::Decode("this HEIF is not laid out as expected".into()))?
+        if heif::is_isobmff_image(bytes) || tiff::is_tiff(bytes) {
+            let (stripped, wiped) = if heif::is_isobmff_image(bytes) {
+                let container = heif::container_name(bytes);
+                heif::strip_heif(bytes).ok_or_else(|| {
+                    Error::Decode(format!("this {container} is not laid out as expected"))
+                })?
             } else {
                 tiff::strip_tiff(bytes)
                     .ok_or_else(|| Error::Decode("this TIFF is not laid out as expected".into()))?

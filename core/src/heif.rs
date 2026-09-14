@@ -30,13 +30,62 @@ const METADATA_ITEMS: [&[u8; 4]; 2] = [b"Exif", b"mime"];
 ///
 /// The brand list is the set an Apple camera and its exports actually write.
 pub fn is_heif(bytes: &[u8]) -> bool {
-    if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
+    if !has_ftyp(bytes) {
         return false;
     }
     matches!(
         &bytes[8..12],
         b"heic" | b"heix" | b"heim" | b"heis" | b"hevc" | b"hevx" | b"mif1" | b"msf1" | b"miaf"
-    )
+    ) && !is_avif(bytes)
+}
+
+/// Whether these bytes are an AVIF container.
+///
+/// AVIF is the same ISOBMFF tree as a HEIF with AV1 in the tiles instead of
+/// HEVC, so everything below reads one exactly as it reads the other. The two
+/// are told apart only to name the format in a message and in `converted_from`.
+///
+/// The compatible-brand list is consulted as well as the major brand: an AVIF
+/// written with `mif1` as its major brand is common, and it is matched by the
+/// HEIF brand list above, so major brand alone would call it a HEIC.
+pub fn is_avif(bytes: &[u8]) -> bool {
+    if !has_ftyp(bytes) {
+        return false;
+    }
+    let avif_brand = |b: &[u8]| b == b"avif" || b == b"avis";
+    avif_brand(&bytes[8..12]) || compatible_brands(bytes).any(avif_brand)
+}
+
+/// Whether these bytes are one of the ISOBMFF pictures read here.
+pub fn is_isobmff_image(bytes: &[u8]) -> bool {
+    is_heif(bytes) || is_avif(bytes)
+}
+
+/// The name for the container, for a message and for `converted_from`.
+pub fn container_name(bytes: &[u8]) -> &'static str {
+    if is_avif(bytes) {
+        "AVIF"
+    } else {
+        "HEIC"
+    }
+}
+
+fn has_ftyp(bytes: &[u8]) -> bool {
+    bytes.len() >= 12 && &bytes[4..8] == b"ftyp"
+}
+
+/// The brands listed after the major brand and minor version in `ftyp`.
+///
+/// The `ftyp` box's declared size bounds the walk; a size that runs past the
+/// bytes given yields nothing rather than reading whatever follows.
+fn compatible_brands(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let size = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    let end = if (16..=bytes.len()).contains(&size) {
+        size
+    } else {
+        16
+    };
+    bytes[16.min(end)..end].chunks_exact(4)
 }
 
 /// One box: where it starts, how long it is, and how much of that is header.
@@ -220,7 +269,7 @@ fn item_extents(bytes: &[u8], iloc: &Box) -> Option<Vec<(u32, Vec<(usize, usize)
 /// and draws what it can — a black or half-filled picture with no error — so
 /// completeness is judged here, from the index, before it is asked to decode.
 pub fn is_complete(bytes: &[u8]) -> bool {
-    if !is_heif(bytes) {
+    if !is_isobmff_image(bytes) {
         return false;
     }
     match find(bytes, b"iloc") {
@@ -235,7 +284,7 @@ pub fn is_complete(bytes: &[u8]) -> bool {
 /// carried none of the items this removes, which is a different outcome from a
 /// failure and is reported as one.
 pub fn strip_heif(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
-    if !is_heif(bytes) {
+    if !is_isobmff_image(bytes) {
         return None;
     }
     let iinf = find(bytes, b"iinf")?;
@@ -410,6 +459,79 @@ mod tests {
     #[test]
     fn refuses_something_that_is_not_a_heif() {
         assert!(strip_heif(b"not a heif at all, not even close").is_none());
+    }
+
+    /// An `ftyp` box: major brand, minor version, then compatible brands.
+    fn ftyp(major: &[u8; 4], compatible: &[&[u8; 4]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let size = 16 + 4 * compatible.len();
+        out.extend_from_slice(&be32(size as u32));
+        out.extend_from_slice(b"ftyp");
+        out.extend_from_slice(major);
+        out.extend_from_slice(&be32(0));
+        for brand in compatible {
+            out.extend_from_slice(*brand);
+        }
+        out
+    }
+
+    #[test]
+    fn an_avif_is_told_apart_from_a_heic() {
+        let avif = ftyp(b"avif", &[b"mif1", b"miaf"]);
+        assert!(is_avif(&avif));
+        assert!(!is_heif(&avif), "an AVIF must not also answer to HEIC");
+        assert_eq!(container_name(&avif), "AVIF");
+
+        let heic = ftyp(b"heic", &[b"mif1"]);
+        assert!(is_heif(&heic));
+        assert!(!is_avif(&heic));
+        assert_eq!(container_name(&heic), "HEIC");
+    }
+
+    /// The case major brand alone gets wrong: `mif1` is in the HEIF list, so an
+    /// AVIF that leads with it would be called a HEIC and named as one in every
+    /// message, even though the compatible brands say what it is.
+    #[test]
+    fn a_mif1_avif_is_recognised_by_its_compatible_brands() {
+        let avif = ftyp(b"mif1", &[b"avif"]);
+        assert!(is_avif(&avif));
+        assert!(!is_heif(&avif));
+        assert_eq!(container_name(&avif), "AVIF");
+
+        let heif = ftyp(b"mif1", &[b"heic"]);
+        assert!(is_heif(&heif), "mif1 without an AVIF brand stays a HEIF");
+        assert!(!is_avif(&heif));
+    }
+
+    #[test]
+    fn a_lying_ftyp_size_does_not_read_past_the_bytes() {
+        // The declared size claims brands that are not there. Reading them
+        // would walk into whatever follows in memory and could match `avif` by
+        // accident, so an out-of-range size yields no compatible brands.
+        let mut avif = ftyp(b"mif1", &[b"avif"]);
+        avif[0..4].copy_from_slice(&be32(4096));
+        assert!(!is_avif(&avif), "brands past the end are not read");
+        assert!(is_heif(&avif), "the major brand still stands on its own");
+
+        // A size smaller than the header cannot bound anything either.
+        let mut truncated = ftyp(b"mif1", &[b"avif"]);
+        truncated[0..4].copy_from_slice(&be32(8));
+        assert!(!is_avif(&truncated));
+    }
+
+    #[test]
+    fn an_avif_is_stripped_by_the_same_walk_as_a_heif() {
+        // Same tree, AVIF brand: the ISOBMFF layout is what the strip reads,
+        // and the codec in the tiles is not part of it.
+        let (mut bytes, exif) = heif_with_exif();
+        assert!(contains(&bytes[exif.clone()], b"GPS"));
+        bytes[8..12].copy_from_slice(b"avif");
+        assert!(is_avif(&bytes));
+
+        let (out, wiped) = strip_heif(&bytes).expect("an AVIF strips");
+        assert!(wiped > 0, "the EXIF item should have been destroyed");
+        assert!(!contains(&out[exif], b"GPS"));
+        assert!(is_complete(&bytes), "and the index still describes the file");
     }
 
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
