@@ -13,6 +13,7 @@ pub mod gif;
 pub mod png;
 pub mod source;
 pub mod svg;
+pub mod webp;
 #[cfg(target_os = "macos")]
 pub mod imageio;
 pub use metadata::{extract_icc, extract_orientation};
@@ -538,6 +539,29 @@ pub fn optimize(
             });
         }
 
+        // A WebP is stripped by rebuilding its chunk chain, so unlike a HEIF the
+        // metadata genuinely leaves and the file shrinks. Whether anything was
+        // removed is still reported the same way, as the payload bytes dropped.
+        if webp::is_webp(bytes) {
+            let (stripped, wiped) = webp::strip_webp(bytes)
+                .ok_or_else(|| Error::Decode("this WebP is not laid out as expected".into()))?;
+            if wiped == 0 {
+                return Err(Error::NoSmallerResult {
+                    best_bytes: bytes.len(),
+                    original_bytes: bytes.len(),
+                });
+            }
+            return Ok(Optimized {
+                data: stripped,
+                probes: Vec::new(),
+                score: None,
+                hdr: Hdr::Absent,
+                quantized: false,
+                original_bytes: bytes.len(),
+                converted_from: None,
+            });
+        }
+
         if heif::is_isobmff_image(bytes) || tiff::is_tiff(bytes) {
             let (stripped, wiped) = if heif::is_isobmff_image(bytes) {
                 let container = heif::container_name(bytes);
@@ -638,6 +662,15 @@ pub fn optimize(
 
     if tiff::is_tiff(bytes) {
         return Err(Error::ReadOnlyFormat { format: "TIFF" });
+    }
+
+    // A still WebP is re-encoded as a JPEG, exactly as a HEIC is, and arrives
+    // through `Source::open` below with `converted_from` set. An animation has
+    // no encoder here and is refused before it reaches a decoder that would
+    // hand back its first frame and nothing else, which is the same reason a
+    // GIF is refused above.
+    if webp::is_webp(bytes) && webp::is_animated(bytes) {
+        return Err(Error::ReadOnlyFormat { format: "WebP" });
     }
 
     if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {

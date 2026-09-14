@@ -1,9 +1,10 @@
 //! One way in for every picture the engine can re-encode.
 //!
-//! JPEG and PNG are decoded by the `image` crate; a HEIF is handed to the
-//! system's Image I/O, which is the only HEVC decoder on the machine. Whichever
-//! path a picture takes, it arrives here the same way: RGB8 in its own colour
-//! space, orientation baked in, capped to the long edge that was asked for.
+//! JPEG, PNG and WebP are decoded by the `image` crate; an SVG is rasterized by
+//! `resvg`; a HEIF is handed to the system's Image I/O, which is the only HEVC
+//! decoder on the machine. Whichever path a picture takes, it arrives here the
+//! same way: RGB8 in its own colour space, orientation baked in, capped to the
+//! long edge that was asked for.
 //! Both sides of a perceptual comparison must come through this one door, since
 //! a reference and a candidate that were decoded differently do not score
 //! against each other honestly.
@@ -21,7 +22,7 @@ pub struct Source {
     /// Whether a HEIF declared an HDR gain map. Always false for JPEG and PNG,
     /// whose maps the caller detects from the bytes.
     pub has_gain_map: bool,
-    /// Set when the output format will differ from the input's: `Some("HEIC")` or `Some("AVIF")` for an ISOBMFF source. None for JPEG and PNG.
+    /// Set when the output format will differ from the input's: `Some("HEIC")` or `Some("AVIF")` for an ISOBMFF source, `Some("SVG")` for a drawing, `Some("WebP")` for a WebP. None for JPEG and PNG.
     pub converted_from: Option<&'static str>,
 }
 
@@ -78,6 +79,31 @@ impl Source {
             {
                 Err(Error::ReadOnlyFormat { format: container })
             }
+        } else if crate::webp::is_webp(bytes) {
+            // An animated WebP decodes to its first frame in every decoder that
+            // would take it, and squint has no animated encoder, so the frames
+            // after that one would be gone with nothing to replace them. A GIF
+            // is refused for the same reason.
+            if crate::webp::is_animated(bytes) {
+                return Err(Error::ReadOnlyFormat { format: "WebP" });
+            }
+
+            let image = Image::decode_capped(bytes, max_dimension)?;
+            Ok(Source {
+                image,
+                // `extract_icc` reads JPEG APP2 segments and knows nothing of a
+                // RIFF chain, so the profile comes from the `ICCP` chunk
+                // instead. It has to come from somewhere: a wide-gamut picture
+                // that arrives untagged is treated as sRGB and the JPEG written
+                // beside it comes out flat.
+                icc: crate::webp::icc_profile(bytes),
+                // WebP has no orientation tag: EXIF may be present as a chunk,
+                // and a file that carried one has already had it applied by
+                // whatever wrote it. Baking a second turn would be wrong.
+                orientation: 1,
+                has_gain_map: false,
+                converted_from: Some("WebP"),
+            })
         } else {
             let mut image = Image::decode_capped(bytes, max_dimension)?;
             let icc = extract_icc(bytes);
