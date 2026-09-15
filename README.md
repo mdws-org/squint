@@ -10,7 +10,7 @@ Working. JPEG and PNG are implemented. Builds are published on the releases page
 
 What runs today: a drag and drop window, five Finder Services entries, in-place replacement that preserves Finder tags, and a command line harness for measurement.
 
-What does not exist yet: a GIF and a TIFF can only have their metadata removed; a HEIC, an AVIF, a WebP or an SVG can be shrunk only through the two entries that write beside the original, which write a JPEG; AVIF and WebP are written from the command line only, never from a Finder entry, and AVIF is written only on macOS; lossy WebP, which would mean a C dependency; Balanced mode; further recipes beyond the email and social presets; PDF; HDR gain maps through a re-encode, which Strip keeps but Fast and Quality report as removed.
+What does not exist yet: a GIF and a TIFF can only have their metadata removed; a HEIC, an AVIF, a WebP or an SVG can be shrunk only through the two entries that write beside the original, which write a JPEG; AVIF and WebP are written from the command line only, never from a Finder entry, and AVIF is written only on macOS; lossy WebP, which would mean a C dependency; Balanced mode; further recipes beyond the email and social presets; a PDF is compressed from the command line only and never from a Finder entry, and inside one a fax-coded page, a JPEG 2000 image or a CMYK image is left exactly as it was; HDR gain maps through a re-encode, which Strip keeps but Fast and Quality report as removed.
 
 ## Why this exists
 
@@ -203,7 +203,7 @@ Formats are tracked separately for reading and writing. Squint should read anyth
 - **v1** — ImageOptim parity plus the perceptual engine, in place, colour profile preserved, location data dropped. JPEG and PNG read and written. HEIC, AVIF, WebP and SVG are read and re-encoded as JPEG beside the original; GIF and TIFF are read only far enough to strip them.
 - **v1.1** — recipes, the Email and Social presets, dimension caps, and a Finder Sync extension for the preset submenu
 - **v1.2** — WebP and AVIF written. `--format avif` and `--format webp` on the command line, as conversions written beside the original. AVIF goes through the system encoder because no pure-Rust one can embed a colour profile, so it is macOS only; WebP is lossless, because the pure-Rust encoder has no other kind, and suits what a PNG suits rather than photographs.
-- **v1.3** — PDF, both compression and metadata removal
+- **v1.3** — PDF, both compression and metadata removal. The pictures inside a document are lifted out, re-encoded through the same perceptual search a standalone JPEG gets, and put back; the text, the vectors and the structure are untouched, so the document stays selectable and searchable. Resolution is capped at 150 dpi, which is where nearly all of the saving is: a 14 MB thirty-page scan comes out at 3.0 MB and an 11 MB sheet holding one uncompressed image at 183 KB. Command line only, and the cap is not a control.
 
 ## License
 
