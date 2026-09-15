@@ -176,6 +176,39 @@ fn main() {
         }
     }
 
+    // A PDF is not a picture, so it never reaches `Source::open`. It goes
+    // through `optimize` like everything else rather than being rewritten here:
+    // a private copy of the work in the harness is how this tool once came to
+    // measure something the application does not do.
+    if squint_core::pdf::is_pdf(&bytes) {
+        let requested = if mode == "quality" { Mode::Quality } else { Mode::Fast };
+        let pages = squint_core::pdf::page_count(&bytes);
+        let t0 = Instant::now();
+        match optimize(&bytes, requested, target, fixed_quality, png_min_quality, probes, None) {
+            Ok(r) => {
+                println!(
+                    "{}  {} {:>7.0} KB -> {:>7.0} KB  {:>5.1}%  images re-encoded in place  {:.3}s",
+                    path,
+                    match pages {
+                        Some(n) => format!("{n} pages "),
+                        None => String::new(),
+                    },
+                    bytes.len() as f64 / 1024.0,
+                    r.data.len() as f64 / 1024.0,
+                    100.0 * r.data.len() as f64 / bytes.len() as f64,
+                    t0.elapsed().as_secs_f64()
+                );
+                if let Some(o) = &out_path {
+                    std::fs::write(o, &r.data)
+                        .unwrap_or_else(|e| { eprintln!("write failed: {e}"); std::process::exit(1) });
+                    println!("         wrote {o}");
+                }
+            }
+            Err(e) => { eprintln!("{e}"); std::process::exit(1) }
+        }
+        return;
+    }
+
     let src = match Source::open(&bytes, None) {
         Ok(s) => s,
         Err(e) => {

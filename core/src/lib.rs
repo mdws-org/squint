@@ -13,6 +13,7 @@ pub mod gif;
 pub mod png;
 pub mod source;
 pub mod svg;
+pub mod pdf;
 pub mod webp;
 #[cfg(target_os = "macos")]
 pub mod imageio;
@@ -626,6 +627,27 @@ pub fn optimize_as(
     max_dimension: Option<u32>,
 ) -> Result<Optimized, Error> {
     if mode == Mode::Strip {
+        // A PDF says who wrote it, with what, and when, in its info dictionary
+        // and again in an XMP packet. Both go; the pages are untouched.
+        if pdf::is_pdf(bytes) {
+            let r = pdf::rewrite(bytes, Mode::Strip, 0.0, 0.0, 0, None)?;
+            if r.metadata_removed == 0 {
+                return Err(Error::NoSmallerResult {
+                    best_bytes: bytes.len(),
+                    original_bytes: bytes.len(),
+                });
+            }
+            return Ok(Optimized {
+                data: r.data,
+                probes: Vec::new(),
+                score: None,
+                hdr: Hdr::Absent,
+                quantized: false,
+                original_bytes: bytes.len(),
+                converted_from: None,
+            });
+        }
+
         // A HEIF is stripped by destroying its metadata where it lies rather
         // than cutting it out, so the result is exactly as long as the input.
         // Whether anything was removed is answered by how much was destroyed,
@@ -790,6 +812,38 @@ pub fn optimize_as(
     // the whole list in one place.
     if heif::is_image_sequence(bytes) {
         return Err(Error::ReadOnlyFormat { format: heif::container_name(bytes) });
+    }
+
+    // A PDF is not a picture and never becomes one: it is rewritten as itself,
+    // with the pictures inside it re-encoded in place. Naming another format
+    // for one is refused rather than quietly ignored.
+    if pdf::is_pdf(bytes) {
+        if format != OutputFormat::Jpeg {
+            return Err(Error::ReadOnlyFormat { format: "PDF" });
+        }
+        let r = pdf::rewrite(
+            bytes,
+            mode,
+            target,
+            fixed_quality,
+            max_probes,
+            Some(pdf::DEFAULT_MAX_DPI),
+        )?;
+        if r.data.len() >= bytes.len() {
+            return Err(Error::NoSmallerResult {
+                best_bytes: r.data.len(),
+                original_bytes: bytes.len(),
+            });
+        }
+        return Ok(Optimized {
+            data: r.data,
+            probes: Vec::new(),
+            score: None,
+            hdr: Hdr::Absent,
+            quantized: false,
+            original_bytes: bytes.len(),
+            converted_from: None,
+        });
     }
 
     // A PNG asked for as a PNG stays one. A PNG asked for as something else is
