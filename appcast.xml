@@ -3,13 +3,13 @@
     <channel>
         <title>Squint</title>
         <item>
-            <title>0.6.0</title>
-            <pubDate>Mon, 14 Sep 2026 13:47:58 -0700</pubDate>
-            <sparkle:version>9</sparkle:version>
-            <sparkle:shortVersionString>0.6.0</sparkle:shortVersionString>
+            <title>0.7.0</title>
+            <pubDate>Fri, 25 Sep 2026 16:13:26 -0700</pubDate>
+            <sparkle:version>10</sparkle:version>
+            <sparkle:shortVersionString>0.7.0</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <enclosure url="https://github.com/mdws-org/squint/releases/download/v0.6.0/Squint-0.6.0.zip" length="5990687" type="application/octet-stream" sparkle:edSignature="rLBN+lSmNU1/EiyWJw8IQTvgka+egU3qxnkyOM8WFS4wviKgrW4PHsSGEVJLhTX/vyi484tH34GgWBpwaTVpDw=="/>
+            <enclosure url="https://github.com/mdws-org/squint/releases/download/v0.7.0/Squint-0.7.0.zip" length="7142863" type="application/octet-stream" sparkle:edSignature="onO1+pQHWTRxENBJl3PQlAapPvAzvNUnJJm5oa+g6I0gAl01nJ5o0tCz0FHlLKRZrPIIbKaOm8k6cE25B0frDA=="/>
         </item>
     </channel>
 </rss>
