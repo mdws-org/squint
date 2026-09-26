@@ -155,9 +155,12 @@ final class JobQueue: ObservableObject {
                 // The check that actually guards the write: whatever the name
                 // said, a result of another format never lands on the source.
                 if result.converted && landsOnSource {
+                    // The guard fires on where the result would land, not on
+                    // what the source is, so the message says that and no
+                    // more: a PNG named `.avif` arrives here too.
                     return .failed(
                         preset.format == .avif
-                            ? "this picture is already an AVIF, so converting it would only overwrite it"
+                            ? "the AVIF would be written over the original, so nothing was written"
                             : besideOnly
                     )
                 }
@@ -177,6 +180,16 @@ final class JobQueue: ObservableObject {
                     outputExtension: result.outputExtension
                 )
             } catch let failure as Engine.Failure {
+                // "Already optimal" answers a question about the original.
+                // A conversion asked a different one, whether a smaller file
+                // of another kind exists, and when the engine refuses the
+                // larger result the honest outcome is that nothing was
+                // written, said in those words.
+                if failure.isAlreadyOptimal && preset.format != .jpeg {
+                    return .failed(
+                        "an \(preset.format.name) of this picture would be larger than the original, so none was written"
+                    )
+                }
                 return failure.isAlreadyOptimal ? .alreadyOptimal : .failed(failure.message)
             } catch {
                 return .failed(error.localizedDescription)

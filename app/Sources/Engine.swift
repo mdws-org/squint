@@ -30,6 +30,14 @@ enum Engine {
     enum Format: Int32 {
         case jpeg = 0
         case avif = 1
+
+        /// How the format is named to a person.
+        var name: String {
+            switch self {
+            case .jpeg: return "JPEG"
+            case .avif: return "AVIF"
+            }
+        }
     }
 
     struct Result {

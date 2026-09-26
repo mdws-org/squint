@@ -103,8 +103,9 @@ final class ServiceProvider: NSObject {
     /// formats the engine can only re-encode as JPEG — HEIC, AVIF, WebP and
     /// SVG — only to the entries that write beside the original, since a JPEG
     /// must not be written over a file that is not one. A PDF is rewritten as
-    /// a PDF, with the pictures inside it re-encoded, so it is offered to the
-    /// two in-place shrinking entries and nothing else.
+    /// a PDF, with the pictures inside it re-encoded or its own record of who
+    /// wrote it dropped, so it is offered to the three in-place entries and
+    /// to nothing that writes a picture beside the original.
     ///
     /// This list and the `NSSendFileTypes` in `project.yml` have to be changed
     /// together. Finder decides from the type declarations whether the menu

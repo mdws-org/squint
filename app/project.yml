@@ -158,17 +158,19 @@ targets:
               default: "Squint: Convert to AVIF"
             NSMessage: convertToAvif
             NSPortName: Squint
-            # Every picture the engine can decode, and no AVIF: converting one
+            # Every raster the engine can decode, and no AVIF: converting one
             # to itself would only write over it. TIFF and GIF are absent
-            # because the engine cannot decode them for a re-encode, and a
-            # PDF because it never becomes a picture.
+            # because the engine cannot decode them for a re-encode, a PDF
+            # because it never becomes a picture, and SVG because a raster of
+            # a drawing is larger than the drawing and the engine refuses a
+            # conversion that grows the file, so the entry would always
+            # refuse.
             NSSendFileTypes:
               - public.jpeg
               - public.png
               - public.heic
               - public.heif
               - org.webmproject.webp
-              - public.svg-image
             NSRequiredContext:
               NSApplicationIdentifier: com.apple.finder
               NSTextContent: FilePath
@@ -189,12 +191,17 @@ targets:
               # SVG is deliberately absent: a drawing has no metadata block
               # this strips, and the engine has no strip path for one, so
               # offering it would put an entry in the menu that always fails.
+              #
+              # A PDF says who wrote it, with what, and when, in its info
+              # dictionary and again in an XMP packet; both go and the pages
+              # are untouched.
               - public.heic
               - public.heif
               - public.avif
               - org.webmproject.webp
               - public.tiff
               - com.compuserve.gif
+              - com.adobe.pdf
             NSRequiredContext:
               NSApplicationIdentifier: com.apple.finder
               NSTextContent: FilePath
