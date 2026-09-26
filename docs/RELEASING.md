@@ -33,14 +33,24 @@ colon must be quoted.
 
 Do not sign with `--deep`. It is discouraged by Apple and refused by notarization for an application that embeds a framework, which is why the script names each piece.
 
-Then the two archives, from the same signed bundle:
+`SIGN_ONLY=1` in the environment stops the script after verification. A new certificate, a new build machine, or a keychain that might prompt can all be proven that way without spending a notarization.
+
+Then the two archives, from the same stapled bundle. The zip is what Sparkle downloads; it cannot be stapled itself, and the ticket travels inside it on the bundle. The dmg is what a person downloads, so it is signed, notarized and stapled in its own right, and its hash is taken only after stapling, which changes the file:
 
 ```
+KC=~/Library/Keychains/mdws-signing.keychain-db
 ditto -c -k --keepParent build/Build/Products/Release/Squint.app Squint-<version>.zip
 mkdir dmgroot && cp -R build/Build/Products/Release/Squint.app dmgroot/
 ln -s /Applications dmgroot/Applications
 hdiutil create -volname "Squint <version>" -srcfolder dmgroot -format UDZO Squint-<version>.dmg
+codesign --force --timestamp --keychain "$KC" --sign "Developer ID Application: Benjamin Meadows" Squint-<version>.dmg
+xcrun notarytool submit Squint-<version>.dmg --keychain-profile squint-notary --keychain "$KC" --wait
+xcrun stapler staple Squint-<version>.dmg
+spctl -a -vv -t open --context context:primary-signature Squint-<version>.dmg
+shasum -a 256 Squint-<version>.dmg Squint-<version>.zip
 ```
+
+`spctl` must answer `accepted` with `source=Notarized Developer ID` for the dmg as well. An unsigned dmg is accepted by notarization and staples without complaint, and still answers `rejected` with `no usable signature`: notarization looks at the application inside, `spctl` at the container.
 
 ## Sign the update and write the appcast
 
@@ -96,9 +106,12 @@ gh release create v<version> --prerelease --target <full 40-character SHA> \
     Squint-<version>.dmg Squint-<version>.zip
 ```
 
-A short SHA is rejected as an invalid target. Releases stay pre-releases while
-the application is unsigned by a paid developer account: macOS blocks the first
-launch and the notes carry the walkthrough.
+A short SHA is rejected as an invalid target. Releases before 0.7.1 stayed
+pre-releases because they were unsigned: macOS blocked the first launch and the
+notes carried the walkthrough. 0.7.1 is the first update to cross from an ad-hoc
+signature to a Developer ID one, which Sparkle permits when the EdDSA key is
+unchanged; it stays a pre-release until an installed 0.7.0 has taken it through
+Check for Updates and come up running.
 
 ## One-time signing setup on the build machine
 
@@ -109,11 +122,13 @@ Installing the pair, once:
 ```
 KC=~/Library/Keychains/mdws-signing.keychain-db
 security import ~/squint-signing/developerid.key -k "$KC" -T /usr/bin/codesign -T /usr/bin/security
-security import ~/squint-signing/developerID_application.cer -k "$KC" -T /usr/bin/codesign
+security import ~/squint-signing/developerid.cer -k "$KC" -T /usr/bin/codesign
+curl -O https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+security import DeveloperIDG2CA.cer -k "$KC"
 security find-identity -v -p codesigning "$KC"
 ```
 
-The identity must appear as valid. If it shows as untrusted, the intermediate `Developer ID Certification Authority` is missing from the System keychain; Xcode installs it, and Apple publishes it at https://www.apple.com/certificateauthority/ otherwise.
+The identity must appear as valid. `find-identity` reports no valid identity at all, with the key and certificate both imported and matching, until Apple's `Developer ID Certification Authority` (G2) intermediate is in the same keychain; Xcode does not put it anywhere that `security` searches. `security verify-cert -c developerid.cer -k "$KC" -p codeSign` confirms the chain.
 
 `codesign` in a session with no window server cannot answer a keychain prompt, and fails as `errSecInternalComponent`. The keychain is unlocked and its key's partition list is set once so that no prompt is raised. The password is read from 1Password into the environment and never appears on a command line:
 
@@ -130,7 +145,7 @@ Unlocking is needed again in each new session; the partition list persists.
 
 ## Notary credentials
 
-Notarization authenticates with an App Store Connect API key: an Issuer ID, a Key ID, and a `.p8` file that App Store Connect lets you download exactly once. All three live in the Fleet vault as `squint App Store Connect API key`. They are stored into the signing keychain under the profile name the script expects:
+Notarization authenticates with an App Store Connect API key: an Issuer ID, a Key ID, and a `.p8` file that App Store Connect lets you download exactly once. The key is a Team key, generated at App Store Connect under Users and Access, Integrations, App Store Connect API, with the Developer role, which is all notarization needs; the first visit asks for access to the API and acceptance of its terms before the Team Keys tab exists. All three values live in the Fleet vault as `squint App Store Connect API key`. They are stored into the signing keychain under the profile name the script expects, and `store-credentials` checks them against Apple before it saves anything:
 
 ```
 xcrun notarytool store-credentials squint-notary \
