@@ -6,7 +6,7 @@ Most optimizers ask you to choose a quality setting once and then apply it to ev
 
 ## Status
 
-Working. JPEG and PNG are implemented. Builds are published on the releases page, but none of them is signed by a paid developer account, so macOS blocks the first launch. From 0.4.0 the application can update itself: Squint menu, Check for Updates. It asks once whether to check on a schedule, and every update it installs is verified against a key compiled into the build.
+Working. JPEG and PNG are implemented. Builds on the releases page are signed with a Developer ID and notarized from 0.7.1, so they open like any other application. From 0.4.0 the application can update itself: Squint menu, Check for Updates. It asks once whether to check on a schedule, and every update it installs is verified against a key compiled into the build.
 
 What runs today: a drag and drop window, five Finder Services entries, in-place replacement that preserves Finder tags, and a command line harness for measurement.
 
@@ -38,14 +38,7 @@ One hundred files through fast mode, eight at a time, took 9 seconds on an 8 cor
 
 Download the `.dmg` from [Releases](https://github.com/mdws-org/squint/releases), or build it from source below. Either way it needs macOS 14 or later.
 
-The build is not signed by a paid developer account, so macOS refuses to open it the first time and says it cannot check the app for malicious software. Since macOS Sequoia, Control-clicking the app no longer offers a way past that. Instead:
-
-1. Move `Squint.app` to Applications and try to open it. It is blocked.
-2. Open System Settings, then Privacy and Security.
-3. Scroll to Security. A line about Squint appears there. Choose **Open Anyway**.
-4. Open the app again and confirm.
-
-That is once, not once per version.
+From 0.7.1 the build is signed with a Developer ID and notarized, so it opens on first launch like any other application. Builds before that were not, and macOS refused them until allowed through System Settings, Privacy and Security, **Open Anyway**; an installed earlier build updates itself to a signed one through Check for Updates.
 
 **Launch it once before looking for it in Finder.** The right-click entries are registered by the application itself, and they do not appear until it has run.
 
