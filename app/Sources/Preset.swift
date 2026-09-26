@@ -14,11 +14,30 @@ struct Preset {
     /// resolution away, and a photograph kept as documentation should not lose
     /// it because a copy was being made for an email.
     let suffix: String?
+    /// What the engine writes. Anything but `jpeg` is a conversion, and a
+    /// conversion is written beside the original: the result is a different
+    /// kind of file, and the original stays what it was.
+    let format: Engine.Format
+
+    /// True when the result replaces the original. A preset that resizes or
+    /// converts never does; the three plain modes always do.
+    var writesInPlace: Bool { suffix == nil && format == .jpeg }
 
     /// The three plain modes, replacing in place as they always have.
     static func plain(_ mode: Engine.Mode) -> Preset {
-        Preset(mode: mode, maxDimension: nil, suffix: nil)
+        Preset(mode: mode, maxDimension: nil, suffix: nil, format: .jpeg)
     }
+
+    /// Convert to AVIF: the picture at its own size, searched to the quality
+    /// target as the Quality entry is, and written beside the original as
+    /// `name.avif`.
+    ///
+    /// No cap, because AVIF is chosen for bytes rather than for a smaller
+    /// picture: it is the format for a web page or an archive that wants the
+    /// whole photograph in a fraction of the space. The search is the one the
+    /// application exists for; a fixed quality would hand back a number nobody
+    /// chose.
+    static let avif = Preset(mode: .quality, maxDimension: nil, suffix: nil, format: .avif)
 
     /// Shrink for email: 2048 pixels on the long edge, written beside the
     /// original as `name-email.jpg`.
@@ -28,7 +47,7 @@ struct Preset {
     /// on every phone and laptop it will be seen on. 2048 rather than smaller
     /// because a client zooms into exactly the detail a job photograph is sent
     /// to show.
-    static let email = Preset(mode: .fast, maxDimension: 2048, suffix: "-email")
+    static let email = Preset(mode: .fast, maxDimension: 2048, suffix: "-email", format: .jpeg)
 
     /// Shrink for social: 1440 pixels on the long edge, written beside the
     /// original as `name-social.jpg`.
@@ -43,20 +62,22 @@ struct Preset {
     /// Re-encoding is what removes the location: a job-site photograph carries
     /// the client's address in its EXIF, and every mode but Strip drops all of
     /// it and keeps only the colour profile.
-    static let social = Preset(mode: .fast, maxDimension: 1440, suffix: "-social")
+    static let social = Preset(mode: .fast, maxDimension: 1440, suffix: "-social", format: .jpeg)
 
     /// Where this preset's output goes for a given input.
     ///
     /// The extension names what the engine wrote, not what the input was
     /// called. A JPEG that arrived as `IMG_1234.heic` (Dropbox's camera upload
-    /// does exactly this) comes out as `IMG_1234-email.jpg`, and a HEIC comes
-    /// out as a `.jpg` because that is what it became.
+    /// does exactly this) comes out as `IMG_1234-email.jpg`, a HEIC comes out
+    /// as a `.jpg` because that is what it became, and a conversion to AVIF
+    /// comes out as `IMG_1234.avif` with no suffix, since the extension alone
+    /// already tells it apart from the original.
     func destination(for url: URL, outputExtension: String) -> URL {
-        guard let suffix else { return url }
+        if writesInPlace { return url }
         let stem = url.deletingPathExtension().lastPathComponent
         return url
             .deletingLastPathComponent()
-            .appendingPathComponent(stem + suffix)
+            .appendingPathComponent(stem + (suffix ?? ""))
             .appendingPathExtension(outputExtension)
     }
 }

@@ -30,8 +30,8 @@ targets:
       base:
         PRODUCT_NAME: Squint
         PRODUCT_BUNDLE_IDENTIFIER: net.mdws.squint
-        MARKETING_VERSION: "0.7.1"
-        CURRENT_PROJECT_VERSION: "11"
+        MARKETING_VERSION: "0.8.0"
+        CURRENT_PROJECT_VERSION: "12"
         SWIFT_VERSION: "5.0"
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Squint-Bridging-Header.h
         HEADER_SEARCH_PATHS: $(SRCROOT)/../core/include
@@ -93,13 +93,19 @@ targets:
               default: "Squint: Shrink"
             NSMessage: optimizeFast
             NSPortName: Squint
+            # A PDF is offered to the two in-place entries and to nothing
+            # else: it is rewritten as a PDF with the pictures inside it
+            # re-encoded, which is in-place work, and it never becomes a
+            # picture, so the entries that write a JPEG or an AVIF beside
+            # the original have nothing to write.
             NSSendFileTypes:
               - public.jpeg
               - public.png
+              - com.adobe.pdf
             NSRequiredContext:
               NSApplicationIdentifier: com.apple.finder
               NSTextContent: FilePath
-            NSServiceDescription: Shrink images in place, keeping the colour profile
+            NSServiceDescription: Shrink images in place, keeping the colour profile; a PDF has its pictures re-encoded
           - NSMenuItem:
               default: "Squint: Shrink for Email"
             NSMessage: shrinkForEmail
@@ -143,10 +149,32 @@ targets:
             NSSendFileTypes:
               - public.jpeg
               - public.png
+              - com.adobe.pdf
             NSRequiredContext:
               NSApplicationIdentifier: com.apple.finder
               NSTextContent: FilePath
-            NSServiceDescription: Shrink images to a perceptual quality target
+            NSServiceDescription: Shrink images to a perceptual quality target; a PDF has its pictures re-encoded
+          - NSMenuItem:
+              default: "Squint: Convert to AVIF"
+            NSMessage: convertToAvif
+            NSPortName: Squint
+            # Every raster the engine can decode, and no AVIF: converting one
+            # to itself would only write over it. TIFF and GIF are absent
+            # because the engine cannot decode them for a re-encode, a PDF
+            # because it never becomes a picture, and SVG because a raster of
+            # a drawing is larger than the drawing and the engine refuses a
+            # conversion that grows the file, so the entry would always
+            # refuse.
+            NSSendFileTypes:
+              - public.jpeg
+              - public.png
+              - public.heic
+              - public.heif
+              - org.webmproject.webp
+            NSRequiredContext:
+              NSApplicationIdentifier: com.apple.finder
+              NSTextContent: FilePath
+            NSServiceDescription: "Write an AVIF beside the original at the picture's own size, searched to the quality target"
           - NSMenuItem:
               default: "Squint: Remove Location Data"
             NSMessage: stripMetadata
@@ -163,12 +191,17 @@ targets:
               # SVG is deliberately absent: a drawing has no metadata block
               # this strips, and the engine has no strip path for one, so
               # offering it would put an entry in the menu that always fails.
+              #
+              # A PDF says who wrote it, with what, and when, in its info
+              # dictionary and again in an XMP packet; both go and the pages
+              # are untouched.
               - public.heic
               - public.heif
               - public.avif
               - org.webmproject.webp
               - public.tiff
               - com.compuserve.gif
+              - com.adobe.pdf
             NSRequiredContext:
               NSApplicationIdentifier: com.apple.finder
               NSTextContent: FilePath
