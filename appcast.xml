@@ -3,6 +3,15 @@
     <channel>
         <title>Squint</title>
         <item>
+            <title>0.8.1</title>
+            <pubDate>Sat, 26 Sep 2026 16:28:28 -0700</pubDate>
+            <sparkle:version>13</sparkle:version>
+            <sparkle:shortVersionString>0.8.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://github.com/mdws-org/squint/releases/download/v0.8.1/Squint-0.8.1.zip" length="7214064" type="application/octet-stream" sparkle:edSignature="UjX4CfMd3QzcFKkfqij0cvuVxReDFZ9Xvh/vbkd3PIPoW6rKkM3pE0S6phX6pHUmMYkPYYmIildXSr8MKxMDDw=="/>
+        </item>
+        <item>
             <title>0.8.0</title>
             <pubDate>Sat, 26 Sep 2026 15:25:31 -0700</pubDate>
             <sparkle:version>12</sparkle:version>
@@ -19,15 +28,6 @@
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
             <enclosure url="https://github.com/mdws-org/squint/releases/download/v0.7.1/Squint-0.7.1.zip" length="7212412" type="application/octet-stream" sparkle:edSignature="fwfD0OkzoEzhfRiusQKdOeGsE9XPGyKBmFk7HNZze0pgfI89vKEEh5r/8auBbT2+mU9cFtbJ8Yf60NuxaKjvAQ=="/>
-        </item>
-        <item>
-            <title>0.7.0</title>
-            <pubDate>Fri, 25 Sep 2026 16:13:26 -0700</pubDate>
-            <sparkle:version>10</sparkle:version>
-            <sparkle:shortVersionString>0.7.0</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <enclosure url="https://github.com/mdws-org/squint/releases/download/v0.7.0/Squint-0.7.0.zip" length="7142863" type="application/octet-stream" sparkle:edSignature="onO1+pQHWTRxENBJl3PQlAapPvAzvNUnJJm5oa+g6I0gAl01nJ5o0tCz0FHlLKRZrPIIbKaOm8k6cE25B0frDA=="/>
         </item>
     </channel>
 </rss>
