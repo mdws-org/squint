@@ -52,6 +52,14 @@ final class ServiceProvider: NSObject {
         run(pasteboard, mode: .strip, error: error)
     }
 
+    @objc func convertToAvif(
+        _ pasteboard: NSPasteboard,
+        userData: String?,
+        error: AutoreleasingUnsafeMutablePointer<NSString>
+    ) {
+        run(pasteboard, preset: .avif, error: error)
+    }
+
     private func run(
         _ pasteboard: NSPasteboard,
         mode: Engine.Mode,
@@ -93,8 +101,10 @@ final class ServiceProvider: NSObject {
     /// HEIC, AVIF, WebP, TIFF and GIF belong here because what they disclose
     /// can be removed. TIFF and GIF are offered to no shrinking entry, and the
     /// formats the engine can only re-encode as JPEG — HEIC, AVIF, WebP and
-    /// SVG — only to the two that write beside the original, since a JPEG must
-    /// not be written over a file that is not one.
+    /// SVG — only to the entries that write beside the original, since a JPEG
+    /// must not be written over a file that is not one. A PDF is rewritten as
+    /// a PDF, with the pictures inside it re-encoded, so it is offered to the
+    /// two in-place shrinking entries and nothing else.
     ///
     /// This list and the `NSSendFileTypes` in `project.yml` have to be changed
     /// together. Finder decides from the type declarations whether the menu
@@ -102,7 +112,7 @@ final class ServiceProvider: NSObject {
     /// A format in one and not the other either never shows up or shows up and
     /// refuses.
     private static func isSupported(_ url: URL) -> Bool {
-        ["jpg", "jpeg", "png", "heic", "heif", "avif", "webp", "svg", "tif", "tiff", "gif"]
+        ["jpg", "jpeg", "png", "heic", "heif", "avif", "webp", "svg", "tif", "tiff", "gif", "pdf"]
             .contains(url.pathExtension.lowercased())
     }
 }

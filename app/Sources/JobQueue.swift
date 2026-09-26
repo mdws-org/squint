@@ -136,22 +136,32 @@ final class JobQueue: ObservableObject {
                 // only place such a picture may go is beside itself.
                 let besideOnly = "this picture is re-encoded as a JPEG, so it can only be written beside the original; use Squint: Shrink for Email"
                 let isIsobmff = input.count >= 12 && input[4..<8].elementsEqual("ftyp".utf8)
-                if isIsobmff && preset.suffix == nil && preset.mode != .strip {
+                if isIsobmff && preset.writesInPlace && preset.mode != .strip {
                     return .failed(besideOnly)
                 }
                 let result = try Engine.optimize(
                     input,
                     mode: preset.mode,
+                    format: preset.format,
                     target: target,
                     maxDimension: preset.maxDimension
                 )
                 let destination = preset.destination(for: url, outputExtension: result.outputExtension)
+                // Compared without regard to case, because the volume very
+                // likely does not regard it either: `Photo.AVIF` converted to
+                // AVIF would be written to `Photo.avif`, which on a
+                // case-insensitive disk is the original.
+                let landsOnSource = destination.path.lowercased() == url.path.lowercased()
                 // The check that actually guards the write: whatever the name
                 // said, a result of another format never lands on the source.
-                if result.converted && destination == url {
-                    return .failed(besideOnly)
+                if result.converted && landsOnSource {
+                    return .failed(
+                        preset.format == .avif
+                            ? "this picture is already an AVIF, so converting it would only overwrite it"
+                            : besideOnly
+                    )
                 }
-                if destination == url {
+                if landsOnSource {
                     try Writer.replaceInPlace(url, with: result.data)
                 } else {
                     // A derived copy: the original is not touched, and a copy

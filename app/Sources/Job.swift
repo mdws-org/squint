@@ -72,7 +72,7 @@ final class Job: ObservableObject, Identifiable {
             }
             // A preset that wrote beside the original says where, since the
             // point of the run is the new file rather than the old one.
-            if preset.suffix != nil {
+            if !preset.writesInPlace {
                 text = "wrote \(preset.destination(for: url, outputExtension: outputExtension).lastPathComponent), " + text
             }
             return text
