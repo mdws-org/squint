@@ -21,10 +21,19 @@
 #define SQUINT_ERR_PANIC      9
 #define SQUINT_ERR_COLOURS    10
 #define SQUINT_ERR_READ_ONLY  11
+#define SQUINT_ERR_UNKNOWN_FORMAT 12
+#define SQUINT_ERR_UNKNOWN_MODE   13
 
 #define SQUINT_MODE_FAST    0
 #define SQUINT_MODE_QUALITY 1
 #define SQUINT_MODE_STRIP   2
+
+// What squint_optimize_as writes. JPEG is what squint_optimize asks for: a JPEG
+// or PNG is re-encoded as itself, a PDF is rewritten as a PDF, and everything
+// else becomes a JPEG. AVIF and lossless WebP are conversions of any picture.
+#define SQUINT_FORMAT_JPEG          0
+#define SQUINT_FORMAT_AVIF          1
+#define SQUINT_FORMAT_WEBP_LOSSLESS 2
 
 // What became of a high dynamic range gain map.
 #define SQUINT_HDR_ABSENT    0
@@ -44,16 +53,28 @@ typedef struct {
     // along with the data buffer. When it is null, squint_error_message(error)
     // is the description to show.
     const char *error_message;
-    int converted; // non-zero when the output is a JPEG made from a source of another format (HEIC)
+    // Non-zero when the output is a different kind of file from the input: a
+    // JPEG made from a HEIC, WebP or SVG, or an AVIF made from anything. Such a
+    // result must be written beside the original, never over it.
+    int converted;
 } SquintResult;
 
-// Format is detected from the bytes. HEIC is decoded for fast and quality modes
-// and comes back as JPEG. png_min_quality below 0 disables quantization.
-// max_dimension caps the long edge in pixels; 0 leaves the picture its own size.
-// The cap never enlarges.
+// The input format is detected from the bytes. HEIC is decoded for fast and
+// quality modes and comes back as JPEG. mode is one of the SQUINT_MODE_ values
+// and any other is refused with SQUINT_ERR_UNKNOWN_MODE. png_min_quality below
+// 0 disables quantization. max_dimension caps the long edge in pixels; 0
+// leaves the picture its own size. The cap never enlarges.
 SquintResult squint_optimize(const uint8_t *input, size_t input_len, int mode,
                              double target, float fixed_quality, int png_min_quality,
                              int max_dimension);
+
+// squint_optimize with the output format named: one of the SQUINT_FORMAT_
+// values. Any other value is refused with SQUINT_ERR_UNKNOWN_FORMAT rather than
+// read as JPEG. A PDF is rewritten as a PDF only when JPEG is named, and refused
+// with SQUINT_ERR_READ_ONLY otherwise.
+SquintResult squint_optimize_as(const uint8_t *input, size_t input_len, int format,
+                                int mode, double target, float fixed_quality,
+                                int png_min_quality, int max_dimension);
 
 void squint_result_free(SquintResult result);
 

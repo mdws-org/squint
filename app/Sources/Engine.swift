@@ -21,6 +21,25 @@ enum Engine {
         case dropped = 2
     }
 
+    /// What the engine is asked to write.
+    ///
+    /// `jpeg` is the plain case: a JPEG or PNG is re-encoded as itself, a PDF
+    /// is rewritten as a PDF, and anything else becomes a JPEG. Naming `avif`
+    /// is a conversion of whatever arrived, and the result is a different kind
+    /// of file that goes beside the original.
+    enum Format: Int32 {
+        case jpeg = 0
+        case avif = 1
+
+        /// How the format is named to a person.
+        var name: String {
+            switch self {
+            case .jpeg: return "JPEG"
+            case .avif: return "AVIF"
+            }
+        }
+    }
+
     struct Result {
         let data: Data
         /// Absent in fast mode, and for images too small to judge.
@@ -29,15 +48,21 @@ enum Engine {
         /// True when the colour count was reduced, which PNG does by default.
         let quantized: Bool
         let originalBytes: Int
-        /// True when the output is a JPEG made from a source of another format.
+        /// True when the output is a different kind of file from the input: a
+        /// JPEG made from a HEIC, or an AVIF made from anything. Such a result
+        /// must never land on the source.
         let converted: Bool
 
         var ratio: Double { Double(data.count) / Double(originalBytes) }
 
-        /// The extension the bytes actually are, read from their magic. The
-        /// engine writes JPEG or PNG and nothing else.
+        /// The extension the bytes actually are, read from their magic rather
+        /// than from what was asked for. AVIF is the only ISOBMFF file the
+        /// engine writes, so a `ftyp` box at offset 4 is enough to name it.
         var outputExtension: String {
-            data.starts(with: [0x89, 0x50, 0x4E, 0x47]) ? "png" : "jpg"
+            if data.starts(with: [0x89, 0x50, 0x4E, 0x47]) { return "png" }
+            if data.starts(with: Array("%PDF".utf8)) { return "pdf" }
+            if data.count >= 12, data[4..<8].elementsEqual("ftyp".utf8) { return "avif" }
+            return "jpg"
         }
     }
 
@@ -54,6 +79,7 @@ enum Engine {
     static func optimize(
         _ input: Data,
         mode: Mode,
+        format: Format = .jpeg,
         target: Double = 80,
         fixedQuality: Float = 75,
         pngMinQuality: Int32 = 70,
@@ -61,9 +87,9 @@ enum Engine {
     ) throws -> Result {
         var result = input.withUnsafeBytes { raw -> SquintResult in
             let base = raw.bindMemory(to: UInt8.self).baseAddress
-            return squint_optimize(
-                base, input.count, mode.rawValue, target, fixedQuality, pngMinQuality,
-                maxDimension ?? 0
+            return squint_optimize_as(
+                base, input.count, format.rawValue, mode.rawValue, target, fixedQuality,
+                pngMinQuality, maxDimension ?? 0
             )
         }
         defer { squint_result_free(result) }

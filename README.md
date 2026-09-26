@@ -8,9 +8,9 @@ Most optimizers ask you to choose a quality setting once and then apply it to ev
 
 Working. JPEG and PNG are implemented. Builds on the releases page are signed with a Developer ID and notarized from 0.7.1, so they open like any other application. From 0.4.0 the application can update itself: Squint menu, Check for Updates. It asks once whether to check on a schedule, and every update it installs is verified against a key compiled into the build.
 
-What runs today: a drag and drop window, five Finder Services entries, in-place replacement that preserves Finder tags, and a command line harness for measurement.
+What runs today: a drag and drop window, six Finder Services entries, in-place replacement that preserves Finder tags, and a command line harness for measurement.
 
-What does not exist yet: a GIF and a TIFF can only have their metadata removed; a HEIC, an AVIF, a WebP or an SVG can be shrunk only through the two entries that write beside the original, which write a JPEG; AVIF and WebP are written from the command line only, never from a Finder entry, and AVIF is written only on macOS; lossy WebP, which would mean a C dependency; Balanced mode; further recipes beyond the email and social presets; a PDF is compressed from the command line only and never from a Finder entry, and inside one a fax-coded page, a JPEG 2000 image or a CMYK image is left exactly as it was; HDR gain maps through a re-encode, which Strip keeps but Fast and Quality report as removed.
+What does not exist yet: a GIF and a TIFF can only have their metadata removed; a HEIC, an AVIF, a WebP or an SVG can be shrunk only through the entries that write beside the original, as a JPEG or an AVIF; WebP is written from the command line only, and only losslessly, since lossy WebP would mean a C dependency; AVIF is written only on macOS; Balanced mode; further recipes beyond the email and social presets; inside a PDF, a fax-coded page, a JPEG 2000 image or a CMYK image is left exactly as it was; HDR gain maps through a re-encode, which Strip keeps but Fast and Quality report as removed.
 
 ## Why this exists
 
@@ -36,7 +36,7 @@ One hundred files through fast mode, eight at a time, took 9 seconds on an 8 cor
 
 ## Install
 
-Download the `.dmg` from [Releases](https://github.com/mdws-org/squint/releases), or build it from source below. Either way it needs macOS 14 or later.
+Download the `.dmg` from [Releases](https://github.com/mdws-org/squint/releases), or build it from source below. Either way it needs an Apple silicon Mac running macOS 14 or later; there is no Intel build.
 
 From 0.7.1 the build is signed with a Developer ID and notarized, so it opens on first launch like any other application. Builds before that were not, and macOS refused them until allowed through System Settings, Privacy and Security, **Open Anyway**; an installed earlier build updates itself to a signed one through Check for Updates.
 
@@ -63,13 +63,14 @@ The application is unsandboxed by design. Replacing arbitrary files in place is 
 
 Drop images on the window, or right-click them in Finder and choose **Services**, then one of:
 
-- **Squint: Shrink** does the everyday job. It encodes once at a fixed quality and measures nothing.
+- **Squint: Shrink** does the everyday job. It encodes once at a fixed quality and measures nothing. It also takes a PDF, and rewrites it in place with the pictures inside it re-encoded and any downscaled to 150 dpi.
 - **Squint: Shrink for Email** accepts HEIC and writes `name-email.jpg`, resizing to 2048 pixels on the long edge. The original is not touched: the cap throws resolution away, and a photograph kept as documentation should not lose it because a copy was being made for an email. Measured on a 4032x3024 photograph, the copy is 129 KB, so about thirty fit under any provider's attachment limit.
 - **Squint: Shrink for Social** does the same at 1440 pixels and writes `name-social.jpg`. Smaller because the destinations are different: Instagram shows a feed picture 1080 pixels wide, X recompresses whatever it is given, and a Nostr client recompresses nothing at all, so what is posted is what everyone downloads. Measured on a 5712x4284 photograph, the copy is 331 KB.
-- **Squint: Shrink to a Quality Target** searches for the smallest file that still meets a perceptual score.
-- **Squint: Remove Location Data** takes out where and when a photograph was taken, and what took it, without touching the pixels.
+- **Squint: Shrink to a Quality Target** searches for the smallest file that still meets a perceptual score. It takes a PDF as Shrink does, searching each picture inside it to the target.
+- **Squint: Convert to AVIF** writes `name.avif` beside the original, at the picture's own size, searched to the quality target. It accepts JPEG, PNG, HEIC and WebP; the original is not touched. An AVIF that would be larger than the original is not written, and the entry says so.
+- **Squint: Remove Location Data** takes out where and when a photograph was taken, and what took it, without touching the pixels. On a PDF it drops the document's own record of who wrote it, with what, and when.
 
-**Squint: Remove Location Data** also accepts HEIC, which is what an iPhone camera writes by default, TIFF, and GIF. The two in-place shrinking entries do not accept HEIC because squint writes JPEG, and a JPEG must not overwrite a `.heic`; Shrink for Email and Shrink for Social do accept it.
+**Squint: Remove Location Data** also accepts HEIC, which is what an iPhone camera writes by default, TIFF, GIF, and PDF. The two in-place shrinking entries do not accept HEIC because squint writes JPEG, and a JPEG must not overwrite a `.heic`; Shrink for Email, Shrink for Social and Convert to AVIF do accept it, since each writes a new file beside it.
 
 The entries show only when everything selected is a type that entry accepts. Select a folder, or mix a HEIC into a batch for the in-place entries, and Squint is absent from the Services menu with nothing to say why. That is Finder filtering on declared types, not a broken install.
 

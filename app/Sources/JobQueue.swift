@@ -136,22 +136,35 @@ final class JobQueue: ObservableObject {
                 // only place such a picture may go is beside itself.
                 let besideOnly = "this picture is re-encoded as a JPEG, so it can only be written beside the original; use Squint: Shrink for Email"
                 let isIsobmff = input.count >= 12 && input[4..<8].elementsEqual("ftyp".utf8)
-                if isIsobmff && preset.suffix == nil && preset.mode != .strip {
+                if isIsobmff && preset.writesInPlace && preset.mode != .strip {
                     return .failed(besideOnly)
                 }
                 let result = try Engine.optimize(
                     input,
                     mode: preset.mode,
+                    format: preset.format,
                     target: target,
                     maxDimension: preset.maxDimension
                 )
                 let destination = preset.destination(for: url, outputExtension: result.outputExtension)
+                // Compared without regard to case, because the volume very
+                // likely does not regard it either: `Photo.AVIF` converted to
+                // AVIF would be written to `Photo.avif`, which on a
+                // case-insensitive disk is the original.
+                let landsOnSource = destination.path.lowercased() == url.path.lowercased()
                 // The check that actually guards the write: whatever the name
                 // said, a result of another format never lands on the source.
-                if result.converted && destination == url {
-                    return .failed(besideOnly)
+                if result.converted && landsOnSource {
+                    // The guard fires on where the result would land, not on
+                    // what the source is, so the message says that and no
+                    // more: a PNG named `.avif` arrives here too.
+                    return .failed(
+                        preset.format == .avif
+                            ? "the AVIF would be written over the original, so nothing was written"
+                            : besideOnly
+                    )
                 }
-                if destination == url {
+                if landsOnSource {
                     try Writer.replaceInPlace(url, with: result.data)
                 } else {
                     // A derived copy: the original is not touched, and a copy
@@ -167,6 +180,16 @@ final class JobQueue: ObservableObject {
                     outputExtension: result.outputExtension
                 )
             } catch let failure as Engine.Failure {
+                // "Already optimal" answers a question about the original.
+                // A conversion asked a different one, whether a smaller file
+                // of another kind exists, and when the engine refuses the
+                // larger result the honest outcome is that nothing was
+                // written, said in those words.
+                if failure.isAlreadyOptimal && preset.format != .jpeg {
+                    return .failed(
+                        "an \(preset.format.name) of this picture would be larger than the original, so none was written"
+                    )
+                }
                 return failure.isAlreadyOptimal ? .alreadyOptimal : .failed(failure.message)
             } catch {
                 return .failed(error.localizedDescription)
