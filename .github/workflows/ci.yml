@@ -41,7 +41,7 @@ jobs:
         run: python3 tools/corpus-gen.py seeds/seed.png seeds/seed.jpg seeds/seed.heic -o corpus
       - name: run corpus
         run: python3 tools/corpus-run.py core/target/release/squint corpus -o corpus-report.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: corpus-report
