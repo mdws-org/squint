@@ -57,7 +57,7 @@ struct ContentView: View {
         VStack(spacing: 6) {
             Text("Drop images here")
                 .font(.title3)
-            Text(queue.mode == .strip ? "Removes metadata. Pixels are untouched." : "JPEG and PNG. Files are replaced in place.")
+            Text(queue.mode == .strip ? "Removes metadata. Pixels are untouched." : "JPEG, PNG and PDF. Files are replaced in place.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
@@ -66,19 +66,7 @@ struct ContentView: View {
 
     private var list: some View {
         List(queue.jobs) { job in
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(job.name)
-                    Text(job.detail)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                if job.state == .working {
-                    ProgressView().controlSize(.small)
-                }
-            }
-            .padding(.vertical, 2)
+            JobRow(job: job)
         }
         .listStyle(.inset)
     }
@@ -90,5 +78,33 @@ struct ContentView: View {
                 Task { @MainActor in queue.add([url], mode: queue.mode) }
             }
         }
+    }
+}
+
+/// One row, observing its own job.
+///
+/// The queue publishes its array of jobs, so the list redraws when a job is
+/// added or cleared. A job's state is published by the job itself, and a row
+/// that reads it through a plain reference is not told when it changes: the
+/// row would show "working" until something else made the list redraw, such
+/// as the next file being added. Observing the job here is what makes a row
+/// move to its result the moment the work finishes.
+private struct JobRow: View {
+    @ObservedObject var job: Job
+
+    var body: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(job.name)
+                Text(job.detail)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            if job.state == .working {
+                ProgressView().controlSize(.small)
+            }
+        }
+        .padding(.vertical, 2)
     }
 }
