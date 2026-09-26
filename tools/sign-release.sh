@@ -1,7 +1,7 @@
 #!/bin/sh
 # Sign a built Squint.app with a Developer ID, notarize it, and staple the ticket.
 #
-#   tools/sign-release.sh <Squint.app> <identity> <notary-profile> [keychain]
+#   sh tools/sign-release.sh <Squint.app> <identity> <notary-profile> [keychain]
 #
 #   identity        the Developer ID Application certificate, by name or SHA-1
 #   notary-profile  a profile stored with `xcrun notarytool store-credentials`

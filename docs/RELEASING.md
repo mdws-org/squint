@@ -19,7 +19,7 @@ git clone https://github.com/mdws-org/squint.git && cd squint && git checkout <t
 cd app
 xcodegen
 xcodebuild -project Squint.xcodeproj -scheme Squint -configuration Release -derivedDataPath build
-../tools/sign-release.sh build/Build/Products/Release/Squint.app \
+sh ../tools/sign-release.sh build/Build/Products/Release/Squint.app \
     "Developer ID Application: Benjamin Meadows" squint-notary \
     ~/Library/Keychains/mdws-signing.keychain-db
 ```
