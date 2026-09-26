@@ -64,6 +64,14 @@ codesign --verify --deep --strict --verbose=2 "$APP"
 # Developer ID root, and the team identifier must be set.
 codesign -dvv "$APP" 2>&1 | grep -E "^Authority=|^TeamIdentifier=|flags=|^Signature=" || true
 
+# Signing can be proven without spending a notarization: a new certificate, a
+# new build machine, or a keychain that may prompt are all checked here, and
+# `spctl` on an unnotarized bundle answers `rejected` by design.
+if [ "${SIGN_ONLY:-}" = "1" ]; then
+    echo "SIGN_ONLY=1: signed and verified; not submitted, not stapled"
+    exit 0
+fi
+
 # Apple's notary service takes an archive, not a bundle.
 SUBMIT="$(mktemp -d)/Squint-notarize.zip"
 ditto -c -k --keepParent "$APP" "$SUBMIT"
