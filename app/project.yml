@@ -41,7 +41,10 @@ targets:
         # the whole point of the app, is not possible under the App Sandbox.
         ENABLE_APP_SANDBOX: NO
         # Hardened runtime is a property of a signature, so this does nothing
-        # while signing is off. It is left here, and named as inert, so that
+        # while signing is off, and signing is off in the build on purpose: the
+        # release is signed afterwards by tools/sign-release.sh, which applies
+        # the runtime itself with `--options runtime`. It is left here, and
+        # named as inert, so that
         # setting up notarization does not mistake it for work already done.
         ENABLE_HARDENED_RUNTIME: YES  # inert until CODE_SIGNING_ALLOWED is YES
         CODE_SIGN_IDENTITY: "-"

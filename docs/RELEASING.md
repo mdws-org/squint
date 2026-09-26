@@ -19,13 +19,19 @@ git clone https://github.com/mdws-org/squint.git && cd squint && git checkout <t
 cd app
 xcodegen
 xcodebuild -project Squint.xcodeproj -scheme Squint -configuration Release -derivedDataPath build
-codesign -f -s - --deep build/Build/Products/Release/Squint.app
+../tools/sign-release.sh build/Build/Products/Release/Squint.app \
+    "Developer ID Application: Benjamin Meadows" squint-notary \
+    ~/Library/Keychains/mdws-signing.keychain-db
 ```
 
 Do not send `xcodegen`'s output to `/dev/null`. It has failed on invalid YAML
 while `xcodebuild` went on to succeed against the previous `Info.plist`, so the
 build reported success and shipped the old menu titles. Any string containing a
 colon must be quoted.
+
+`sign-release.sh` signs Sparkle's five nested pieces inside out and the application last, each with the hardened runtime and a timestamp, verifies every seal, submits the bundle to Apple's notary service and waits, staples the ticket, and finishes with `spctl`, which must answer `accepted` with `source=Notarized Developer ID`. Nothing after this step may modify the bundle: the archives are built from the stapled bundle, and a zip made before stapling ships without the ticket.
+
+Do not sign with `--deep`. It is discouraged by Apple and refused by notarization for an application that embeds a framework, which is why the script names each piece.
 
 Then the two archives, from the same signed bundle:
 
@@ -93,6 +99,46 @@ gh release create v<version> --prerelease --target <full 40-character SHA> \
 A short SHA is rejected as an invalid target. Releases stay pre-releases while
 the application is unsigned by a paid developer account: macOS blocks the first
 launch and the notes carry the walkthrough.
+
+## One-time signing setup on the build machine
+
+The Developer ID Application certificate and its private key live in `~/Library/Keychains/mdws-signing.keychain-db` on svk, not in the login keychain. The private key was generated there and is escrowed in 1Password as `squint Developer ID private key` in the Fleet vault; the certificate is issued by Apple against the CSR from that key and can be reissued from the portal if lost, but the key cannot.
+
+Installing the pair, once:
+
+```
+KC=~/Library/Keychains/mdws-signing.keychain-db
+security import ~/squint-signing/developerid.key -k "$KC" -T /usr/bin/codesign -T /usr/bin/security
+security import ~/squint-signing/developerID_application.cer -k "$KC" -T /usr/bin/codesign
+security find-identity -v -p codesigning "$KC"
+```
+
+The identity must appear as valid. If it shows as untrusted, the intermediate `Developer ID Certification Authority` is missing from the System keychain; Xcode installs it, and Apple publishes it at https://www.apple.com/certificateauthority/ otherwise.
+
+`codesign` in a session with no window server cannot answer a keychain prompt, and fails as `errSecInternalComponent`. The keychain is unlocked and its key's partition list is set once so that no prompt is raised. The password is read from 1Password into the environment and never appears on a command line:
+
+```
+# The item is 'MDWS Dev Signing — self-signed code-sign cert (svk+btm)'; it is
+# addressed by ID so a renamed title cannot break a release, and the password is
+# its attached file, not a field.
+KEYCHAIN_PW="$(op read 'op://Fleet/rimse6i35takecjdcilqb6j7xa/keychain-pass')"
+security unlock-keychain -p "$KEYCHAIN_PW" "$KC"
+security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PW" "$KC"
+```
+
+Unlocking is needed again in each new session; the partition list persists.
+
+## Notary credentials
+
+Notarization authenticates with an App Store Connect API key: an Issuer ID, a Key ID, and a `.p8` file that App Store Connect lets you download exactly once. All three live in the Fleet vault as `squint App Store Connect API key`. They are stored into the signing keychain under the profile name the script expects:
+
+```
+xcrun notarytool store-credentials squint-notary \
+    --key ~/squint-signing/AuthKey_<KEYID>.p8 --key-id <KEYID> --issuer <ISSUER> \
+    --keychain ~/Library/Keychains/mdws-signing.keychain-db
+```
+
+`xcrun notarytool history --keychain-profile squint-notary --keychain "$KC"` confirms the profile works before a release depends on it.
 
 ## Keys
 
