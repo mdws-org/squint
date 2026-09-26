@@ -35,6 +35,7 @@ pub const SQUINT_ERR_PANIC: c_int = 9;
 pub const SQUINT_ERR_COLOURS: c_int = 10;
 pub const SQUINT_ERR_READ_ONLY: c_int = 11;
 pub const SQUINT_ERR_UNKNOWN_FORMAT: c_int = 12;
+pub const SQUINT_ERR_UNKNOWN_MODE: c_int = 13;
 
 /// The result of one optimization.
 ///
@@ -159,13 +160,15 @@ pub unsafe extern "C" fn squint_optimize_as(
         _ => return SquintResult::failure(SQUINT_ERR_UNKNOWN_FORMAT, input_len, None),
     };
     let bytes = std::slice::from_raw_parts(input, input_len);
-    // Every mode is named here. Collapsing the unrecognised case into fast is
-    // what silently turned strip into a re-encode: the caller asked for the
-    // pixels to be left alone and got them rewritten.
+    // Every mode is named here and any other value is refused. Collapsing the
+    // unrecognised case into fast is what once silently turned strip into a
+    // re-encode: the caller asked for the pixels to be left alone and got
+    // them rewritten.
     let mode = match mode {
+        SQUINT_MODE_FAST => Mode::Fast,
         SQUINT_MODE_QUALITY => Mode::Quality,
         SQUINT_MODE_STRIP => Mode::Strip,
-        _ => Mode::Fast,
+        _ => return SquintResult::failure(SQUINT_ERR_UNKNOWN_MODE, input_len, None),
     };
     let png_min = if png_min_quality < 0 { None } else { Some(png_min_quality.min(100) as u8) };
     // Zero or below means no cap, matching how the header describes it.
@@ -257,6 +260,17 @@ mod tests {
     }
 
     #[test]
+    fn a_mode_code_the_engine_does_not_know_is_refused() {
+        let png = noisy_png(16);
+        // Read as fast, this would re-encode a file whose caller may have
+        // asked for its pixels to be left alone.
+        let r = unsafe { call(&png, SQUINT_FORMAT_JPEG, 7) };
+        assert_eq!(r.error, SQUINT_ERR_UNKNOWN_MODE);
+        assert!(r.data.is_null());
+        unsafe { squint_result_free(r) };
+    }
+
+    #[test]
     fn the_plain_entry_point_still_means_the_input_format() {
         let png = noisy_png(64);
         let r = unsafe {
@@ -320,6 +334,7 @@ pub extern "C" fn squint_error_message(code: c_int) -> *const c_char {
         SQUINT_ERR_COLOURS => b"this image's colours cannot be reduced that far; the file was not changed\0",
         SQUINT_ERR_READ_ONLY => b"this format can have its location data removed but cannot be shrunk yet; the file was not changed\0",
         SQUINT_ERR_UNKNOWN_FORMAT => b"the output format asked for is not one squint writes; the file was not changed\0",
+        SQUINT_ERR_UNKNOWN_MODE => b"the mode asked for is not one squint has; the file was not changed\0",
         _ => b"unknown error\0",
     };
     s.as_ptr() as *const c_char

@@ -22,6 +22,7 @@
 #define SQUINT_ERR_COLOURS    10
 #define SQUINT_ERR_READ_ONLY  11
 #define SQUINT_ERR_UNKNOWN_FORMAT 12
+#define SQUINT_ERR_UNKNOWN_MODE   13
 
 #define SQUINT_MODE_FAST    0
 #define SQUINT_MODE_QUALITY 1
@@ -59,9 +60,10 @@ typedef struct {
 } SquintResult;
 
 // The input format is detected from the bytes. HEIC is decoded for fast and
-// quality modes and comes back as JPEG. png_min_quality below 0 disables
-// quantization. max_dimension caps the long edge in pixels; 0 leaves the
-// picture its own size. The cap never enlarges.
+// quality modes and comes back as JPEG. mode is one of the SQUINT_MODE_ values
+// and any other is refused with SQUINT_ERR_UNKNOWN_MODE. png_min_quality below
+// 0 disables quantization. max_dimension caps the long edge in pixels; 0
+// leaves the picture its own size. The cap never enlarges.
 SquintResult squint_optimize(const uint8_t *input, size_t input_len, int mode,
                              double target, float fixed_quality, int png_min_quality,
                              int max_dimension);
