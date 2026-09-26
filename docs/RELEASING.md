@@ -101,17 +101,18 @@ cat app/Squint.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolv
 ## Publish
 
 ```
-gh release create v<version> --prerelease --target <full 40-character SHA> \
+gh release create v<version> --target <full 40-character SHA> \
     --title "Squint <version>" --notes-file notes.md \
     Squint-<version>.dmg Squint-<version>.zip
 ```
 
-A short SHA is rejected as an invalid target. Releases before 0.7.1 stayed
-pre-releases because they were unsigned: macOS blocked the first launch and the
-notes carried the walkthrough. 0.7.1 is the first update to cross from an ad-hoc
-signature to a Developer ID one, which Sparkle permits when the EdDSA key is
-unchanged; it stays a pre-release until an installed 0.7.0 has taken it through
-Check for Updates and come up running.
+A short SHA is rejected as an invalid target. Releases before 0.7.1 were
+pre-releases because they were unsigned and macOS blocked the first launch.
+0.7.1, the first signed build, was held as a pre-release until an installed
+earlier build had taken it through Check for Updates, because it was the first
+update to cross from an ad-hoc signature to a Developer ID one; Sparkle allows
+that when the EdDSA key is unchanged, and it did. `--prerelease` is now for a
+release that has a specific reason to be held, not the default.
 
 ## One-time signing setup on the build machine
 
