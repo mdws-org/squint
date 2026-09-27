@@ -241,6 +241,11 @@ fn item_extents(bytes: &[u8], iloc: &Box) -> Option<Vec<(u32, Vec<(usize, usize)
         return None;
     }
     let version = body[0];
+    // Four bytes of version and flags, two of field widths, then the item
+    // count: two bytes wide before version 2 and four from version 2 on.
+    if version >= 2 && body.len() < 10 {
+        return None;
+    }
     let mut at = 4;
 
     let offset_size = (body[at] >> 4) as usize;
@@ -670,6 +675,24 @@ mod tests {
         assert!(wiped > 0, "the EXIF item should have been destroyed");
         assert!(!contains(&out[exif], b"GPS"));
         assert!(is_complete(&bytes), "and the index still describes the file");
+    }
+
+    /// Found by the fuzzer: an `iloc` box of exactly eight bytes that declares
+    /// version 2, whose item count is four bytes wide. The walk read those four
+    /// bytes past the end of the box and panicked. It now refuses the box.
+    #[test]
+    fn an_iloc_too_short_for_its_version_is_refused() {
+        let hostile: [u8; 62] = [
+            0x00, 0x00, 0x00, 0x2e, 0x66, 0x74, 0x79, 0x70, 0x6d, 0x73, 0x66, 0x31, 0x68, 0x65,
+            0x76, 0x63, 0x6d, 0xff, 0xff, 0xff, 0xff, 0x73, 0x00, 0x2d, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x70, 0x68, 0x65, 0x0c, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x69, 0x6c, 0x6f, 0x63, 0xa3, 0x00,
+            0x00, 0x00, 0x2e, 0x66, 0x74, 0x79,
+        ];
+        assert!(!is_complete(&hostile));
+        if let Some((out, _)) = strip_heif(&hostile) {
+            assert_eq!(out.len(), hostile.len());
+        }
     }
 
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {

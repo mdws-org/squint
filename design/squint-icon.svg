@@ -13,9 +13,8 @@
       <rect x="100" y="100" width="824" height="824" rx="185.4"/>
     </clipPath>
   </defs>
-  <rect x="100" y="100" width="824" height="824" rx="185.4" fill="#16233a"/>
   <g clip-path="url(#clip-b)">
-    <rect x="120" y="120" width="784" height="784" rx="165.4" fill="url(#tile-b)"/>
+    <rect x="100" y="100" width="824" height="824" rx="185.4" fill="url(#tile-b)"/>
     <path d="M 258,512 C 362,412 662,412 766,512 C 662,612 362,612 258,512 Z" fill="#f6faff"/>
     <path d="M 236,502 C 350,300 674,300 788,502 C 690,420 334,420 236,502 Z" fill="url(#lids-b)"/>
     <path d="M 788,522 C 674,716 350,716 236,522 C 334,606 690,606 788,522 Z" fill="url(#lids-b)"/>
