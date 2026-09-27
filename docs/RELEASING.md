@@ -5,10 +5,11 @@ update archives all come from one clean checkout of the tag being released.
 
 ## Before the build
 
-A version bump touches four places, and CI fails if they disagree:
+A version bump touches five places, and CI fails if they disagree:
 
 - `core/Cargo.toml`, the `version` field
 - `core/Cargo.lock`, the `squint-core` entry (the `--locked` gate reads it)
+- `core/fuzz/Cargo.lock`, the same entry, since the fuzz crate depends on the engine by path
 - `app/project.yml`, `MARKETING_VERSION`
 - `app/project.yml`, `CURRENT_PROJECT_VERSION` (an integer, one higher each time)
 
