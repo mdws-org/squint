@@ -1,0 +1,48 @@
+name: fuzz
+
+# The parsers are the attack surface: every walker in the engine is reached
+# from a right-click on an arbitrary file. Each target runs for a minute on
+# every change to the engine and for longer on a schedule. A crash is a
+# failure of this job, with the reproducing input attached.
+
+on:
+  pull_request:
+    paths: ["core/**", ".github/workflows/fuzz.yml"]
+  push:
+    branches: [main]
+    paths: ["core/**", ".github/workflows/fuzz.yml"]
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: cargo fuzz (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [strip, heif, webp, tiff, gif, pdf, png, open]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: seconds for this run
+        id: budget
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then echo "seconds=900" >> "$GITHUB_OUTPUT"; else echo "seconds=60" >> "$GITHUB_OUTPUT"; fi
+      - name: fuzz ${{ matrix.target }}
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=${{ steps.budget.outputs.seconds }} -max_len=262144 -timeout=20
+        working-directory: core
+      - name: keep the crashing input
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: core/fuzz/artifacts/
+          if-no-files-found: ignore

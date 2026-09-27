@@ -119,16 +119,23 @@ impl<'a> Reader<'a> {
     }
 
     /// The numbers an entry holds, whether inline or elsewhere.
+    ///
+    /// The count is the file's own claim and is bounded here by what the file
+    /// can actually hold: an inline value has four bytes, and data elsewhere
+    /// has whatever lies between its offset and the end of the file. A count
+    /// of four billion on a forty-byte file otherwise turns into four billion
+    /// failed reads, which is a hang from a hostile file rather than a refusal.
     fn numbers(&self, entry: usize, kind: u16, count: u32) -> Vec<u64> {
         let width = type_size(kind);
         if width == 0 || count == 0 {
             return Vec::new();
         }
-        let at = match self.data_at(entry, kind, count) {
-            Some((at, _)) => at,
-            None => entry + 8,
+        let (at, room) = match self.data_at(entry, kind, count) {
+            Some((at, size)) => (at, size),
+            None => (entry + 8, 4),
         };
-        (0..count as usize)
+        let readable = self.bytes.len().saturating_sub(at).min(room) / width;
+        (0..(count as usize).min(readable))
             .filter_map(|i| match width {
                 2 => self.u16(at + i * 2).map(u64::from),
                 4 => self.u32(at + i * 4).map(u64::from),
@@ -205,12 +212,12 @@ pub fn strip_tiff(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
     };
 
     let mut out = bytes.to_vec();
-    let mut wiped = 0usize;
+    let mut destroyed = Destroyed::default();
     let mut directory = first;
-    let mut visited = 0;
+    let mut visited: Vec<usize> = Vec::new();
 
-    while directory != 0 && visited < 8 {
-        visited += 1;
+    while directory != 0 && visited.len() < 8 && !visited.contains(&directory) {
+        visited.push(directory);
         let entries = reader.entries(directory);
         if entries.is_empty() {
             break;
@@ -232,21 +239,18 @@ pub fn strip_tiff(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
                     for (sub_entry, _, sub_kind, sub_count) in reader.entries(sub) {
                         if let Some((at, size)) = reader.data_at(sub_entry, sub_kind, sub_count) {
                             if safe(at, at + size) {
-                                out[at..at + size].fill(0);
-                                wiped += size;
+                                destroyed.wipe(&mut out, at, at + size);
                             }
                         }
                     }
                     let end = sub + 2 + reader.entries(sub).len() * 12 + 4;
                     if end <= out.len() && safe(sub, end) {
-                        out[sub..end].fill(0);
-                        wiped += end - sub;
+                        destroyed.wipe(&mut out, sub, end);
                     }
                 }
             } else if let Some((at, size)) = reader.data_at(*entry, *kind, *count) {
                 if safe(at, at + size) {
-                    out[at..at + size].fill(0);
-                    wiped += size;
+                    destroyed.wipe(&mut out, at, at + size);
                 }
             }
         }
@@ -265,7 +269,41 @@ pub fn strip_tiff(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
         directory = next as usize;
     }
 
-    Some((out, wiped))
+    Some((out, destroyed.bytes))
+}
+
+/// The regions zeroed so far, kept disjoint so that the byte count is the
+/// number of distinct bytes destroyed. Two entries can name the same bytes,
+/// and a sub-directory's own entries lie inside the region its parent entry
+/// points at, so summing declared sizes reports more bytes than the file has.
+#[derive(Default)]
+struct Destroyed {
+    ranges: Vec<(usize, usize)>,
+    bytes: usize,
+}
+
+impl Destroyed {
+    fn wipe(&mut self, out: &mut [u8], start: usize, end: usize) {
+        if start >= end || end > out.len() {
+            return;
+        }
+        out[start..end].fill(0);
+        let (mut s, mut e) = (start, end);
+        let mut already = 0;
+        let mut merged = Vec::with_capacity(self.ranges.len() + 1);
+        for &(rs, re) in &self.ranges {
+            if re <= start || end <= rs {
+                merged.push((rs, re));
+            } else {
+                already += re.min(end) - rs.max(start);
+                s = s.min(rs);
+                e = e.max(re);
+            }
+        }
+        merged.push((s, e));
+        self.ranges = merged;
+        self.bytes += (end - start) - already;
+    }
 }
 
 #[cfg(test)]
@@ -383,5 +421,61 @@ mod tests {
     #[test]
     fn refuses_something_that_is_not_a_tiff() {
         assert!(strip_tiff(b"not a tiff, not even a little").is_none());
+    }
+
+    /// Found by the fuzzer in its first thirty seconds: forty bytes whose one
+    /// entry declares a count in the billions. Every read past the end of the
+    /// file fails, but the loop still ran once per declared element, and the
+    /// walk took longer than the fuzzer's twenty-second timeout. The count is
+    /// now bounded by what the file holds, so this returns at once. The
+    /// deadline is generous so a slow machine cannot fail it by accident; the
+    /// unfixed code took tens of seconds.
+    #[test]
+    fn a_count_in_the_billions_does_not_hang_the_walk() {
+        let hostile: [u8; 40] = [
+            0x4d, 0x4d, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x06, 0x02, 0x02, 0x02, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x10, 0x02, 0x02, 0x01, 0x00, 0x08, 0x4d, 0x00, 0xc8, 0x00,
+            0x00, 0x00, 0x31, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x2a, 0x00, 0x0a,
+        ];
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(strip_tiff(&hostile).map(|(out, wiped)| (out.len(), wiped)));
+        });
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the walk must finish in seconds, not hang on a declared count");
+        // Whatever it decides about the file, it decided it quickly.
+        let _ = outcome;
+    }
+
+    /// Also from the fuzzer: 220 bytes whose directory chain points back at
+    /// itself and whose entries name the same bytes more than once. Each pass
+    /// zeroed the same region again and added its size again, so the count of
+    /// bytes destroyed came out larger than the file. The count is the number
+    /// of distinct bytes zeroed, and a directory is walked once.
+    #[test]
+    fn destroyed_bytes_never_exceed_the_file() {
+        let hostile: [u8; 220] = [
+            0x4d, 0x4d, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x16, 0x00, 0x00, 0x01, 0x2a, 0x00, 0x0f,
+            0x00, 0x10, 0x02, 0x00, 0x00, 0x00, 0x02, 0x01, 0x00, 0x52, 0x51, 0x51, 0x51, 0x02,
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x10, 0x02, 0x22, 0x01, 0x31, 0x00, 0x00, 0x4d, 0x4d,
+            0x00, 0x2a, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x02,
+            0x02, 0x01, 0x00, 0x00, 0x4d, 0x00, 0x2a, 0x40, 0x02, 0x00, 0x00, 0x00, 0x00, 0x10,
+            0x02, 0x22, 0x01, 0x31, 0x00, 0x02, 0x00, 0x00, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x06,
+            0x02, 0x02, 0xff, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x02, 0x00, 0x02, 0x01,
+            0x00, 0x00, 0x4d, 0x00, 0x00, 0x00, 0x02, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
+            0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x2f, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
+            0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x00, 0x00, 0x00, 0x00, 0x10, 0x02,
+            0x02, 0x01, 0x00, 0x52, 0x51, 0x51, 0x51, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x10,
+            0x02, 0x22, 0x01, 0x31, 0x00, 0x00, 0x00, 0x00, 0x32, 0x00, 0x00, 0x51, 0x02, 0x02,
+            0x00, 0x00, 0x00, 0x00, 0x10, 0x02, 0x22, 0x01, 0x32, 0x00, 0x00, 0x00, 0x00, 0x32,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02,
+            0x01, 0x00, 0x00, 0x4d, 0x00, 0x2a, 0x40, 0x02, 0x00, 0x00, 0x00, 0x00, 0x10, 0x02,
+            0x22, 0x01, 0x31, 0x0f, 0xf7, 0x00, 0x00, 0x00, 0x00, 0x0a,
+        ];
+        if let Some((out, wiped)) = strip_tiff(&hostile) {
+            assert_eq!(out.len(), hostile.len());
+            assert!(wiped <= hostile.len(), "{wiped} bytes destroyed in a {}-byte file", hostile.len());
+        }
     }
 }
