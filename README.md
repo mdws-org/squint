@@ -6,11 +6,13 @@ Most optimizers ask you to choose a quality setting once and then apply it to ev
 
 ## Status
 
-Working. JPEG and PNG are implemented. Builds on the releases page are signed with a Developer ID and notarized from 0.7.1, so they open like any other application. From 0.4.0 the application can update itself: Squint menu, Check for Updates. It asks once whether to check on a schedule, and every update it installs is verified against a key compiled into the build.
+Working. JPEG and PNG are read and written in place. HEIC, AVIF, WebP and SVG are read and re-encoded beside the original, as a JPEG or an AVIF; GIF and TIFF are read far enough to remove their metadata; a PDF has the pictures inside it re-encoded and its own record of who wrote it removed. Builds on the releases page are signed with a Developer ID and notarized from 0.7.1, so they open like any other application. From 0.4.0 the application can update itself: Squint menu, Check for Updates. It asks once whether to check on a schedule, and every update it installs is verified against a key compiled into the build.
 
 What runs today: a drag and drop window, six Finder Services entries, in-place replacement that preserves Finder tags, and a command line harness for measurement.
 
-What does not exist yet: a GIF and a TIFF can only have their metadata removed; a HEIC, an AVIF, a WebP or an SVG can be shrunk only through the entries that write beside the original, as a JPEG or an AVIF; WebP is written from the command line only, and only losslessly, since lossy WebP would mean a C dependency; AVIF is written only on macOS; Balanced mode; further recipes beyond the email and social presets; inside a PDF, a fax-coded page, a JPEG 2000 image or a CMYK image is left exactly as it was; HDR gain maps through a re-encode, which Strip keeps but Fast and Quality report as removed.
+What does not exist yet: a GIF and a TIFF can only have their metadata removed; an SVG is rasterized, never optimized as a drawing; WebP is written from the command line only, and only losslessly, since lossy WebP would mean a C dependency; AVIF is written only on macOS; further recipes beyond the email and social presets; inside a PDF, a fax-coded page, a JPEG 2000 image or a CMYK image is left exactly as it was; HDR gain maps through a re-encode, which Strip keeps but Fast and Quality report as removed. Balanced mode is built and parked, for the reason given under Modes.
+
+The claims on this page about what is removed and what is kept can be checked with ExifTool; [docs/VERIFY.md](docs/VERIFY.md) shows the commands and what they returned. [SECURITY.md](SECURITY.md) describes what the engine is exposed to, how it is fuzzed, and how to report a defect privately.
 
 ## Why this exists
 
@@ -36,7 +38,13 @@ One hundred files through fast mode, eight at a time, took 9 seconds on an 8 cor
 
 ## Install
 
-Download the `.dmg` from [Releases](https://github.com/mdws-org/squint/releases), or build it from source below. Either way it needs an Apple silicon Mac running macOS 14 or later; there is no Intel build.
+Download the `.dmg` from [Releases](https://github.com/mdws-org/squint/releases), or with Homebrew:
+
+```
+brew install mdws-org/tap/squint
+```
+
+Or build it from source below. Either way it needs an Apple silicon Mac running macOS 14 or later; there is no Intel build.
 
 From 0.7.1 the build is signed with a Developer ID and notarized, so it opens on first launch like any other application. Builds before that were not, and macOS refused them until allowed through System Settings, Privacy and Security, **Open Anyway**; an installed earlier build updates itself to a signed one through Check for Updates.
 
@@ -64,13 +72,13 @@ The application is unsandboxed by design. Replacing arbitrary files in place is 
 Drop images on the window, or right-click them in Finder and choose **Services**, then one of:
 
 - **Squint: Shrink** does the everyday job. It encodes once at a fixed quality and measures nothing. It also takes a PDF, and rewrites it in place with the pictures inside it re-encoded and any downscaled to 150 dpi.
-- **Squint: Shrink for Email** accepts HEIC and writes `name-email.jpg`, resizing to 2048 pixels on the long edge. The original is not touched: the cap throws resolution away, and a photograph kept as documentation should not lose it because a copy was being made for an email. Measured on a 4032x3024 photograph, the copy is 129 KB, so about thirty fit under any provider's attachment limit.
-- **Squint: Shrink for Social** does the same at 1440 pixels and writes `name-social.jpg`. Smaller because the destinations are different: Instagram shows a feed picture 1080 pixels wide, X recompresses whatever it is given, and a Nostr client recompresses nothing at all, so what is posted is what everyone downloads. Measured on a 5712x4284 photograph, the copy is 331 KB.
+- **Squint: Shrink for Email** writes `name-email.jpg`, resizing to 2048 pixels on the long edge. It accepts JPEG, PNG, HEIC, AVIF, WebP and SVG, since the copy is a new file and the original's format does not matter. The original is not touched: the cap throws resolution away, and a photograph kept as documentation should not lose it because a copy was being made for an email. Measured on a 4032x3024 photograph, the copy is 129 KB, so about thirty fit under any provider's attachment limit.
+- **Squint: Shrink for Social** does the same at 1440 pixels and writes `name-social.jpg`, from the same six formats. Smaller because the destinations are different: Instagram shows a feed picture 1080 pixels wide, X recompresses whatever it is given, and a Nostr client recompresses nothing at all, so what is posted is what everyone downloads. Measured on a 5712x4284 photograph, the copy is 331 KB.
 - **Squint: Shrink to a Quality Target** searches for the smallest file that still meets a perceptual score. It takes a PDF as Shrink does, searching each picture inside it to the target.
 - **Squint: Convert to AVIF** writes `name.avif` beside the original, at the picture's own size, searched to the quality target. It accepts JPEG, PNG, HEIC and WebP; the original is not touched. An AVIF that would be larger than the original is not written, and the entry says so.
 - **Squint: Remove Location Data** takes out where and when a photograph was taken, and what took it, without touching the pixels. On a PDF it drops the document's own record of who wrote it, with what, and when.
 
-**Squint: Remove Location Data** also accepts HEIC, which is what an iPhone camera writes by default, TIFF, GIF, and PDF. The two in-place shrinking entries do not accept HEIC because squint writes JPEG, and a JPEG must not overwrite a `.heic`; Shrink for Email, Shrink for Social and Convert to AVIF do accept it, since each writes a new file beside it.
+**Squint: Remove Location Data** also accepts HEIC, which is what an iPhone camera writes by default, AVIF and WebP, which are what a browser hands you, TIFF, GIF, and PDF. It does not accept SVG, because a drawing carries no metadata block this removes. The two in-place shrinking entries do not accept HEIC because squint writes JPEG, and a JPEG must not overwrite a `.heic`; Shrink for Email, Shrink for Social and Convert to AVIF do accept it, since each writes a new file beside it.
 
 The entries show only when everything selected is a type that entry accepts. Select a folder, or mix a HEIC into a batch for the in-place entries, and Squint is absent from the Services menu with nothing to say why. That is Finder filtering on declared types, not a broken install.
 
@@ -86,13 +94,13 @@ Note that an already-open Get Info window will keep showing camera and location 
 
 PNG has an option JPEG does not: leaving the pixels alone, which is identical to the source and so meets any target by construction. A perceptual target on a PNG is never unreachable, only expensive: where no reduction in colours will meet it, the result is the lossless one. Measured on a 400x300 Display P3 screenshot, a target of 80 returns 55 KB scoring 88.3, smaller than fast mode's 61 KB. A target of 90 finds no reduction that qualifies, and the answer is the 121 KB lossless file.
 
-**An SVG** is rasterized rather than optimized: it has no pixels of its own, so the engine draws it at whatever size was asked for and writes a JPEG. That is a conversion, not an optimization, so the result goes beside the original and never over it — a drawing and a picture of a drawing are not the same file, and the drawing is the one you can still edit. Two things worth knowing. The renderer is told to ignore any file a document names, so an `<image href="file:///...">` fetches nothing: a picture handed to this program must not be able to make it read the disk. And the drawing is composited onto white before the alpha is dropped, because JPEG has none and a transparent background over black looks like a mistake. There is no Finder entry for SVG; the command line reads one.
+**An SVG** is rasterized rather than optimized: it has no pixels of its own, so the engine draws it at whatever size was asked for and writes a JPEG. That is a conversion, not an optimization, so the result goes beside the original and never over it — a drawing and a picture of a drawing are not the same file, and the drawing is the one you can still edit. Two things worth knowing. The renderer is told to ignore any file a document names, so an `<image href="file:///...">` fetches nothing: a picture handed to this program must not be able to make it read the disk. And the drawing is composited onto white before the alpha is dropped, because JPEG has none and a transparent background over black looks like a mistake. In Finder, Shrink for Email and Shrink for Social accept an SVG, since both write beside the original; the in-place entries and Remove Location Data do not.
 
 **Strip** removes metadata and nothing else, and is the only mode that reads GIF or TIFF; HEIC is read by every mode. From a GIF it takes out comments and every application block it was not told to keep, which is how XMP and anything a future encoder invents leave without being named. It keeps the frame timing, the animation loop count, any text a viewer draws into the frame, and the colour profile. The pixels are copied unchanged, so the result is identical to the input image, and only the container shrinks. An HDR gain map is kept, because it is part of the picture rather than a record of where it was taken.
 
 What it takes out includes **the date the photograph was taken**. That is deliberate, since when a photograph was taken discloses about as much as where. But it is worth naming, because it is the one field a photograph kept as documentation cannot do without, and it is not recoverable once the file has been overwritten. Strip a copy, not the master.
 
-**Balanced** is designed but not implemented. It will search a downscaled proxy and then encode at full resolution.
+**Balanced** was built and is not shipped. The design searches a downscaled proxy for the quality setting and then encodes once at full resolution. Measured on 2026-09-13, the proxy's score did not predict the full-resolution score closely enough for the result to be trusted to meet the target, so the mode is parked rather than offered.
 
 ## Metadata
 
@@ -117,6 +125,12 @@ One trap is worth naming. A tag's declared size cannot be trusted to stay inside
 A HEIC is a tree of boxes rather than a stream of segments, and its EXIF and XMP sit in the same blob as the coded picture, addressed by absolute offsets. Cutting them out would move every byte after them and invalidate every one of those offsets, so their contents are overwritten where they lie instead. The file keeps a few kilobytes of dead space and loses what it was asked to lose. Measured on a 4032x3024 photograph: 3,417 bytes destroyed across two items, the colour profile and HDR headroom intact, and the picture byte-identical everywhere else.
 
 ImageIO looks like it should do this and does not. `CGImageDestinationCopyImageSource`, asked to exclude GPS and XMP, works on a JPEG and on a HEIC returns success having changed nothing — the GPS, EXIF and maker note all survive a copy that reports itself as having excluded them. That is why this is done by hand.
+
+An AVIF is the same tree of boxes with AV1 in the tiles instead of HEVC, so it is stripped the same way: the EXIF and XMP items are overwritten where they lie and nothing moves. A file whose brand names a sequence rather than a still is refused.
+
+A WebP is a RIFF file, a chain of chunks that nothing points into by offset, so a dropped chunk genuinely leaves and the file shrinks. The strip keeps the chunks that carry picture (`VP8 `, `VP8L`, `VP8X`, `ALPH`, `ANIM`, `ANMF`) and the colour profile (`ICCP`), and drops everything else, which is how `EXIF`, `XMP ` and anything a future encoder invents leave without being named. A chunk whose declared length runs past the end of the file is a refusal, not a best effort.
+
+A PDF says who wrote it, with what, and when, twice: in its `/Info` dictionary and again in an XMP packet that `/Metadata` points at. Both go, and the pages are untouched. The same strip runs after a compression pass, so a document that has been shrunk has also lost its author.
 
 Apple writes trailing data past the end-of-image marker, where the gain map and further XMP live. Stripping stops at that marker rather than copying to the end of the file. A first implementation did not, and XMP survived.
 
@@ -156,7 +170,10 @@ These hold across every release.
 | PNG quantization | [libimagequant](https://github.com/ImageOptim/libimagequant) | GPL-3.0-or-later |
 | PNG optimization | [oxipng](https://github.com/shssoichiro/oxipng) | MIT |
 | JPEG encoding | [mozjpeg](https://github.com/mozilla/mozjpeg) | BSD-3-Clause |
-| SVG rasterization (planned) | [resvg](https://github.com/linebender/resvg) | Apache-2.0 |
+| JPEG, PNG and WebP decoding; lossless WebP encoding | [image](https://github.com/image-rs/image) | MIT OR Apache-2.0 |
+| SVG rasterization | [resvg](https://github.com/linebender/resvg) | Apache-2.0 OR MIT |
+| PDF object model | [lopdf](https://github.com/J-F-Liu/lopdf) | MIT |
+| HEIC and AVIF decoding, AVIF encoding | Image I/O | Apple system framework, macOS only |
 
 Squint is GPL-3.0 because it links libimagequant, which is the only PNG quantizer implementing a quality floor. GPL-3 rather than GPL-2 is required, because resvg is Apache-2.0 and Apache-2.0 is incompatible with GPL-2.
 
@@ -190,14 +207,50 @@ Fast mode is bounded by core count. It peaks at 167 MB per file.
 
 Quality mode is bounded by memory, and exceeding that bound is not merely wasteful but harmful. A 12 megapixel comparison peaks at 2.84 GB. Sixteen files on an 8 core, 8 GB machine took 36 seconds at two concurrent, 60 at four, and 116 at eight, against about 63 seconds run one at a time.
 
-## Roadmap
+## Command line
 
-Formats are tracked separately for reading and writing. Squint should read anything a person is likely to have, because Strip mode is useful on a file it cannot re-encode, while writing a format is a larger commitment.
+The engine ships with a harness, built by `cargo build --release` in `core/` and left at `core/target/release/squint`. It exists for measurement: every number on this page came from it, and the Finder entries call the same functions.
 
-- **v1** — ImageOptim parity plus the perceptual engine, in place, colour profile preserved, location data dropped. JPEG and PNG read and written. HEIC, AVIF, WebP and SVG are read and re-encoded as JPEG beside the original; GIF and TIFF are read only far enough to strip them.
-- **v1.1** — recipes, the Email and Social presets, dimension caps, and a Finder Sync extension for the preset submenu
-- **v1.2** — WebP and AVIF written. `--format avif` and `--format webp` on the command line, as conversions written beside the original. AVIF goes through the system encoder because no pure-Rust one can embed a colour profile, so it is macOS only; WebP is lossless, because the pure-Rust encoder has no other kind, and suits what a PNG suits rather than photographs.
-- **v1.3** — PDF, both compression and metadata removal. The pictures inside a document are lifted out, re-encoded through the same perceptual search a standalone JPEG gets, and put back; the text, the vectors and the structure are untouched, so the document stays selectable and searchable. Resolution is capped at 150 dpi, which is where nearly all of the saving is: a 14 MB thirty-page scan comes out at 3.0 MB and an 11 MB sheet holding one uncompressed image at 183 KB. Command line only, and the cap is not a control.
+```
+squint <image> [--mode fast|quality|strip] [--target <score>] [--quality <n>] [--probes <n>]
+
+  fast     encode once at a fixed quality, measure nothing (the default)
+  quality  search for the smallest file scoring at or above the target
+  strip    remove metadata, leaving the pixels exactly as they were
+
+  --target         perceptual target, 70 general web, 80 high, 90 visually lossless (default 80)
+  --quality        fixed quality for fast mode (default 75)
+  --probes         maximum encodes during a search (default 6)
+  --png-quality    palette quality floor for PNG, negative for lossless (default 70)
+  --max-dimension  cap the long edge in pixels; never enlarges (default none)
+  --out            write the result to this path
+  --format         jpeg (default), avif, or webp; avif and webp are conversions, written beside the original
+  --against        score this image against another instead of encoding
+```
+
+It reads every format the application reads, including a PDF, and reports what it wrote, the score where one was measured, and whether the colour profile and the HDR gain map survived. Without `--out` it writes nothing and reports what it would have done, which is how a result is measured before a file is touched.
+
+## Shipped
+
+Formats are tracked separately for reading and writing. Squint reads anything a person is likely to have, because Strip is useful on a file it cannot re-encode, while writing a format is a larger commitment.
+
+- **0.1** — the perceptual engine, JPEG and PNG read and written in place, the colour profile kept, the Finder entries, and Strip.
+- **0.2** — Shrink for Email, the first preset written beside the original with a size cap. Remove Location Data reads HEIC and TIFF.
+- **0.4** — Shrink for Social. The application updates itself through Sparkle. GIF is read far enough to strip it; SVG is read and rasterized beside the original.
+- **0.5** — WebP and AVIF are read, for stripping and for re-encoding beside the original.
+- **0.6** — AVIF and lossless WebP are written, named on the command line with `--format`. AVIF goes through the system encoder because no pure-Rust one can embed a colour profile, so it is macOS only; WebP is lossless, because the pure-Rust encoder has no other kind, and suits what a PNG suits rather than photographs.
+- **0.7** — PDF, both compression and metadata removal. The pictures inside a document are lifted out, re-encoded through the same perceptual search a standalone JPEG gets, and put back; the text, the vectors and the structure are untouched, so the document stays selectable and searchable. Resolution is capped at 150 dpi, which is where nearly all of the saving is: a 14 MB thirty-page scan comes out at 3.0 MB and an 11 MB sheet holding one uncompressed image at 183 KB. From 0.7.1 the build is signed and notarized.
+- **0.8** — PDF and AVIF reach the Finder menu: Shrink and Shrink to a Quality Target take a PDF, Convert to AVIF is an entry, and Remove Location Data takes a PDF.
+
+## Open
+
+- Lossy WebP, which would mean a C dependency.
+- AVIF written anywhere but macOS, which would mean a pure-Rust encoder that can embed a colour profile.
+- The HDR gain map carried through a re-encode. The container is sound; a primary encoded by mozjpeg with the map attached will not open, so this needs a different encoder for the primary.
+- Inside a PDF, a fax-coded page, a JPEG 2000 image and a CMYK image are left as they were. The 150 dpi cap is not a control.
+- Balanced mode, parked for the reason under Modes.
+- A Finder Sync extension, so the presets are a submenu rather than six entries under Services.
+- Further recipes beyond the Email and Social presets.
 
 ## License
 
