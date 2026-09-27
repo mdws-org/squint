@@ -1,0 +1,71 @@
+[package]
+name = "squint-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.squint-core]
+path = ".."
+
+# The engine's own binary is not a fuzz target.
+[[bin]]
+name = "strip"
+path = "fuzz_targets/strip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "heif"
+path = "fuzz_targets/heif.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "webp"
+path = "fuzz_targets/webp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tiff"
+path = "fuzz_targets/tiff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gif"
+path = "fuzz_targets/gif.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pdf"
+path = "fuzz_targets/pdf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "png"
+path = "fuzz_targets/png.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "open"
+path = "fuzz_targets/open.rs"
+test = false
+doc = false
+bench = false
