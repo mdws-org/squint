@@ -5,6 +5,13 @@ options:
     macOS: "14.0"
   createIntermediateGroups: true
 
+# The version is set once for the whole project, so the application and the
+# Finder extension it embeds always report the same one.
+settings:
+  base:
+    MARKETING_VERSION: "0.8.3"
+    CURRENT_PROJECT_VERSION: "15"
+
 packages:
   # Pinned to one exact version, because the project file is generated and so
   # Package.resolved is not committed with it: this line is the only thing
@@ -22,16 +29,16 @@ targets:
     platform: macOS
     dependencies:
       - package: Sparkle
+      - target: SquintFinder
     sources:
       - path: Sources
+      - path: Shared
       - path: ../design/squint.icns
         buildPhase: resources
     settings:
       base:
         PRODUCT_NAME: Squint
         PRODUCT_BUNDLE_IDENTIFIER: net.mdws.squint
-        MARKETING_VERSION: "0.8.3"
-        CURRENT_PROJECT_VERSION: "15"
         SWIFT_VERSION: "5.0"
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Squint-Bridging-Header.h
         HEADER_SEARCH_PATHS: $(SRCROOT)/../core/include
@@ -76,136 +83,13 @@ targets:
         SUPublicEDKey: 6FzlDrtCklzeHwPAZ097Oxu3WKoRrHk0VO3glbJptU0=
         LSApplicationCategoryType: public.app-category.graphics-design
         NSHighResolutionCapable: true
-        # The Finder right-click entries, one per mode. Services are listed
-        # alphabetically by title; there is no ordering key, so placement in the
-        # menu cannot be controlled beyond the name itself.
-        #
-        # Each is named for what it does rather than for how hard it works.
-        # NSServiceDescription is written below but macOS never renders it, so
-        # the title is the only thing anyone reads, and "Fast" against "Quality"
-        # asks for a decision at the moment of use that the preset should be
-        # making instead.
-        #
-        # NSMessage must match the @objc method name on ServiceProvider. A
-        # mismatch fails silently: the item appears and does nothing.
-        NSServices:
-          - NSMenuItem:
-              default: "Squint: Shrink"
-            NSMessage: optimizeFast
-            NSPortName: Squint
-            # A PDF is offered to the two in-place entries and to nothing
-            # else: it is rewritten as a PDF with the pictures inside it
-            # re-encoded, which is in-place work, and it never becomes a
-            # picture, so the entries that write a JPEG or an AVIF beside
-            # the original have nothing to write.
-            NSSendFileTypes:
-              - public.jpeg
-              - public.png
-              - com.adobe.pdf
-            NSRequiredContext:
-              NSApplicationIdentifier: com.apple.finder
-              NSTextContent: FilePath
-            NSServiceDescription: Shrink images in place, keeping the colour profile; a PDF has its pictures re-encoded
-          - NSMenuItem:
-              default: "Squint: Shrink for Email"
-            NSMessage: shrinkForEmail
-            NSPortName: Squint
-            # AVIF needs naming in its own right: it does NOT conform to
-            # public.heif, and neither does public.heic — both conform to
-            # public.heif-standard instead, so the two entries above cover
-            # nothing else. Measured with UTTypeConformsTo, not assumed.
-            NSSendFileTypes:
-              - public.jpeg
-              - public.png
-              - public.heic
-              - public.heif
-              - public.avif
-              - org.webmproject.webp
-              - public.svg-image
-            NSRequiredContext:
-              NSApplicationIdentifier: com.apple.finder
-              NSTextContent: FilePath
-            NSServiceDescription: "Shrink to 2048 pixels beside the original, sized for sending; a HEIC becomes a JPEG"
-          - NSMenuItem:
-              default: "Squint: Shrink for Social"
-            NSMessage: shrinkForSocial
-            NSPortName: Squint
-            NSSendFileTypes:
-              - public.jpeg
-              - public.png
-              - public.heic
-              - public.heif
-              - public.avif
-              - org.webmproject.webp
-              - public.svg-image
-            NSRequiredContext:
-              NSApplicationIdentifier: com.apple.finder
-              NSTextContent: FilePath
-            NSServiceDescription: "Shrink to 1440 pixels beside the original, sized for posting; a HEIC becomes a JPEG"
-          - NSMenuItem:
-              default: "Squint: Shrink to a Quality Target"
-            NSMessage: optimizeQuality
-            NSPortName: Squint
-            NSSendFileTypes:
-              - public.jpeg
-              - public.png
-              - com.adobe.pdf
-            NSRequiredContext:
-              NSApplicationIdentifier: com.apple.finder
-              NSTextContent: FilePath
-            NSServiceDescription: Shrink images to a perceptual quality target; a PDF has its pictures re-encoded
-          - NSMenuItem:
-              default: "Squint: Convert to AVIF"
-            NSMessage: convertToAvif
-            NSPortName: Squint
-            # Every raster the engine can decode, and no AVIF: converting one
-            # to itself would only write over it. TIFF and GIF are absent
-            # because the engine cannot decode them for a re-encode, a PDF
-            # because it never becomes a picture, and SVG because a raster of
-            # a drawing is larger than the drawing and the engine refuses a
-            # conversion that grows the file, so the entry would always
-            # refuse.
-            NSSendFileTypes:
-              - public.jpeg
-              - public.png
-              - public.heic
-              - public.heif
-              - org.webmproject.webp
-            NSRequiredContext:
-              NSApplicationIdentifier: com.apple.finder
-              NSTextContent: FilePath
-            NSServiceDescription: "Write an AVIF beside the original at the picture's own size, searched to the quality target"
-          - NSMenuItem:
-              default: "Squint: Remove Location Data"
-            NSMessage: stripMetadata
-            NSPortName: Squint
-            NSSendFileTypes:
-              - public.jpeg
-              - public.png
-              # HEIC is what an iPhone camera writes, AVIF and WebP are what a
-              # browser hands you, TIFF is what a scanner does, and a GIF
-              # carries whatever comment or application block its encoder
-              # wrote. Removing what they disclose is the one thing squint can
-              # do to any of them, since it re-encodes none of them as itself.
-              #
-              # SVG is deliberately absent: a drawing has no metadata block
-              # this strips, and the engine has no strip path for one, so
-              # offering it would put an entry in the menu that always fails.
-              #
-              # A PDF says who wrote it, with what, and when, in its info
-              # dictionary and again in an XMP packet; both go and the pages
-              # are untouched.
-              - public.heic
-              - public.heif
-              - public.avif
-              - org.webmproject.webp
-              - public.tiff
-              - com.compuserve.gif
-              - com.adobe.pdf
-            NSRequiredContext:
-              NSApplicationIdentifier: com.apple.finder
-              NSTextContent: FilePath
-            NSServiceDescription: Remove location and camera data without re-encoding
+        # The Finder extension wakes the application with a squint:// link that
+        # names a request it left in the app group's folder. The link alone does
+        # nothing; see FinderRequests.swift.
+        CFBundleURLTypes:
+          - CFBundleURLName: net.mdws.squint
+            CFBundleURLSchemes:
+              - squint
     preBuildScripts:
       - name: Build the engine
         basedOnDependencyAnalysis: false
@@ -213,3 +97,32 @@ targets:
           export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
           cd "$SRCROOT/../core"
           cargo build --release --locked
+
+  # Squint's submenu in Finder's right-click menu. App extensions must be
+  # sandboxed, so this one only records what was chosen and wakes the
+  # application, which does the work. Signed with its entitlements by
+  # tools/sign-release.sh, like everything else in the bundle.
+  SquintFinder:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: FinderExtension
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_NAME: SquintFinder
+        PRODUCT_BUNDLE_IDENTIFIER: net.mdws.squint.finder
+        SWIFT_VERSION: "5.0"
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGNING_ALLOWED: NO
+    info:
+      path: FinderExtension/Info.plist
+      properties:
+        CFBundleDisplayName: Squint
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSMinimumSystemVersion: "14.0"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.FinderSync
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).FinderSync

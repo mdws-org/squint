@@ -3,16 +3,16 @@ import SwiftUI
 
 /// Brings the application's window back, from code that is not a view.
 ///
-/// The Finder services are the primary way this application is used, and they
-/// run whether or not a window is open. `NSApp.activate` raises an application;
+/// The Finder menu is the primary way this application is used, and it works
+/// whether or not a window is open. `NSApp.activate` raises an application;
 /// it does not reopen a `Window` scene that has been closed, and closing that
 /// scene destroys its `NSWindow`. So a right-click after the window was closed
 /// rewrote files with nothing on screen: no progress, no score, no error.
 ///
 /// SwiftUI will only reopen the scene through its own action, which exists in
 /// the environment of a view. The action is a value and outlives the view it
-/// came from, so the window captures it once and this holds it for the service
-/// to use later.
+/// came from, so the window captures it once and this holds it for the Finder
+/// menu to use later.
 @MainActor
 enum MainWindow {
     static let id = "main"

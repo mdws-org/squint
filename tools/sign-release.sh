@@ -12,7 +12,8 @@
 # and the application last; anything signed after its container invalidates the
 # container's seal. `codesign --deep` walks the same tree but has been
 # discouraged by Apple for years and is rejected by notarization for apps that
-# embed frameworks, which is why each of Sparkle's five pieces is named here.
+# embed frameworks, which is why each of Sparkle's five pieces, and the Finder
+# extension, is named here.
 #
 # Every signature carries `--options runtime`. Notarization requires the
 # hardened runtime, and Sparkle loads under it without any entitlement because
@@ -40,9 +41,13 @@ if [ -n "$KEYCHAIN" ]; then
     KC="--keychain $KEYCHAIN"
 fi
 
+# Entitlements live beside the sources they belong to, and are applied here
+# rather than by the build, which signs nothing.
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+
 sign() {
     # shellcheck disable=SC2086
-    codesign --force --options runtime --timestamp $KC --sign "$IDENTITY" "$1"
+    codesign --force --options runtime --timestamp $KC --sign "$IDENTITY" "$@"
 }
 
 SPARKLE="$APP/Contents/Frameworks/Sparkle.framework"
@@ -53,7 +58,11 @@ sign "$V/XPCServices/Installer.xpc"
 sign "$V/Autoupdate"
 sign "$V/Updater.app"
 sign "$SPARKLE"
-sign "$APP"
+# The Finder extension must be sandboxed or macOS will not load it, and it
+# shares an app group with the application so that a choice made in Finder can
+# be handed over. Signed before the application, whose seal covers it.
+sign --entitlements "$REPO/app/FinderExtension/SquintFinder.entitlements" "$APP/Contents/PlugIns/SquintFinder.appex"
+sign --entitlements "$REPO/app/Squint.entitlements" "$APP"
 
 # `--deep` is right for verification even though it is wrong for signing: here
 # it asks that every nested seal be intact, which is the whole question.

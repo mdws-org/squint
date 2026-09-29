@@ -8,7 +8,7 @@ struct SquintApp: App {
     /// Started with the application. Sparkle then checks on its own schedule
     /// and the menu item below asks for a check on demand. Held here because
     /// the updater must outlive any one window: this application spends most
-    /// of its life with no window open, answering the Finder services.
+    /// of its life with no window open, answering the Finder menu.
     private let updaterController = SPUStandardUpdaterController(
         startingUpdater: true,
         updaterDelegate: nil,
@@ -24,6 +24,7 @@ struct SquintApp: App {
         .commands {
             CommandGroup(after: .appInfo) {
                 CheckForUpdatesView(updater: updaterController.updater)
+                Button("Turn On Finder Menu…") { AppDelegate.offerFinderMenu() }
             }
         }
     }

@@ -8,7 +8,7 @@ import Foundation
 /// is bounded by cores as usual.
 @MainActor
 final class JobQueue: ObservableObject {
-    /// One queue for the whole application. The window and the Finder service
+    /// One queue for the whole application. The window and the Finder menu
     /// both feed it, so work arriving by either route joins the same run and
     /// respects the same concurrency limit — including work that arrives while a
     /// run is already under way, which is re-checked rather than left waiting.
