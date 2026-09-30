@@ -10,7 +10,7 @@ Working. JPEG and PNG are read and written in place. HEIC, AVIF, WebP and SVG ar
 
 What runs today: a drag and drop window, six Finder Services entries, in-place replacement that preserves Finder tags, and a command line harness for measurement.
 
-What does not exist yet: a GIF and a TIFF can only have their metadata removed; an SVG is rasterized, never optimized as a drawing; WebP is written from the command line only, and only losslessly, since lossy WebP would mean a C dependency; AVIF is written only on macOS; further recipes beyond the email and social presets; inside a PDF, a fax-coded page, a JPEG 2000 image or a CMYK image is left exactly as it was; HDR gain maps through a re-encode, which Strip keeps but Fast and Quality report as removed. Balanced mode is built and parked, for the reason given under Modes.
+What does not exist yet: a GIF and a TIFF can only have their metadata removed; an SVG is rasterized, never optimized as a drawing; WebP is written from the command line only, and only losslessly, since lossy WebP would mean a C dependency; AVIF is written only on macOS; further recipes beyond the email and social presets; inside a PDF, a fax-coded page, a JPEG 2000 image or a CMYK image is left exactly as it was; an HDR gain map in the copies Shrink for Email and Shrink for Social make, which report it as removed. Balanced mode is built and parked, for the reason given under Modes.
 
 The claims on this page about what is removed and what is kept can be checked with ExifTool; [docs/VERIFY.md](docs/VERIFY.md) shows the commands and what they returned. [SECURITY.md](SECURITY.md) describes what the engine is exposed to, how it is fuzzed, and how to report a defect privately.
 
@@ -69,7 +69,7 @@ The application is unsandboxed by design. Replacing arbitrary files in place is 
 
 ## Use
 
-Drop images on the window, or right-click them in Finder and choose **Services**, then one of:
+Drop images on the window, or right-click them in Finder and choose **Services**, then one of the six below. The window's picker offers the same six, so a file in a folder where Finder shows no Services entries can still be sent through any of them:
 
 - **Squint: Shrink** does the everyday job. It encodes once at a fixed quality and measures nothing. It also takes a PDF, and rewrites it in place with the pictures inside it re-encoded and any downscaled to 150 dpi.
 - **Squint: Shrink for Email** writes `name-email.jpg`, resizing to 2048 pixels on the long edge. It accepts JPEG, PNG, HEIC, AVIF, WebP and SVG, since the copy is a new file and the original's format does not matter. The original is not touched: the cap throws resolution away, and a photograph kept as documentation should not lose it because a copy was being made for an email. Measured on a 4032x3024 photograph, the copy is 129 KB, so about thirty fit under any provider's attachment limit.
@@ -142,7 +142,9 @@ Losing it is quiet. The file still opens, still looks right on an ordinary displ
 
 **Strip keeps the map.** It is picture data, not a record of where the picture was taken. Its own EXIF is removed and the parameters describing how to apply it are kept, since without those it is an unreadable grey picture. The result was checked against ImageIO, which reads the map back at full size and reports the headroom, exactly as it does for the untouched original.
 
-**Fast and Quality do not, yet.** The container Squint builds is sound: the same index and the same map, attached to a primary encoded by libjpeg-turbo or to the untouched primary that Strip produces, are read by ImageIO without complaint. Attached to a primary that mozjpeg encoded, macOS will not open the file at all, and `sips` reports nothing either. Substituting the colour profile, the quantization tables, the scan mode and the segment order one at a time changed nothing, which places the trigger in mozjpeg's entropy-coded output. A file that will not open is a worse outcome than one that has lost its extra range, so these modes report the loss instead of causing it silently. Carrying the map through a re-encode needs a different encoder for the primary and is not yet done.
+**Shrink and Shrink to a Quality Target keep it too, when they replace the file.** The system encoder writes the picture and the map is copied across from the original as macOS read it, because macOS will not decode a gain map beside a picture any other encoder wrote. That was measured on an iPhone photograph with every other part of the file held fixed: mozjpeg's defaults, its libjpeg-turbo settings, baseline and progressive scans, the quantization tables swapped both ways, the JFIF and EXIF headers, a restart interval, and a primary as large as the original's were each refused, while the same index and map beside Apple's own primary decoded. The system encoder costs about 30% more bytes than mozjpeg at the same score, so it is used only for a photograph that has a map. The picture keeps the layout its map was drawn for and says which way up it goes with an orientation tag. An older iPhone's map is applied by two values in the maker note, tags 33 and 48, which say how bright the picture may go; those two are kept and the rest of the maker note is not. Measured on a 4032x3024 photograph from an iPhone 12, a portrait: 3,995 KB to 1,505 KB with Shrink, the headroom 4.00 before and after, and no location, camera or date left in the file.
+
+**Shrink for Email and Shrink for Social drop it.** They make a smaller copy to send, the original beside them keeps its range, and the copy's row says `HDR removed`.
 
 ## Design rules
 
@@ -241,12 +243,12 @@ Formats are tracked separately for reading and writing. Squint reads anything a 
 - **0.6** — AVIF and lossless WebP are written, named on the command line with `--format`. AVIF goes through the system encoder because no pure-Rust one can embed a colour profile, so it is macOS only; WebP is lossless, because the pure-Rust encoder has no other kind, and suits what a PNG suits rather than photographs.
 - **0.7** — PDF, both compression and metadata removal. The pictures inside a document are lifted out, re-encoded through the same perceptual search a standalone JPEG gets, and put back; the text, the vectors and the structure are untouched, so the document stays selectable and searchable. Resolution is capped at 150 dpi, which is where nearly all of the saving is: a 14 MB thirty-page scan comes out at 3.0 MB and an 11 MB sheet holding one uncompressed image at 183 KB. From 0.7.1 the build is signed and notarized.
 - **0.8** — PDF and AVIF reach the Finder menu: Shrink and Shrink to a Quality Target take a PDF, Convert to AVIF is an entry, and Remove Location Data takes a PDF.
+- **0.9** — Shrink and Shrink to a Quality Target keep an iPhone photograph's HDR gain map. The window offers all six Finder treatments.
 
 ## Open
 
 - Lossy WebP, which would mean a C dependency.
 - AVIF written anywhere but macOS, which would mean a pure-Rust encoder that can embed a colour profile.
-- The HDR gain map carried through a re-encode. The container is sound; a primary encoded by mozjpeg with the map attached will not open, so this needs a different encoder for the primary.
 - Inside a PDF, a fax-coded page, a JPEG 2000 image and a CMYK image are left as they were. The 150 dpi cap is not a control.
 - Balanced mode, parked for the reason under Modes.
 - A Finder Sync extension, so the presets are a submenu rather than six entries under Services.

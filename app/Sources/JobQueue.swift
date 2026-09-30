@@ -18,9 +18,9 @@ final class JobQueue: ObservableObject {
 
     @Published private(set) var jobs: [Job] = []
     @Published private(set) var isRunning = false
-    /// The mode the window's picker governs. It decides what a drop onto the
+    /// What the window's picker governs. It decides what a drop onto the
     /// window does, and nothing else: files arriving from Finder carry their own.
-    @Published var mode: Engine.Mode = .fast
+    @Published var choice: WindowChoice = .shrink
     @Published var target: Double = 80
 
     /// Measured peak for one 12 megapixel comparison: 2.84 GB. Rounded up,
