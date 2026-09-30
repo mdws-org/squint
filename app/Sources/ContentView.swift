@@ -15,7 +15,7 @@ struct ContentView: View {
                 list
             }
         }
-        .frame(minWidth: 460, minHeight: 320)
+        .frame(minWidth: 640, minHeight: 320)
         .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in
             load(providers)
             return true
@@ -25,16 +25,16 @@ struct ContentView: View {
 
     private var controls: some View {
         HStack(spacing: 12) {
-            Picker("", selection: $queue.mode) {
-                Text("Fast").tag(Engine.Mode.fast)
-                Text("Quality").tag(Engine.Mode.quality)
-                Text("Strip").tag(Engine.Mode.strip)
+            Picker("", selection: $queue.choice) {
+                ForEach(WindowChoice.allCases) { choice in
+                    Text(choice.label).tag(choice)
+                }
             }
             .pickerStyle(.segmented)
-            .frame(width: 220)
+            .frame(width: 400)
             .disabled(queue.isRunning)
 
-            if queue.mode == .quality {
+            if queue.choice.usesTarget {
                 Text("target \(Int(queue.target))")
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
@@ -57,7 +57,7 @@ struct ContentView: View {
         VStack(spacing: 6) {
             Text("Drop images here")
                 .font(.title3)
-            Text(queue.mode == .strip ? "Removes metadata. Pixels are untouched." : "JPEG, PNG and PDF. Files are replaced in place.")
+            Text(queue.choice.summary)
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
@@ -75,7 +75,7 @@ struct ContentView: View {
         for provider in providers {
             _ = provider.loadObject(ofClass: URL.self) { url, _ in
                 guard let url else { return }
-                Task { @MainActor in queue.add([url], mode: queue.mode) }
+                Task { @MainActor in queue.add([url], preset: queue.choice.preset) }
             }
         }
     }

@@ -78,6 +78,7 @@ const K_CG_IMAGE_ALPHA_NONE_SKIP_LAST: u32 = 5;
 const K_CG_BITMAP_BYTE_ORDER_DEFAULT: u32 = 0;
 
 const K_CF_NUMBER_DOUBLE_TYPE: i32 = 13;
+const K_CF_NUMBER_SINT32_TYPE: i32 = 3;
 const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -139,6 +140,7 @@ extern "C" {
     static kCGImagePropertyPixelWidth: CFStringRef;
     static kCGImagePropertyPixelHeight: CFStringRef;
     static kCGImagePropertyOrientation: CFStringRef;
+    static kCGImagePropertyMakerAppleDictionary: CFStringRef;
     static kCGImageAuxiliaryDataTypeHDRGainMap: CFStringRef;
     static kCGImageAuxiliaryDataTypeISOGainMap: CFStringRef;
     static kCGImageDestinationLossyCompressionQuality: CFStringRef;
@@ -155,6 +157,11 @@ extern "C" {
         properties: CFDictionaryRef,
     );
     fn CGImageDestinationFinalize(idst: CGImageDestinationRef) -> bool;
+    fn CGImageDestinationAddAuxiliaryDataInfo(
+        idst: CGImageDestinationRef,
+        auxiliary_image_data_type: CFStringRef,
+        auxiliary_data_info_dictionary: CFDictionaryRef,
+    );
 
     fn CGImageSourceCreateWithData(data: CFDataRef, options: CFDictionaryRef) -> CGImageSourceRef;
     fn CGImageSourceGetCount(isrc: CGImageSourceRef) -> usize;
@@ -392,6 +399,117 @@ pub fn decode(bytes: &[u8], max_pixels: usize) -> Result<Decoded, Error> {
 /// The cost is that AVIF is written only on macOS, which is the same bargain
 /// already struck for reading HEIC.
 pub fn encode_avif(image: &crate::Image, quality: f32, icc: Option<&[u8]>) -> Result<Vec<u8>, Error> {
+    encode_system(image, quality, icc, b"public.avif\0", "AVIF", None, None)
+}
+
+/// Encode a JPEG through the system encoder, without a gain map.
+///
+/// Used to search for a quality when the result will carry a gain map: the
+/// map does not change the picture, so the picture is searched on its own and
+/// the map is attached once, to the encode that was chosen.
+pub fn encode_jpeg(image: &crate::Image, quality: f32, icc: Option<&[u8]>) -> Result<Vec<u8>, Error> {
+    encode_system(image, quality, icc, b"public.jpeg\0", "JPEG", None, None)
+}
+
+/// Encode a JPEG through the system encoder, carrying the source's gain map.
+///
+/// Only the system encoder is used here. Measured on an iPhone photograph,
+/// macOS refuses to decode a file whose primary came from any libjpeg-family
+/// encoder once a gain map is attached (`CMPhotoJFIFUtilities` error -17102),
+/// whatever the settings, tables, headers or restart interval; the index and
+/// the map were not the cause, since the same ones attached to Apple's own
+/// primary decode. So the system writes the whole file and the map is copied
+/// across from the source as the system read it.
+///
+/// `image` must be laid out as the source's pixels were, with `orientation`
+/// saying how to turn it, because the map is laid out that way too.
+pub fn encode_jpeg_with_gain_map(
+    image: &crate::Image,
+    quality: f32,
+    icc: Option<&[u8]>,
+    orientation: u16,
+    source: &[u8],
+) -> Result<Vec<u8>, Error> {
+    encode_system(image, quality, icc, b"public.jpeg\0", "JPEG", Some(orientation), Some(source))
+}
+
+/// A source's gain map as the system reads it.
+///
+/// The ISO 21496-1 map is preferred and Apple's own kind is the fallback; an
+/// iPhone writes both, describing the same map. Apple's kind is applied by two
+/// values that live in the maker note rather than beside the map, tags 33 and
+/// 48; without them a photograph measured at 4.00 of headroom came back at
+/// 3.48. They say how bright the picture may go and nothing about who took it
+/// or where, so they are carried and the rest of the maker note is not.
+struct GainMap {
+    _data: Cf<c_void>,
+    _source: Cf<c_void>,
+    kind: CFStringRef,
+    info: Cf<c_void>,
+    headroom: Option<Cf<c_void>>,
+}
+
+unsafe fn read_gain_map(source: &[u8]) -> Result<GainMap, Error> {
+    let data = Cf::wrap(CFDataCreate(ptr::null(), source.as_ptr(), source.len() as isize))
+        .ok_or_else(|| Error::Encode("Image I/O could not read the source".into()))?;
+    let src = Cf::wrap(CGImageSourceCreateWithData(data.as_ptr() as CFDataRef, ptr::null()))
+        .ok_or_else(|| Error::Encode("Image I/O could not read the source".into()))?;
+    let index = CGImageSourceGetPrimaryImageIndex(src.as_ptr() as CGImageSourceRef);
+    let (kind, info) = [kCGImageAuxiliaryDataTypeISOGainMap, kCGImageAuxiliaryDataTypeHDRGainMap]
+        .into_iter()
+        .find_map(|kind| {
+            Cf::wrap(CGImageSourceCopyAuxiliaryDataInfoAtIndex(src.as_ptr() as CGImageSourceRef, index, kind))
+                .map(|info| (kind, info))
+        })
+        .ok_or_else(|| Error::Encode("the source's gain map could not be read".into()))?;
+    let headroom = maker_headroom(src.as_ptr() as CGImageSourceRef, index);
+    Ok(GainMap { _data: data, _source: src, kind, info, headroom })
+}
+
+/// Maker-note tags 33 and 48 from the source, alone in a dictionary of their
+/// own, or nothing if the source has neither.
+unsafe fn maker_headroom(src: CGImageSourceRef, index: usize) -> Option<Cf<c_void>> {
+    let props = Cf::wrap(CGImageSourceCopyPropertiesAtIndex(src, index, ptr::null()))?;
+    let maker = CFDictionaryGetValue(
+        props.as_ptr() as CFDictionaryRef,
+        kCGImagePropertyMakerAppleDictionary as *const c_void,
+    );
+    if maker.is_null() {
+        return None;
+    }
+    let mut names = Vec::new();
+    let (mut keys, mut values) = (Vec::new(), Vec::new());
+    for tag in [b"33\0", b"48\0"] {
+        let name = Cf::wrap(CFStringCreateWithCString(ptr::null(), tag.as_ptr() as *const i8, K_CF_STRING_ENCODING_UTF8))?;
+        let value = CFDictionaryGetValue(maker as CFDictionaryRef, name.as_ptr() as *const c_void);
+        if !value.is_null() {
+            keys.push(name.as_ptr() as *const c_void);
+            values.push(value);
+        }
+        names.push(name);
+    }
+    if keys.is_empty() {
+        return None;
+    }
+    Cf::wrap(CFDictionaryCreate(
+        ptr::null(),
+        keys.as_ptr(),
+        values.as_ptr(),
+        keys.len() as isize,
+        &kCFTypeDictionaryKeyCallBacks as *const _ as *const c_void,
+        &kCFTypeDictionaryValueCallBacks as *const _ as *const c_void,
+    ))
+}
+
+fn encode_system(
+    image: &crate::Image,
+    quality: f32,
+    icc: Option<&[u8]>,
+    uti: &[u8],
+    what: &str,
+    orientation: Option<u16>,
+    gain_map_from: Option<&[u8]>,
+) -> Result<Vec<u8>, Error> {
     // Four bytes per pixel with the last ignored: the only RGB layout
     // `CGBitmapContextCreate` accepts at eight bits per component.
     let (w, h) = (image.width, image.height);
@@ -432,10 +550,10 @@ pub fn encode_avif(image: &crate::Image, quality: f32, icc: Option<&[u8]>) -> Re
             .ok_or_else(|| Error::Encode("Image I/O could not make an output buffer".into()))?;
         let uti = Cf::wrap(CFStringCreateWithCString(
             ptr::null(),
-            b"public.avif\0".as_ptr() as *const i8,
+            uti.as_ptr() as *const i8,
             K_CF_STRING_ENCODING_UTF8,
         ))
-        .ok_or_else(|| Error::Encode("Image I/O could not name the AVIF type".into()))?;
+        .ok_or_else(|| Error::Encode(format!("Image I/O could not name the {what} type")))?;
 
         let dest = Cf::wrap(CGImageDestinationCreateWithData(
             out_data.as_ptr() as CFMutableDataRef,
@@ -443,7 +561,7 @@ pub fn encode_avif(image: &crate::Image, quality: f32, icc: Option<&[u8]>) -> Re
             1,
             ptr::null(),
         ))
-        .ok_or_else(|| Error::Encode("this system cannot write AVIF".into()))?;
+        .ok_or_else(|| Error::Encode(format!("this system cannot write {what}")))?;
 
         // Image I/O takes quality as a fraction, where the engine and every
         // other encoder here count from zero to a hundred.
@@ -455,13 +573,39 @@ pub fn encode_avif(image: &crate::Image, quality: f32, icc: Option<&[u8]>) -> Re
         ))
         .ok_or_else(|| Error::Encode("Image I/O could not carry the quality".into()))?;
 
-        let keys = [kCGImageDestinationLossyCompressionQuality as *const c_void];
-        let values = [number.as_ptr() as *const c_void];
+        // The orientation, when given, is written as a tag rather than applied
+        // to the pixels: a gain map copied from the source is laid out the way
+        // the source's pixels were, and the picture must stay laid out the same.
+        let turn = match orientation {
+            Some(o) => Some(
+                Cf::wrap(CFNumberCreate(
+                    ptr::null(),
+                    K_CF_NUMBER_SINT32_TYPE,
+                    &(o as i32) as *const i32 as *const c_void,
+                ))
+                .ok_or_else(|| Error::Encode("Image I/O could not carry the orientation".into()))?,
+            ),
+            None => None,
+        };
+        let carried = match gain_map_from {
+            Some(source) => Some(read_gain_map(source)?),
+            None => None,
+        };
+        let mut keys = vec![kCGImageDestinationLossyCompressionQuality as *const c_void];
+        let mut values = vec![number.as_ptr() as *const c_void];
+        if let Some(t) = &turn {
+            keys.push(kCGImagePropertyOrientation as *const c_void);
+            values.push(t.as_ptr() as *const c_void);
+        }
+        if let Some(h) = carried.as_ref().and_then(|g| g.headroom.as_ref()) {
+            keys.push(kCGImagePropertyMakerAppleDictionary as *const c_void);
+            values.push(h.as_ptr() as *const c_void);
+        }
         let props = Cf::wrap(CFDictionaryCreate(
             ptr::null(),
             keys.as_ptr(),
             values.as_ptr(),
-            1,
+            keys.len() as isize,
             &kCFTypeDictionaryKeyCallBacks as *const _ as *const c_void,
             &kCFTypeDictionaryValueCallBacks as *const _ as *const c_void,
         ))
@@ -472,16 +616,23 @@ pub fn encode_avif(image: &crate::Image, quality: f32, icc: Option<&[u8]>) -> Re
             cg_image.as_ptr() as CGImageRef,
             props.as_ptr() as CFDictionaryRef,
         );
+        if let Some(g) = &carried {
+            CGImageDestinationAddAuxiliaryDataInfo(
+                dest.as_ptr() as CGImageDestinationRef,
+                g.kind,
+                g.info.as_ptr() as CFDictionaryRef,
+            );
+        }
         // Finalize is the only place a refused encode is reported. Skipping the
         // check would hand back whatever the buffer happened to hold, which for
         // a refusal is nothing at all.
         if !CGImageDestinationFinalize(dest.as_ptr() as CGImageDestinationRef) {
-            return Err(Error::Encode("Image I/O refused to write this AVIF".into()));
+            return Err(Error::Encode(format!("Image I/O refused to write this {what}")));
         }
 
         let len = CFDataGetLength(out_data.as_ptr() as CFDataRef) as usize;
         if len == 0 {
-            return Err(Error::Encode("Image I/O wrote an empty AVIF".into()));
+            return Err(Error::Encode(format!("Image I/O wrote an empty {what}")));
         }
         let ptr = CFDataGetBytePtr(out_data.as_ptr() as CFDataRef);
         Ok(std::slice::from_raw_parts(ptr, len).to_vec())

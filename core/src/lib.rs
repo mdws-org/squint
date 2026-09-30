@@ -348,12 +348,18 @@ pub enum OutputFormat {
     /// suits and wrong for photographs, which the never-grow rule refuses on
     /// its own without this having to guess what a picture is of.
     WebpLossless,
+    /// JPEG written by the system encoder rather than mozjpeg. Never named by a
+    /// caller: it is chosen internally for a photograph whose gain map is being
+    /// kept, because macOS will only decode a gain map beside a primary its own
+    /// encoder wrote. It costs about 30% more bytes than mozjpeg at the same
+    /// score, measured on an iPhone photograph.
+    JpegSystem,
 }
 
 impl OutputFormat {
     pub fn extension(self) -> &'static str {
         match self {
-            OutputFormat::Jpeg => "jpg",
+            OutputFormat::Jpeg | OutputFormat::JpegSystem => "jpg",
             OutputFormat::Avif => "avif",
             OutputFormat::WebpLossless => "webp",
         }
@@ -384,6 +390,10 @@ impl OutputFormat {
             OutputFormat::Avif => imageio::encode_avif(image, quality, icc),
             #[cfg(not(target_os = "macos"))]
             OutputFormat::Avif => Err(Error::ReadOnlyFormat { format: "AVIF" }),
+            #[cfg(target_os = "macos")]
+            OutputFormat::JpegSystem => imageio::encode_jpeg(image, quality, icc),
+            #[cfg(not(target_os = "macos"))]
+            OutputFormat::JpegSystem => Err(Error::ReadOnlyFormat { format: "JPEG through the system encoder" }),
         }
     }
 
@@ -407,6 +417,9 @@ impl OutputFormat {
     fn predict_quality(self, target: f64) -> f32 {
         match self {
             OutputFormat::Avif => (1.587 * target - 44.4).clamp(30.0, 98.0) as f32,
+            // Fitted to three probes of the system encoder on a 12 megapixel
+            // iPhone photograph: 50 scored 79.2, 65 scored 86.2, 80 scored 90.4.
+            OutputFormat::JpegSystem => (2.14 * target - 119.0).clamp(30.0, 98.0) as f32,
             _ => (8.30 * (0.0285 * target).exp()).clamp(30.0, 98.0) as f32,
         }
     }
@@ -916,8 +929,24 @@ pub fn optimize_as(
     } else {
         converted_from.is_none().then_some(bytes.len())
     };
+    let orientation = src.orientation;
     let image = src.image;
     let icc = src.icc;
+
+    // A JPEG photograph with a gain map, rewritten in place at its own size,
+    // keeps the map. Copies, caps and conversions do not: they are made to be
+    // sent somewhere small, and the original beside them keeps its range.
+    #[cfg(target_os = "macos")]
+    if format == OutputFormat::Jpeg
+        && max_dimension.is_none()
+        && converted_from.is_none()
+        && gainmap::extract(bytes).map_or(false, |found| found.has_gain_map)
+    {
+        let hdr = HdrSource { bytes, orientation };
+        return hdr_in_place(&hdr, &image, icc.as_deref(), mode, target, fixed_quality, max_probes, size_to_beat);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = orientation;
 
     let (data, score, probes) = match mode {
         // Strip is handled above and never reaches this match.
@@ -942,19 +971,11 @@ pub fn optimize_as(
         }
     };
 
-    // A gain map cannot yet be carried onto a re-encoded picture, so say so
-    // rather than losing the range quietly.
-    //
-    // The container squint builds is sound: the same index and the same map,
-    // attached to a primary from libjpeg-turbo or to the untouched primary that
-    // strip mode produces, are read by ImageIO without complaint. Attached to a
-    // primary mozjpeg encoded, macOS will not open the file at all — no
-    // properties, no decode, and `sips` reports nothing either. What triggers it
-    // lives in mozjpeg's entropy-coded output: the colour profile, the
-    // quantization tables, the scan mode and the segment order were each
-    // substituted in turn and none of them made the difference. An unopenable
-    // file is a worse outcome than one that has lost its extra range, so the
-    // map is left off until the picture can be encoded some other way.
+    // Reached by a copy, a capped or converted picture, or a picture with no
+    // map. A map is carried only by `hdr_in_place`, which needs the system
+    // encoder and the source's own layout; here the picture was encoded by
+    // mozjpeg and turned upright, so a map it carried would be dropped either
+    // way, and it is reported as dropped rather than lost quietly.
     let hdr = if has_gain_map(bytes) || src.has_gain_map { Hdr::Dropped } else { Hdr::Absent };
 
     // Checked on the finished file rather than the picture alone: carrying the
@@ -978,9 +999,96 @@ pub fn optimize_as(
     })
 }
 
+/// The EXIF orientation that undoes another. Orientations 6 and 8 are quarter
+/// turns in opposite directions; every other one undoes itself.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn inverse_orientation(orientation: u16) -> u16 {
+    match orientation {
+        6 => 8,
+        8 => 6,
+        o => o,
+    }
+}
+
+/// The source a kept gain map is copied from, and how its pixels were laid out.
+#[cfg(target_os = "macos")]
+struct HdrSource<'a> {
+    bytes: &'a [u8],
+    orientation: u16,
+}
+
+/// Rewrite a JPEG photograph in place, keeping its gain map.
+///
+/// The system encoder writes the whole file and copies the map across from the
+/// source, as `imageio::encode_jpeg_with_gain_map` explains. The map is laid out
+/// the way the source's pixels were, so the picture is turned back to that
+/// layout and the orientation is written as a tag rather than applied; every
+/// other path turns the pixels upright and writes no tag. The search runs on
+/// the picture without the map, which does not change it, and the map is
+/// attached once to the encode that was chosen.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn hdr_in_place(
+    source: &HdrSource,
+    upright: &Image,
+    icc: Option<&[u8]>,
+    mode: Mode,
+    target: f64,
+    fixed_quality: f32,
+    max_probes: usize,
+    size_to_beat: SizeToBeat,
+) -> Result<Optimized, Error> {
+    let back = inverse_orientation(source.orientation);
+    let (pixels, width, height) = oriented(&upright.pixels, upright.width, upright.height, back);
+    let laid = Image { pixels, width, height };
+
+    let (quality, score, probes) = match mode {
+        Mode::Quality => {
+            if target > JPEG_SCORE_CEILING {
+                return Err(Error::Unreachable { best_score: JPEG_SCORE_CEILING });
+            }
+            let r = search_as(OutputFormat::JpegSystem, &laid, target, max_probes, size_to_beat, icc)?;
+            (r.chosen.quality, Some(r.chosen.score), r.probes)
+        }
+        // Fast measures nothing, so the fixed quality is carried across to the
+        // system encoder's scale: mozjpeg at 75 scored 77.0 on the photograph
+        // the curve above was fitted to, and the system encoder at 50 scored
+        // 79.2, so two thirds of the mozjpeg figure lands just above it.
+        _ => ((fixed_quality * 2.0 / 3.0).clamp(20.0, 98.0), None, Vec::new()),
+    };
+
+    let data = imageio::encode_jpeg_with_gain_map(&laid, quality, icc, source.orientation.max(1), source.bytes)?;
+    if let Some(limit) = size_to_beat {
+        if data.len() >= limit {
+            return Err(Error::NoSmallerResult { best_bytes: data.len(), original_bytes: limit });
+        }
+    }
+    Ok(Optimized {
+        data,
+        probes,
+        score,
+        hdr: Hdr::Preserved,
+        quantized: false,
+        original_bytes: source.bytes.len(),
+        converted_from: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turning_by_an_orientation_and_its_inverse_is_no_turn() {
+        // A 3x2 grid with every cell distinct, so any misplacement shows.
+        let grid: Vec<u8> = (0..6).collect();
+        for o in 1..=8u16 {
+            let (turned, w, h) = oriented(&grid, 3, 2, o);
+            let (back, bw, bh) = oriented(&turned, w, h, inverse_orientation(o));
+            assert_eq!((bw, bh), (3, 2), "orientation {o} came back the wrong shape");
+            assert_eq!(back, grid, "orientation {o} and its inverse did not cancel");
+        }
+    }
 
     #[test]
     fn a_format_is_named_by_what_it_writes() {
