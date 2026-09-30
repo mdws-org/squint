@@ -26,13 +26,14 @@ One behaviour is worth correcting rather than copying. With strip-metadata enabl
 
 One 4032x3024 Display P3 photograph, on an Apple M1, with ImageOptim in lossy mode at its author's habitual quality of 74.5.
 
-| | bytes | of original | SSIMULACRA2 | colour profile |
-|---|---|---|---|---|
-| source | 1,465,453 | | | Display P3 |
-| Squint, fast mode | 401,879 | 27.4% | 76.95 | **Display P3** |
-| ImageOptim | 400,965 | 27.4% | 76.95 | sRGB |
+| | bytes | of original | SSIMULACRA2 | colour profile | HDR gain map |
+|---|---|---|---|---|---|
+| source | 1,465,453 | | | Display P3 | yes |
+| Squint 0.9, fast mode | 735,751 | 50.2% | 79.14 | **Display P3** | **kept** |
+| Squint before 0.9, fast mode | 401,879 | 27.4% | 76.95 | **Display P3** | dropped |
+| ImageOptim | 400,965 | 27.4% | 76.95 | sRGB | dropped |
 
-Squint is not smaller. It compresses to the same size at the same perceived quality, spends 914 bytes carrying the colour profile across, and reports the score rather than leaving you to guess.
+With the gain map dropped, Squint is not smaller than ImageOptim. It compresses to the same size at the same perceived quality, spends 914 bytes carrying the colour profile across, and reports the score rather than leaving you to guess. From 0.9 it keeps the gain map as well, which costs the rest: macOS only decodes a gain map beside a picture its own encoder wrote, and that encoder needs about 30% more bytes than mozjpeg for the same score. High dynamic range, below, has the detail.
 
 One hundred files through fast mode, eight at a time, took 9 seconds on an 8 core machine.
 
