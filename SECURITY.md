@@ -18,7 +18,7 @@ It makes no network connection except the Sparkle update check, which the user e
 
 ## Reporting
 
-Report a vulnerability privately through GitHub's private vulnerability reporting on this repository (Security tab, "Report a vulnerability"), or to the contact address on https://thebenmeadows.com. Include the file that triggers it when there is one; a file that makes Squint crash, hang, allocate without bound, or write a wrong output over the original is a valid report even when the file itself is malformed.
+Report a vulnerability privately through GitHub's private vulnerability reporting on this repository (Security tab, "Report a vulnerability"), or by email to steam-gab-shape@duck.com (the same address as the security contact on https://thebenmeadows.com). Include the file that triggers it when there is one; a file that makes Squint crash, hang, allocate without bound, or write a wrong output over the original is a valid report even when the file itself is malformed.
 
 Reports are acknowledged within seven days. A fix ships as a release with the report credited unless the reporter asks otherwise.
 
