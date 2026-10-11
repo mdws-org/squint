@@ -20,6 +20,11 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     && rustup toolchain install nightly --profile minimal \
     && cargo install cargo-fuzz --locked
 
+# A login shell (bash -l) resets PATH from /etc/profile and loses /usr/local/cargo/bin;
+# linking the toolchain into /usr/local/bin keeps it reachable from either kind of shell.
+RUN ln -s /usr/local/cargo/bin/cargo /usr/local/cargo/bin/rustc /usr/local/cargo/bin/rustup \
+      /usr/local/cargo/bin/cargo-fuzz /usr/local/bin/
+
 COPY . /src
 WORKDIR /src/core
 
