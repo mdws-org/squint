@@ -265,7 +265,7 @@ fn main() {
                     p.quality,
                     p.score,
                     p.bytes as f64 / 1024.0,
-                    if Some(p.score) == r.score { "   <- chosen" } else { "" }
+                    if Some(p.quality) == r.quality { "   <- chosen" } else { "" }
                 );
             }
             // A percentage of the source says nothing once the format has
@@ -277,9 +277,9 @@ fn main() {
                 None => format!("  {:>5.1}% of original", 100.0 * r.data.len() as f64 / bytes.len() as f64),
             };
             println!(
-                "{:<8} q{:<5.1} {:>7.0} KB{}{}  {} probes  {:.3}s{}{}",
+                "{:<8} {:<6} {:>7.0} KB{}{}  {} probes  {:.3}s{}{}",
                 mode,
-                r.probes.last().map_or(fixed_quality, |p| p.quality),
+                r.quality.map_or("-".to_string(), |q| format!("q{q:.1}")),
                 r.data.len() as f64 / 1024.0,
                 against_source,
                 match r.score { Some(s) => format!("  score {s:.3}"), None => "  (no metric evaluated)".into() },
