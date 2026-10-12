@@ -10,7 +10,7 @@ struct SquintApp: App {
     /// the updater must outlive any one window: this application spends most
     /// of its life with no window open, answering the Finder services.
     private let updaterController = SPUStandardUpdaterController(
-        startingUpdater: true,
+        startingUpdater: false,  // SANDBOX SPIKE: Sparkle is not configured for the sandbox
         updaterDelegate: nil,
         userDriverDelegate: nil
     )

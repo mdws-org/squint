@@ -196,6 +196,7 @@ final class JobQueue: ObservableObject {
             }
         }.value
 
+        NSLog("SPIKE job %@ -> %@", url.path, String(describing: outcome))
         await MainActor.run { job.state = outcome }
     }
 }

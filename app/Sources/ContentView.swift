@@ -75,6 +75,7 @@ struct ContentView: View {
         for provider in providers {
             _ = provider.loadObject(ofClass: URL.self) { url, _ in
                 guard let url else { return }
+                NSLog("SPIKE drop %@", url.path)
                 Task { @MainActor in queue.add([url], preset: queue.choice.preset) }
             }
         }

@@ -29,7 +29,7 @@ targets:
     settings:
       base:
         PRODUCT_NAME: Squint
-        PRODUCT_BUNDLE_IDENTIFIER: net.mdws.squint
+        PRODUCT_BUNDLE_IDENTIFIER: net.mdws.squint.spike
         MARKETING_VERSION: "0.9.0"
         CURRENT_PROJECT_VERSION: "16"
         SWIFT_VERSION: "5.0"
@@ -90,7 +90,7 @@ targets:
         # mismatch fails silently: the item appears and does nothing.
         NSServices:
           - NSMenuItem:
-              default: "Squint: Shrink"
+              default: "Spike:Shrink"
             NSMessage: optimizeFast
             NSPortName: Squint
             # A PDF is offered to the two in-place entries and to nothing
@@ -107,7 +107,7 @@ targets:
               NSTextContent: FilePath
             NSServiceDescription: Shrink images in place, keeping the colour profile; a PDF has its pictures re-encoded
           - NSMenuItem:
-              default: "Squint: Shrink for Email"
+              default: "Spike:Shrink for Email"
             NSMessage: shrinkForEmail
             NSPortName: Squint
             # AVIF needs naming in its own right: it does NOT conform to
@@ -127,7 +127,7 @@ targets:
               NSTextContent: FilePath
             NSServiceDescription: "Shrink to 2048 pixels beside the original, sized for sending; a HEIC becomes a JPEG"
           - NSMenuItem:
-              default: "Squint: Shrink for Social"
+              default: "Spike:Shrink for Social"
             NSMessage: shrinkForSocial
             NSPortName: Squint
             NSSendFileTypes:
@@ -143,7 +143,7 @@ targets:
               NSTextContent: FilePath
             NSServiceDescription: "Shrink to 1440 pixels beside the original, sized for posting; a HEIC becomes a JPEG"
           - NSMenuItem:
-              default: "Squint: Shrink to a Quality Target"
+              default: "Spike:Shrink to a Quality Target"
             NSMessage: optimizeQuality
             NSPortName: Squint
             NSSendFileTypes:
@@ -155,7 +155,7 @@ targets:
               NSTextContent: FilePath
             NSServiceDescription: Shrink images to a perceptual quality target; a PDF has its pictures re-encoded
           - NSMenuItem:
-              default: "Squint: Convert to AVIF"
+              default: "Spike:Convert to AVIF"
             NSMessage: convertToAvif
             NSPortName: Squint
             # Every raster the engine can decode, and no AVIF: converting one
@@ -176,7 +176,7 @@ targets:
               NSTextContent: FilePath
             NSServiceDescription: "Write an AVIF beside the original at the picture's own size, searched to the quality target"
           - NSMenuItem:
-              default: "Squint: Remove Location Data"
+              default: "Spike:Remove Location Data"
             NSMessage: stripMetadata
             NSPortName: Squint
             NSSendFileTypes:
