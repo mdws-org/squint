@@ -8,24 +8,28 @@ import Foundation
 enum Writer {
     /// Write `data` over `url`, keeping tags, creation date, and permissions.
     ///
-    /// The temporary file is created in the same directory so the replacement
-    /// stays on one volume and cannot become a slow cross-device copy.
+    /// The temporary file goes in the directory macOS hands out for replacing
+    /// `url`. It is on the same volume, so the swap is a rename and cannot
+    /// become a slow cross-device copy, and it is somewhere the App Sandbox
+    /// lets the application create a file. The original's own directory is
+    /// not: a sandboxed application is granted the file it was given, never
+    /// the folder around it.
     static func replaceInPlace(_ url: URL, with data: Data) throws {
-        let directory = url.deletingLastPathComponent()
-        let temporary = directory.appendingPathComponent(
-            ".squint-\(UUID().uuidString).tmp"
+        let directory = try FileManager.default.url(
+            for: .itemReplacementDirectory,
+            in: .userDomainMask,
+            appropriateFor: url,
+            create: true
         )
+        // Made for this one replacement, and removed whether or not it worked.
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let temporary = directory.appendingPathComponent(url.lastPathComponent)
 
-        try data.write(to: temporary, options: .atomic)
+        try data.write(to: temporary)
 
-        do {
-            // Passing no options means the original's metadata is retained.
-            // Passing .usingNewMetadataOnly would discard the tags.
-            _ = try FileManager.default.replaceItemAt(url, withItemAt: temporary)
-        } catch {
-            try? FileManager.default.removeItem(at: temporary)
-            throw error
-        }
+        // Passing no options means the original's metadata is retained.
+        // Passing .usingNewMetadataOnly would discard the tags.
+        _ = try FileManager.default.replaceItemAt(url, withItemAt: temporary)
     }
 
     /// Finder tags, read back so a caller can verify they survived.
