@@ -134,7 +134,11 @@ final class JobQueue: ObservableObject {
                 // and a HEIC named `.jpg` is still a HEIC. The engine writes
                 // JPEG for every format it cannot re-encode as itself, so the
                 // only place such a picture may go is beside itself.
-                let besideOnly = "this picture is re-encoded as a JPEG, so it can only be written beside the original; use Squint: Shrink for Email"
+                // The store edition writes nothing beside an original, so it
+                // names the treatment that still applies here instead.
+                let besideOnly = Edition.isStore
+                    ? "this picture would become a JPEG beside the original, which only the full edition writes; Strip removes its location data in place"
+                    : "this picture is re-encoded as a JPEG, so it can only be written beside the original; use Squint: Shrink for Email"
                 let isIsobmff = input.count >= 12 && input[4..<8].elementsEqual("ftyp".utf8)
                 if isIsobmff && preset.writesInPlace && preset.mode != .strip {
                     return .failed(besideOnly)

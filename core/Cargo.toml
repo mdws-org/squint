@@ -9,12 +9,19 @@ description = "Perceptual image compression engine for squint"
 fast-ssim2 = { version = "0.8", features = ["imgref"] }
 imgref = "1.12"
 mozjpeg = "0.10"
-imagequant = "4.4"
+imagequant = { version = "4.4", optional = true }
 oxipng = { version = "10", default-features = false, features = ["parallel", "zopfli"] }
 rgb = "0.8"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 resvg = "0.48"
 lopdf = { version = "0.45", default-features = false }
+
+[features]
+default = ["lossy-png"]
+# Colour reduction for PNG, through libimagequant. Its licence does not cover
+# App Store distribution, so the Mac App Store build turns this off and every
+# PNG is then optimized losslessly.
+lossy-png = ["dep:imagequant"]
 
 [lib]
 name = "squint_core"

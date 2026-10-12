@@ -14,6 +14,10 @@ struct ContentView: View {
             } else {
                 list
             }
+            if Edition.isStore {
+                Divider()
+                fullEditionNote
+            }
         }
         .frame(minWidth: 640, minHeight: 320)
         .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in
@@ -26,12 +30,12 @@ struct ContentView: View {
     private var controls: some View {
         HStack(spacing: 12) {
             Picker("", selection: $queue.choice) {
-                ForEach(WindowChoice.allCases) { choice in
+                ForEach(WindowChoice.offered) { choice in
                     Text(choice.label).tag(choice)
                 }
             }
             .pickerStyle(.segmented)
-            .frame(width: 400)
+            .frame(width: Edition.isStore ? 240 : 400)
             .disabled(queue.isRunning)
 
             if queue.choice.usesTarget {
@@ -69,6 +73,18 @@ struct ContentView: View {
             JobRow(job: job)
         }
         .listStyle(.inset)
+    }
+
+    /// The store edition says once, at the foot of the window, what it leaves
+    /// to the other edition.
+    private var fullEditionNote: some View {
+        HStack(spacing: 4) {
+            Text("Email and social copies, AVIF and lossy PNG are in the free full edition:")
+            Link("github.com/mdws-org/squint", destination: Edition.fullEditionURL)
+        }
+        .font(.callout)
+        .foregroundStyle(.secondary)
+        .padding(.vertical, 8)
     }
 
     private func load(_ providers: [NSItemProvider]) {

@@ -68,7 +68,7 @@ open /Applications/Squint.app
 
 Without `-derivedDataPath` the built application lands somewhere under `~/Library/Developer/Xcode/DerivedData` and is easy to lose.
 
-The application is unsandboxed by design. Replacing arbitrary files in place is not possible under the App Sandbox, which is also why ImageOptim is distributed unsandboxed.
+The edition on the releases page is unsandboxed. Shrink for Email, Shrink for Social and Convert to AVIF write a new file beside the original, and the App Sandbox grants an application the file it was handed but not the folder around it. Replacing a file in place does work under the sandbox, so `app/project.yml` also defines `SquintStore`, a sandboxed edition for the Mac App Store. It offers Shrink, Shrink to a Quality Target and Remove Location Data, has no Sparkle, and is built without libimagequant, so it optimizes every PNG losslessly. Build it with `-scheme SquintStore`; the result lands in `build/Build/Products/Release-AppStore/`.
 
 ## Use
 

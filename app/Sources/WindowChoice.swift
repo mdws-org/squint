@@ -12,6 +12,12 @@ enum WindowChoice: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
+    /// What this edition's picker offers. The store edition writes only in
+    /// place, so the three treatments that write a new file are absent.
+    static var offered: [WindowChoice] {
+        Edition.isStore ? [.shrink, .quality, .strip] : allCases
+    }
+
     /// Short enough to sit side by side in the window's picker.
     var label: String {
         switch self {

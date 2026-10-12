@@ -91,6 +91,7 @@ pub fn score_rgba(reference: &RgbaImage, candidate: &RgbaImage) -> Result<f64, E
 /// `min_quality` is a floor, not a target: imagequant refuses to emit a result it
 /// cannot bring up to that quality, which is the behaviour ImageOptim exposes as
 /// `PngMinQuality` and the reason libimagequant is worth its GPL obligation.
+#[cfg(feature = "lossy-png")]
 pub fn quantize(image: &RgbaImage, min_quality: u8, max_quality: u8) -> Result<RgbaImage, Error> {
     let mut liq = imagequant::new();
     liq.set_quality(min_quality, max_quality)
@@ -230,18 +231,15 @@ pub fn optimize_png(
 ) -> Result<PngResult, Error> {
     let source = RgbaImage::decode_capped(bytes, max_dimension)?;
 
-    let (candidate, quantized) = match target {
-        // Quality mode. The colour floor is searched rather than taken on trust,
-        // because it is imagequant's own scale and says nothing about how the
-        // result will score.
-        Some(t) => match search_colours(&source, t)? {
-            Some(floor) => (quantize(&source, floor, 100)?, true),
-            None => (RgbaImage::decode_capped(bytes, max_dimension)?, false),
-        },
-        None => match min_quality {
-            Some(min) => (quantize(&source, min, 100)?, true),
-            None => (RgbaImage::decode_capped(bytes, max_dimension)?, false),
-        },
+    // Quality mode promises a score, and a picture this small cannot be scored.
+    if target.is_some() && source.shorter_side() < crate::MIN_PERCEPTUAL_DIM {
+        return Err(Error::TooSmall { shorter_side: source.shorter_side() });
+    }
+
+    let (candidate, quantized) = match reduction(&source, min_quality, target)? {
+        #[cfg(feature = "lossy-png")]
+        Some(floor) => (quantize(&source, floor, 100)?, true),
+        _ => (RgbaImage::decode_capped(bytes, max_dimension)?, false),
     };
 
     let encoded = candidate.encode_png()?;
@@ -270,7 +268,27 @@ pub fn optimize_png(
     Ok(PngResult { data: optimized, score, quantized })
 }
 
+/// The colour floor to quantize at, or `None` to leave the colours alone.
+#[cfg(feature = "lossy-png")]
+fn reduction(source: &RgbaImage, min_quality: Option<u8>, target: Option<f64>) -> Result<Option<u8>, Error> {
+    match target {
+        // Quality mode. The colour floor is searched rather than taken on trust,
+        // because it is imagequant's own scale and says nothing about how the
+        // result will score.
+        Some(t) => search_colours(source, t),
+        None => Ok(min_quality),
+    }
+}
+
+/// Built without a quantizer, the colours are always left alone: Fast mode is
+/// lossless, and Quality mode meets any target with the untouched pixels.
+#[cfg(not(feature = "lossy-png"))]
+fn reduction(_: &RgbaImage, _: Option<u8>, _: Option<f64>) -> Result<Option<u8>, Error> {
+    Ok(None)
+}
+
 /// Probes the search may spend. Each one quantizes, encodes and scores.
+#[cfg(feature = "lossy-png")]
 const MAX_COLOUR_PROBES: usize = 6;
 
 /// Find the fewest colours that still meet the perceptual target.
@@ -288,11 +306,8 @@ const MAX_COLOUR_PROBES: usize = 6;
 /// pixel-identical to the source and so meets any target by construction, which
 /// makes it the answer when no reduction does. A perceptual target on a PNG can
 /// therefore never be unreachable, only expensive.
+#[cfg(feature = "lossy-png")]
 fn search_colours(source: &RgbaImage, target: f64) -> Result<Option<u8>, Error> {
-    if source.shorter_side() < crate::MIN_PERCEPTUAL_DIM {
-        return Err(Error::TooSmall { shorter_side: source.shorter_side() });
-    }
-
     let (mut lo, mut hi) = (0u8, 100u8);
     let mut best: Option<u8> = None;
 

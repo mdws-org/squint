@@ -5,6 +5,26 @@ options:
     macOS: "14.0"
   createIntermediateGroups: true
 
+# Shared by both editions, so a release bumps the version once.
+settings:
+  base:
+    MARKETING_VERSION: "0.9.0"
+    CURRENT_PROJECT_VERSION: "16"
+    SWIFT_VERSION: "5.0"
+    SWIFT_OBJC_BRIDGING_HEADER: Sources/Squint-Bridging-Header.h
+    HEADER_SEARCH_PATHS: $(SRCROOT)/../core/include
+    OTHER_LDFLAGS: -lsquint_core
+    # Hardened runtime is a property of a signature, so this does nothing
+    # while signing is off, and signing is off in the build on purpose: the
+    # release is signed afterwards by tools/sign-release.sh, which applies
+    # the runtime itself with `--options runtime`. It is left here, and
+    # named as inert, so that
+    # setting up notarization does not mistake it for work already done.
+    ENABLE_HARDENED_RUNTIME: YES  # inert until CODE_SIGNING_ALLOWED is YES
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGNING_REQUIRED: NO
+    CODE_SIGNING_ALLOWED: NO
+
 packages:
   # Pinned to one exact version, because the project file is generated and so
   # Package.resolved is not committed with it: this line is the only thing
@@ -30,26 +50,12 @@ targets:
       base:
         PRODUCT_NAME: Squint
         PRODUCT_BUNDLE_IDENTIFIER: net.mdws.squint
-        MARKETING_VERSION: "0.9.0"
-        CURRENT_PROJECT_VERSION: "16"
-        SWIFT_VERSION: "5.0"
-        SWIFT_OBJC_BRIDGING_HEADER: Sources/Squint-Bridging-Header.h
-        HEADER_SEARCH_PATHS: $(SRCROOT)/../core/include
         LIBRARY_SEARCH_PATHS: $(SRCROOT)/../core/target/release
-        OTHER_LDFLAGS: -lsquint_core
-        # Deliberately unsandboxed. Overwriting arbitrary files in place, which is
-        # the whole point of the app, is not possible under the App Sandbox.
+        # Unsandboxed. Shrink for Email, Shrink for Social and Convert to AVIF
+        # write a new file beside the original, and the App Sandbox grants an
+        # application the file it was handed but not the folder around it.
+        # SquintStore below is the sandboxed edition, without those three.
         ENABLE_APP_SANDBOX: NO
-        # Hardened runtime is a property of a signature, so this does nothing
-        # while signing is off, and signing is off in the build on purpose: the
-        # release is signed afterwards by tools/sign-release.sh, which applies
-        # the runtime itself with `--options runtime`. It is left here, and
-        # named as inert, so that
-        # setting up notarization does not mistake it for work already done.
-        ENABLE_HARDENED_RUNTIME: YES  # inert until CODE_SIGNING_ALLOWED is YES
-        CODE_SIGN_IDENTITY: "-"
-        CODE_SIGNING_REQUIRED: NO
-        CODE_SIGNING_ALLOWED: NO
     info:
       path: Info.plist
       properties:
@@ -89,7 +95,10 @@ targets:
         # NSMessage must match the @objc method name on ServiceProvider. A
         # mismatch fails silently: the item appears and does nothing.
         NSServices:
-          - NSMenuItem:
+          # The three entries that write in place are anchored so the store
+          # edition below lists the same three without a second copy.
+          - &shrinkService
+            NSMenuItem:
               default: "Squint: Shrink"
             NSMessage: optimizeFast
             NSPortName: Squint
@@ -142,7 +151,8 @@ targets:
               NSApplicationIdentifier: com.apple.finder
               NSTextContent: FilePath
             NSServiceDescription: "Shrink to 1440 pixels beside the original, sized for posting; a HEIC becomes a JPEG"
-          - NSMenuItem:
+          - &qualityService
+            NSMenuItem:
               default: "Squint: Shrink to a Quality Target"
             NSMessage: optimizeQuality
             NSPortName: Squint
@@ -175,7 +185,8 @@ targets:
               NSApplicationIdentifier: com.apple.finder
               NSTextContent: FilePath
             NSServiceDescription: "Write an AVIF beside the original at the picture's own size, searched to the quality target"
-          - NSMenuItem:
+          - &stripService
+            NSMenuItem:
               default: "Squint: Remove Location Data"
             NSMessage: stripMetadata
             NSPortName: Squint
@@ -213,3 +224,56 @@ targets:
           export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
           cd "$SRCROOT/../core"
           cargo build --release --locked
+
+  # The Mac App Store edition. Sandboxed, so it offers only the treatments that
+  # replace a file in place; the copies written beside an original need the
+  # folder, which the sandbox does not grant. No Sparkle, since the App Store
+  # updates it, and an engine built without libimagequant, whose licence does
+  # not cover App Store distribution, so every PNG is optimized losslessly.
+  SquintStore:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources
+        excludes:
+          - Updater.swift
+      - path: ../design/squint.icns
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_NAME: Squint
+        PRODUCT_BUNDLE_IDENTIFIER: net.mdws.squint.appstore
+        # Its own products directory, so building it never overwrites the
+        # Squint.app the other target produced.
+        CONFIGURATION_BUILD_DIR: $(BUILD_DIR)/$(CONFIGURATION)-AppStore
+        LIBRARY_SEARCH_PATHS: $(SRCROOT)/../core/target/store/release
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) APP_STORE
+        ENABLE_APP_SANDBOX: YES
+        # Applied when the build is signed for the store; inert until then,
+        # like the hardened runtime.
+        CODE_SIGN_ENTITLEMENTS: SquintStore.entitlements
+    info:
+      path: InfoStore.plist
+      properties:
+        CFBundleName: Squint
+        CFBundleIconFile: squint
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSMinimumSystemVersion: "14.0"
+        LSApplicationCategoryType: public.app-category.photography
+        NSHighResolutionCapable: true
+        NSHumanReadableCopyright: "GPL-3.0-or-later. The full edition is free at github.com/mdws-org/squint."
+        # It makes no network connection at all, so it uses no encryption to
+        # declare.
+        ITSAppUsesNonExemptEncryption: false
+        NSServices:
+          - *shrinkService
+          - *qualityService
+          - *stripService
+    preBuildScripts:
+      - name: Build the engine without libimagequant
+        basedOnDependencyAnalysis: false
+        script: |
+          export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
+          cd "$SRCROOT/../core"
+          cargo build --release --locked --no-default-features --target-dir target/store
