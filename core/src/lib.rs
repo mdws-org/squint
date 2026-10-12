@@ -82,6 +82,11 @@ pub enum Error {
     /// The target was met, but only by a file larger than the original. An
     /// optimizer must never grow a file; the caller keeps the original.
     NoSmallerResult { best_bytes: usize, original_bytes: usize },
+    /// Strip found no metadata to remove. The file is already what Strip
+    /// would make of it, which is an outcome rather than a failure; the
+    /// application reports it as one, under the same code as an already
+    /// optimal file.
+    NothingToRemove,
     /// The picture declares more pixels than the engine will decode.
     TooLarge { width: usize, height: usize },
     /// The colour count could not be brought down to the floor that was asked
@@ -111,8 +116,9 @@ impl std::fmt::Display for Error {
             ),
             Error::NoSmallerResult { best_bytes, original_bytes } => write!(
                 f,
-                "target is only reachable at {best_bytes} bytes, larger than the original {original_bytes}; keeping the original"
+                "the result would be {best_bytes} bytes, no smaller than the original {original_bytes}; keeping the original"
             ),
+            Error::NothingToRemove => write!(f, "nothing to remove; the file was not changed"),
             Error::TooLarge { width, height } => write!(
                 f,
                 "image declares {width}x{height} pixels, beyond the {MAX_PIXELS} the engine will decode; the file was not changed"
@@ -649,10 +655,7 @@ pub fn optimize_as(
         if pdf::is_pdf(bytes) {
             let r = pdf::rewrite(bytes, Mode::Strip, 0.0, 0.0, 0, None)?;
             if r.metadata_removed == 0 {
-                return Err(Error::NoSmallerResult {
-                    best_bytes: bytes.len(),
-                    original_bytes: bytes.len(),
-                });
+                return Err(Error::NothingToRemove);
             }
             // A rewritten document is not always smaller: one its writer had
             // packed tighter than this can, or one with little to lose, comes
@@ -683,10 +686,7 @@ pub fn optimize_as(
             let (stripped, wiped) = gif::strip_gif(bytes)
                 .ok_or_else(|| Error::Decode("this GIF is not laid out as expected".into()))?;
             if wiped == 0 {
-                return Err(Error::NoSmallerResult {
-                    best_bytes: bytes.len(),
-                    original_bytes: bytes.len(),
-                });
+                return Err(Error::NothingToRemove);
             }
             return Ok(Optimized {
                 data: stripped,
@@ -706,10 +706,7 @@ pub fn optimize_as(
             let (stripped, wiped) = webp::strip_webp(bytes)
                 .ok_or_else(|| Error::Decode("this WebP is not laid out as expected".into()))?;
             if wiped == 0 {
-                return Err(Error::NoSmallerResult {
-                    best_bytes: bytes.len(),
-                    original_bytes: bytes.len(),
-                });
+                return Err(Error::NothingToRemove);
             }
             return Ok(Optimized {
                 data: stripped,
@@ -733,10 +730,7 @@ pub fn optimize_as(
                     .ok_or_else(|| Error::Decode("this TIFF is not laid out as expected".into()))?
             };
             if wiped == 0 {
-                return Err(Error::NoSmallerResult {
-                    best_bytes: bytes.len(),
-                    original_bytes: bytes.len(),
-                });
+                return Err(Error::NothingToRemove);
             }
             return Ok(Optimized {
                 data: stripped,
@@ -792,6 +786,11 @@ pub fn optimize_as(
         };
         let stripped = stripped.ok_or_else(|| Error::Decode("not a JPEG or PNG".into()))?;
 
+        if stripped == bytes {
+            return Err(Error::NothingToRemove);
+        }
+        // Something came out but the file did not shrink: the orientation
+        // block written back can outweigh a very small amount removed.
         if stripped.len() >= bytes.len() {
             return Err(Error::NoSmallerResult {
                 best_bytes: stripped.len(),
@@ -1502,8 +1501,10 @@ mod tests {
         let err_no_smaller = Error::NoSmallerResult { best_bytes: 612000, original_bytes: 480000 };
         assert_eq!(
             err_no_smaller.to_string(),
-            "target is only reachable at 612000 bytes, larger than the original 480000; keeping the original"
+            "the result would be 612000 bytes, no smaller than the original 480000; keeping the original"
         );
+
+        assert_eq!(Error::NothingToRemove.to_string(), "nothing to remove; the file was not changed");
 
         let err_too_large = Error::TooLarge { width: 60000, height: 60000 };
         assert_eq!(

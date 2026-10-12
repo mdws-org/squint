@@ -83,7 +83,7 @@ fn code_for(e: &Error) -> c_int {
         Error::Metric(_) => SQUINT_ERR_METRIC,
         Error::TooSmall { .. } => SQUINT_ERR_TOO_SMALL,
         Error::Unreachable { .. } => SQUINT_ERR_UNREACHABLE,
-        Error::NoSmallerResult { .. } => SQUINT_ERR_NO_SMALLER,
+        Error::NoSmallerResult { .. } | Error::NothingToRemove => SQUINT_ERR_NO_SMALLER,
         Error::TooLarge { .. } => SQUINT_ERR_TOO_LARGE,
         Error::ColoursUnreachable { .. } => SQUINT_ERR_COLOURS,
         Error::ReadOnlyFormat { .. } => SQUINT_ERR_READ_ONLY,
