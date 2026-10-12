@@ -2,6 +2,8 @@
 
 A macOS image optimizer that compresses to a perceptual target instead of a fixed quality number.
 
+https://github.com/user-attachments/assets/e6c185ab-6be8-4cdf-8642-b2fa1c214af0
+
 Most optimizers ask you to choose a quality setting once and then apply it to every image forever. A flat interface screenshot and a noisy photograph do not tolerate the same setting, so one number wastes bytes on the first and visibly damages the second. Squint measures perceived difference per image and finds the smallest file that stays above the threshold you set.
 
 ## Status
