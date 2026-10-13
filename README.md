@@ -259,4 +259,6 @@ Formats are tracked separately for reading and writing. Squint reads anything a 
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+GPL-3.0-or-later. See [LICENSE](LICENSE). The copyright holders add one permission under section 7, for conveying Squint through an application store such as the Mac App Store; [LICENSE-APP-STORE.md](LICENSE-APP-STORE.md) states it and its conditions. Contributions are accepted under both.
+
+What Squint does and does not send over the network is in [PRIVACY.md](PRIVACY.md).
