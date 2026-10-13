@@ -82,8 +82,10 @@ if ! xcrun notarytool submit "$SUBMIT" --keychain-profile "$PROFILE" $KC --wait 
     cat "$SUBMIT.json" >&2 || true
     exit 1
 fi
-STATUS="$(/opt/homebrew/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("status",""))' "$SUBMIT.json")"
-ID="$(/opt/homebrew/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("id",""))' "$SUBMIT.json")"
+# plutil reads JSON and ships with macOS. A missing key prints nothing, which
+# the status check below treats as a refusal.
+STATUS="$(plutil -extract status raw -o - "$SUBMIT.json" 2>/dev/null || true)"
+ID="$(plutil -extract id raw -o - "$SUBMIT.json" 2>/dev/null || true)"
 echo "notarization $STATUS ($ID)"
 if [ "$STATUS" != "Accepted" ]; then
     # The log names each file the service objected to and why. Without it a
