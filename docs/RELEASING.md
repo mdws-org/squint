@@ -157,6 +157,31 @@ xcrun notarytool store-credentials squint-notary \
 
 `xcrun notarytool history --keychain-profile squint-notary --keychain "$KC"` confirms the profile works before a release depends on it.
 
+## The Mac App Store edition
+
+The `SquintStore` target is built, signed for the store and packaged by `tools/build-store.sh`. It shares the version settings with the edition on the releases page, so a release bumps both at once. Run it on svk after unlocking the signing keychain as described above:
+
+```
+KC=~/Library/Keychains/mdws-signing.keychain-db
+sh tools/build-store.sh ~/squint-signing/squint-app-store.provisionprofile \
+    <Apple Distribution SHA-1> <Mac Installer Distribution SHA-1> "$KC"
+```
+
+The script refuses a profile issued for another bundle identifier. It writes `app/build/Squint-<version>-appstore.pkg`. Over SSH, `productbuild` prints four `write: Permission denied` lines to stderr and still exits 0; the package it writes is complete, and `pkgutil --check-signature` and App Store Connect validation both pass on it. With `ASC_KEY_ID`, `ASC_ISSUER_ID` and `API_PRIVATE_KEYS_DIR=~/squint-signing` set, App Store Connect also validates the package. Uploading needs `UPLOAD=1` in addition, and it is a separate decision from building.
+
+The two certificates are issued against keys generated on svk in `~/squint-signing/` (`appstore-distribution.key`, `appstore-installer.key`) and escrowed in the Fleet vault as `squint App Store distribution private key` and `squint Mac Installer distribution private key`. Install each pair once, as for the Developer ID pair:
+
+```
+security import ~/squint-signing/appstore-distribution.key -k "$KC" -T /usr/bin/codesign -T /usr/bin/security
+security import ~/squint-signing/appstore-distribution.cer -k "$KC" -T /usr/bin/codesign
+security import ~/squint-signing/appstore-installer.key -k "$KC" -T /usr/bin/productbuild -T /usr/bin/security
+security import ~/squint-signing/appstore-installer.cer -k "$KC" -T /usr/bin/productbuild
+security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PW" "$KC"
+security find-identity -v "$KC"
+```
+
+Both identities must appear as valid. If either does not, import the Apple intermediate named in the certificate's issuer (`openssl x509 -in <cert> -inform der -noout -issuer`) from https://www.apple.com/certificateauthority/ into the same keychain.
+
 ## Keys
 
 The EdDSA key that signs updates lives in 1Password, in the Fleet vault, as
