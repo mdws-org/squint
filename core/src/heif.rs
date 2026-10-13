@@ -289,6 +289,16 @@ fn item_extents(bytes: &[u8], iloc: &Box) -> Option<Vec<(u32, Vec<(usize, usize)
         read(2, &mut at)?; // data reference index
         let base = read(base_size, &mut at)?;
         let extent_count = read(2, &mut at)? as usize;
+        // Each extent normally takes bytes of the box to describe, which bounds
+        // how many a file of a given size can declare. With every width zero
+        // it takes none, so the count is bounded only by its sixteen bits, and
+        // a few kilobytes of `iloc` could declare tens of millions of empty
+        // extents to walk and keep. More than one such extent says nothing
+        // about where the item is, so the box is refused.
+        let extent_width = offset_size + length_size + if version >= 1 { index_size } else { 0 };
+        if extent_width == 0 && extent_count > 1 {
+            return None;
+        }
 
         let mut extents = Vec::new();
         for _ in 0..extent_count {
@@ -693,6 +703,30 @@ mod tests {
         if let Some((out, _)) = strip_heif(&hostile) {
             assert_eq!(out.len(), hostile.len());
         }
+    }
+
+    #[test]
+    fn empty_extents_without_width_are_refused_rather_than_walked() {
+        // One item declaring two extents with every field width zero.
+        let mut iloc = Vec::new();
+        iloc.extend_from_slice(&be32(0));
+        iloc.extend_from_slice(b"iloc");
+        iloc.extend_from_slice(&[1, 0, 0, 0]);
+        iloc.extend_from_slice(&[0, 0]);
+        iloc.extend_from_slice(&1u16.to_be_bytes());
+        iloc.extend_from_slice(&1u16.to_be_bytes());
+        iloc.extend_from_slice(&0u16.to_be_bytes());
+        iloc.extend_from_slice(&0u16.to_be_bytes());
+        iloc.extend_from_slice(&2u16.to_be_bytes());
+        let n = iloc.len() as u32;
+        iloc[0..4].copy_from_slice(&be32(n));
+        let b = Box { at: 0, size: iloc.len(), header: 8 };
+        assert!(item_extents(&iloc, &b).is_none());
+
+        // A single zero-width extent is still read.
+        let last = iloc.len() - 1;
+        iloc[last] = 1;
+        assert_eq!(item_extents(&iloc, &b).map(|items| items.len()), Some(1));
     }
 
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
