@@ -480,7 +480,61 @@ fn strip_document_metadata(doc: &mut Document) -> usize {
         doc.objects.remove(&id);
     }
 
+    removed += strip_annotations_and_piece_info(doc);
+    refresh_file_id(doc);
     removed
+}
+
+/// Who wrote each comment and when, and an application's private editing
+/// data. An annotation's /T names its author and /M and /CreationDate date it;
+/// its /Contents is the comment itself and stays. /PieceInfo, on a page or the
+/// catalog, is where Illustrator, Acrobat and others keep their own data, and
+/// /LastModified dates the page.
+fn strip_annotations_and_piece_info(doc: &mut Document) -> usize {
+    let mut removed = 0;
+    let mut annotations: BTreeSet<ObjectId> = BTreeSet::new();
+    for object in doc.objects.values_mut() {
+        let dict = match object {
+            Object::Dictionary(dict) => dict,
+            Object::Stream(stream) => &mut stream.dict,
+            _ => continue,
+        };
+        for key in [&b"PieceInfo"[..], b"LastModified"] {
+            removed += usize::from(dict.remove(key).is_some());
+        }
+        if let Ok(Object::Array(annots)) = dict.get(b"Annots") {
+            annotations.extend(annots.iter().filter_map(|a| a.as_reference().ok()));
+        }
+    }
+    for id in annotations {
+        if let Ok(annot) = doc.get_dictionary_mut(id) {
+            for key in [&b"T"[..], b"M", b"CreationDate"] {
+                removed += usize::from(annot.remove(key).is_some());
+            }
+        }
+    }
+    removed
+}
+
+/// Replace the trailer's /ID, which ties this file to every other copy and
+/// version of the same document, with a fresh one. An encrypted document's
+/// keys are derived from its /ID, so it is left alone there. Not counted as
+/// metadata removed: nearly every PDF has one, and counting it would make a
+/// second Strip report something removed every time.
+fn refresh_file_id(doc: &mut Document) {
+    if doc.trailer.has(b"Encrypt") || !doc.trailer.has(b"ID") {
+        return;
+    }
+    use std::hash::{BuildHasher, Hasher};
+    let random = std::collections::hash_map::RandomState::new();
+    let mut id = Vec::with_capacity(16);
+    for half in 0..2u8 {
+        let mut h = random.build_hasher();
+        h.write_u8(half);
+        id.extend_from_slice(&h.finish().to_le_bytes());
+    }
+    let fresh = Object::String(id, lopdf::StringFormat::Hexadecimal);
+    doc.trailer.set("ID", Object::Array(vec![fresh.clone(), fresh]));
 }
 
 /// Remove EXIF, XMP and the other application segments from the JPEG pictures
@@ -627,6 +681,55 @@ mod tests {
         let out = rewrite(&bytes, Mode::Strip, 0.0, 0.0, 0, None).unwrap_or_else(|e| panic!("{e}"));
         assert!(!out.data.windows(11).any(|w| w == b"Ben Meadows"), "the author survived");
         assert_eq!(out.metadata_removed, 1);
+    }
+
+    /// A reviewed PDF names each commenter in the annotation's /T and dates
+    /// every comment; an Illustrator or Acrobat export keeps its private
+    /// editing data in /PieceInfo; and /ID ties the file to every other copy
+    /// of the same document. Strip kept all of it.
+    #[test]
+    fn comment_authors_editing_data_and_the_file_id_go() {
+        let mut doc = Document::with_version("1.5");
+        let note = doc.add_object(dictionary! {
+            "Type" => name("Annot"), "Subtype" => name("Text"), "Rect" => rect(10, 10),
+            "T" => Object::string_literal("Ben Meadows"),
+            "M" => Object::string_literal("D:20261017120000-07'00'"),
+            "CreationDate" => Object::string_literal("D:20261016090000-07'00'"),
+            "Contents" => Object::string_literal("move this paragraph up"),
+        });
+        one_page(
+            &mut doc,
+            dictionary! {
+                "Annots" => Object::Array(vec![Object::Reference(note)]),
+                "PieceInfo" => dictionary! { "Illustrator" => dictionary! { "Private" => Object::string_literal("layer history") } },
+            },
+            dictionary! { "MediaBox" => rect(612, 792) },
+        );
+        let original_id = Object::string_literal("0123456789ABCDEF");
+        doc.trailer.set("ID", Object::Array(vec![original_id.clone(), original_id.clone()]));
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+
+        let out = rewrite(&bytes, Mode::Strip, 0.0, 0.0, 0, None).unwrap_or_else(|e| panic!("{e}"));
+        // Read back through the parser: the writer packs plain objects into
+        // compressed object streams, so a string missing from the raw bytes
+        // proves nothing.
+        let after = Document::load_mem(&out.data).unwrap();
+        let annot = after
+            .objects
+            .values()
+            .filter_map(|o| o.as_dict().ok())
+            .find(|d| d.get(b"Subtype").and_then(|s| s.as_name()).map(|n| n == b"Text").unwrap_or(false))
+            .expect("the annotation is still there");
+        for key in [&b"T"[..], b"M", b"CreationDate"] {
+            assert!(!annot.has(key), "/{} survived", String::from_utf8_lossy(key));
+        }
+        assert_eq!(annot.get(b"Contents").unwrap().as_str().unwrap(), b"move this paragraph up");
+        assert!(after.objects.values().filter_map(|o| o.as_dict().ok()).all(|d| !d.has(b"PieceInfo")));
+        match after.trailer.get(b"ID") {
+            Ok(Object::Array(id)) => assert!(id.len() == 2 && id[0] != original_id, "the /ID was not replaced"),
+            other => panic!("expected a fresh /ID, found {other:?}"),
+        }
     }
 
     /// Under a filter chain the stored bytes are not a JPEG until the outer
