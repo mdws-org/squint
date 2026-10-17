@@ -258,9 +258,11 @@ pub fn strip_tiff(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
             return None;
         }
         visited.push(directory);
+        // A directory with no readable entries is malformed. Stopping at it
+        // would leave every later page unwalked, so the file is refused.
         let entries = reader.entries(directory);
         if entries.is_empty() {
-            break;
+            return None;
         }
         let next = reader.u32(directory + 2 + entries.len() * 12)?;
 
@@ -484,6 +486,29 @@ mod tests {
             assert!(!contains(&out, leak), "survived: {:?}", String::from_utf8_lossy(leak));
         }
         assert_eq!(&out[pixels[0].clone()], &tiff[pixels[0].clone()], "the pixels moved");
+    }
+
+    /// A directory with no entries ended the walk without reading where the
+    /// next one was, so every page after it kept its tags and the file was
+    /// reported clean. Such a directory is malformed, and the file is refused.
+    #[test]
+    fn an_empty_directory_in_the_chain_is_refused_rather_than_ending_the_walk() {
+        let p1 = vec![(0x010F, 2, b"Camera One\0".to_vec())];
+        let p3 = vec![(0x013B, 2, b"Ben Meadows\0".to_vec())];
+        let (mut tiff, _) = tiff_pages(&[p1, p3]);
+        let dir1 = u32::from_le_bytes(tiff[4..8].try_into().unwrap()) as usize;
+        let count1 = u16::from_le_bytes(tiff[dir1..dir1 + 2].try_into().unwrap()) as usize;
+        let link1 = dir1 + 2 + count1 * 12;
+        let dir3 = u32::from_le_bytes(tiff[link1..link1 + 4].try_into().unwrap());
+        let empty = tiff.len() as u32;
+        tiff.extend_from_slice(&0u16.to_le_bytes());
+        tiff.extend_from_slice(&dir3.to_le_bytes());
+        tiff[link1..link1 + 4].copy_from_slice(&empty.to_le_bytes());
+
+        match strip_tiff(&tiff) {
+            None => {}
+            Some((out, _)) => assert!(!contains(&out, b"Ben Meadows"), "the page after it kept its artist"),
+        }
     }
 
     /// A scanned document has dozens of pages. The walk stopped after eight
