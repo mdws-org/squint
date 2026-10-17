@@ -31,7 +31,7 @@ fn type_size(kind: u16) -> usize {
 /// way up the picture goes, the other how to read its colour. So is a DNG's
 /// UniqueCameraModel, which the format requires for choosing the colour profile
 /// a raw file is developed with.
-const REMOVE: [u16; 24] = [
+const REMOVE: [u16; 32] = [
     0x010D, // DocumentName
     0x010E, // ImageDescription
     0x010F, // Make
@@ -52,10 +52,18 @@ const REMOVE: [u16; 24] = [
     0x9C9D, // XPAuthor
     0x9C9E, // XPKeywords
     0x9C9F, // XPSubject
+    0xA420, // ImageUniqueID, when a writer puts it here
+    0xA430, // CameraOwnerName, likewise
+    0xA431, // BodySerialNumber, likewise
+    0xA433, // LensMake, likewise
+    0xA434, // LensModel, likewise
+    0xA435, // LensSerialNumber, likewise
     0xC615, // LocalizedCameraModel (DNG)
     0xC62F, // CameraSerialNumber (DNG)
+    0xC634, // DNGPrivateData, which holds the camera's maker note (DNG)
     0xC65D, // RawDataUniqueID (DNG)
     0xC68B, // OriginalRawFileName (DNG)
+    0xC68C, // OriginalRawFileData, the whole original raw file (DNG)
 ];
 
 /// Directories walked, pages and their Exif, GPS and interoperability
@@ -449,6 +457,30 @@ mod tests {
         let (tiff, pixels) = tiff_pages(&[page]);
         let (out, _) = strip_tiff(&tiff).expect("a well formed tiff");
         for leak in [&b"Springfield"[..], b"B\0e\0n\0", b"h\0o\0m\0e\0", b"SN-48151623", b"IMG_4242"] {
+            assert!(!contains(&out, leak), "survived: {:?}", String::from_utf8_lossy(leak));
+        }
+        assert_eq!(&out[pixels[0].clone()], &tiff[pixels[0].clone()], "the pixels moved");
+    }
+
+    /// The Exif identity tags a writer may put in the first directory, and a
+    /// DNG's private data and embedded original raw, which carry the camera's
+    /// own metadata wholesale.
+    #[test]
+    fn camera_owner_serials_lens_and_embedded_originals_are_removed() {
+        let page = vec![
+            (0xA420, 2, b"UID-0011223344\0".to_vec()),          // ImageUniqueID
+            (0xA430, 2, b"Owner Ben M\0".to_vec()),             // CameraOwnerName
+            (0xA431, 2, b"BODY-48151623\0".to_vec()),           // BodySerialNumber
+            (0xA433, 2, b"LensMakerCo\0".to_vec()),             // LensMake
+            (0xA434, 2, b"LensModelX 50mm\0".to_vec()),         // LensModel
+            (0xA435, 2, b"LENS-99887766\0".to_vec()),           // LensSerialNumber
+            (0xC634, 1, b"Adobe\0MakN serial 4242".to_vec()),   // DNGPrivateData
+            (0xC68C, 7, b"original CR3 with GPS 33.44N".to_vec()), // OriginalRawFileData
+        ];
+        let (tiff, pixels) = tiff_pages(&[page]);
+        let (out, _) = strip_tiff(&tiff).expect("a well formed tiff");
+        for leak in [&b"UID-00112"[..], b"Owner Ben", b"BODY-4815", b"LensMakerCo", b"LensModelX",
+                     b"LENS-9988", b"serial 4242", b"GPS 33.44"] {
             assert!(!contains(&out, leak), "survived: {:?}", String::from_utf8_lossy(leak));
         }
         assert_eq!(&out[pixels[0].clone()], &tiff[pixels[0].clone()], "the pixels moved");
