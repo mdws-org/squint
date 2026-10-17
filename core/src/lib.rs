@@ -297,9 +297,13 @@ pub fn has_gain_map(bytes: &[u8]) -> bool {
 /// The general stripper removes every container it is not told to keep, which
 /// for a gain map would take its parameters with the camera identity. They go
 /// back on afterwards.
-fn strip_gain_map(map: &[u8]) -> Option<Vec<u8>> {
-    let bare = metadata::strip_jpeg(map)?;
-    gainmap::insert_segments(&bare, &gainmap::descriptive_segments(map))
+fn strip_gain_map(map: &[u8]) -> Result<Vec<u8>, Error> {
+    let kept = gainmap::descriptive_segments(map).ok_or_else(|| {
+        Error::Encode("the gain map's XMP holds more than its rendering parameters".into())
+    })?;
+    metadata::strip_jpeg(map)
+        .and_then(|bare| gainmap::insert_segments(&bare, &kept))
+        .ok_or_else(|| Error::Encode("could not strip a secondary image".into()))
 }
 
 /// One encode plus one measurement.
@@ -779,8 +783,7 @@ pub fn optimize_as(
                         .images
                         .iter()
                         .map(|img| strip_gain_map(img))
-                        .collect::<Option<Vec<_>>>()
-                        .ok_or_else(|| Error::Encode("could not strip a secondary image".into()))?;
+                        .collect::<Result<Vec<_>, _>>()?;
                     let hdr = if found.has_gain_map { Hdr::Preserved } else { Hdr::Absent };
                     match gainmap::attach(&bare, &cleaned, found.iso_segment.as_deref()) {
                         Some(joined) => (Some(joined), hdr),
@@ -1449,6 +1452,78 @@ mod tests {
         let mut runs_past_the_end = jpeg.clone();
         runs_past_the_end[4..6].copy_from_slice(&0xFF00_u16.to_be_bytes());
         assert!(metadata::strip_jpeg(&runs_past_the_end).is_none());
+    }
+
+    /// A primary and its secondaries joined by a Multi Picture Format index,
+    /// each the smallest JPEG the stripper walks, one secondary per XMP packet
+    /// given. The primary carries EXIF, so Strip always has something to remove.
+    fn joined_with(secondary_xmp: &[&str]) -> Vec<u8> {
+        let tiny = |segs: &[(u8, Vec<u8>)]| {
+            let bare = vec![0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x02, 0x11, 0x22, 0xFF, 0xD9];
+            gainmap::insert_segments(&bare, segs).unwrap()
+        };
+        let xmp = |packet: &str| {
+            (0xE1, [&b"http://ns.adobe.com/xap/1.0/\0"[..], packet.as_bytes()].concat())
+        };
+        let primary = tiny(&[(0xE1, b"Exif\0\0camera serial".to_vec())]);
+        let secondaries: Vec<Vec<u8>> = secondary_xmp.iter().map(|p| tiny(&[xmp(p)])).collect();
+        gainmap::attach(&primary, &secondaries, None).unwrap()
+    }
+
+    fn holds(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn strip_keeps_a_gain_maps_parameters_from_either_vendor() {
+        for packet in [heif::tests::IPHONE_JPEG_GAIN_MAP_XMP, heif::tests::ULTRA_HDR_GAIN_MAP_XMP] {
+            let out = optimize(&joined_with(&[packet]), Mode::Strip, 0.0, 0.0, None, 0, None)
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(out.hdr, Hdr::Preserved);
+            assert!(holds(&out.data, packet.as_bytes()), "the map lost its parameters");
+            assert!(!holds(&out.data, b"camera serial"));
+        }
+    }
+
+    /// A gain map is unusable without its parameters, so one whose XMP holds
+    /// anything more is refused rather than written back flat.
+    #[test]
+    fn strip_refuses_a_gain_map_whose_xmp_says_where_it_was_taken() {
+        let located = heif::tests::IPHONE_JPEG_GAIN_MAP_XMP.replace(
+            "xmlns:apdi=",
+            "xmlns:exif=\"http://ns.adobe.com/exif/1.0/\" exif:GPSLatitude=\"51,30.4N\" xmlns:apdi=",
+        );
+        match optimize(&joined_with(&[&located]), Mode::Strip, 0.0, 0.0, None, 0, None) {
+            Err(Error::Encode(m)) => assert!(m.contains("gain map"), "{m}"),
+            Err(e) => panic!("refused for the wrong reason: {e}"),
+            Ok(out) => panic!(
+                "written, with the location {}",
+                if holds(&out.data, b"GPSLatitude") { "kept" } else { "removed" }
+            ),
+        }
+    }
+
+    /// A secondary whose bytes happen to match a gain map's markers but whose
+    /// XMP names no rendering parameters at all is not refused: there is
+    /// nothing in that packet a renderer needs, so it goes.
+    #[test]
+    fn strip_drops_xmp_that_holds_no_rendering_parameters_even_on_a_likely_gain_map() {
+        let container = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:GContainer="http://ns.google.com/photos/1.0/container/" GContainer:Directory="depth map at home"/></rdf:RDF></x:xmpmeta>"#;
+        let out = optimize(&joined_with(&[container]), Mode::Strip, 0.0, 0.0, None, 0, None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(!holds(&out.data, b"depth map at home"), "the packet survived");
+        assert_eq!(gainmap::extract(&out.data).map(|found| found.images.len()), Some(1));
+    }
+
+    /// Any other secondary has no use for XMP, so it loses the packet and
+    /// keeps its place in the file.
+    #[test]
+    fn strip_removes_the_xmp_of_a_secondary_that_is_not_a_gain_map() {
+        let located = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:exif="http://ns.adobe.com/exif/1.0/" exif:GPSLatitude="51,30.4N"/></rdf:RDF></x:xmpmeta>"#;
+        let out = optimize(&joined_with(&[located]), Mode::Strip, 0.0, 0.0, None, 0, None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(!holds(&out.data, b"GPSLatitude"), "the secondary kept its location");
+        assert_eq!(gainmap::extract(&out.data).map(|found| found.images.len()), Some(1));
     }
 
     #[test]
