@@ -1457,17 +1457,6 @@ mod tests {
         assert!(metadata::strip_jpeg(&jpeg).is_none());
     }
 
-    /// The profile is kept in APP2, where it is read from, and nowhere else.
-    #[test]
-    fn a_profile_tag_on_some_other_segment_does_not_survive() {
-        // APP13 carrying the profile tag: length covers the twelve payload bytes.
-        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xED, 0x00, 0x0E];
-        jpeg.extend_from_slice(b"ICC_PROFILE\0");
-        jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x11, 0x22, 0xFF, 0xD9]);
-        let out = metadata::strip_jpeg(&jpeg).expect("walks cleanly");
-        assert!(!out.windows(11).any(|w| w == b"ICC_PROFILE"));
-    }
-
     /// One marker segment: FF, the marker, a big-endian length, the payload.
     fn segment(marker: u8, payload: &[u8]) -> Vec<u8> {
         let mut s = vec![0xFF, marker];
@@ -1549,6 +1538,17 @@ mod tests {
         expected.extend_from_slice(&[0xFF, 0xD9]);
 
         assert_eq!(metadata::strip_jpeg(&jpeg).expect("walks cleanly"), expected);
+    }
+
+    /// The profile is kept in APP2, where it is read from, and nowhere else.
+    #[test]
+    fn a_profile_tag_on_some_other_segment_does_not_survive() {
+        // APP13 carrying the profile tag: length covers the twelve payload bytes.
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xED, 0x00, 0x0E];
+        jpeg.extend_from_slice(b"ICC_PROFILE\0");
+        jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x11, 0x22, 0xFF, 0xD9]);
+        let out = metadata::strip_jpeg(&jpeg).expect("walks cleanly");
+        assert!(!out.windows(11).any(|w| w == b"ICC_PROFILE"));
     }
 
     #[test]
