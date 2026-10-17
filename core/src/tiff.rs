@@ -185,7 +185,7 @@ impl<'a> Reader<'a> {
 /// this walk has no protection, so stripping it could zero its pixels.
 fn protected(reader: &Reader, first: usize) -> Option<Vec<(usize, usize)>> {
     let mut out = Vec::new();
-    let mut seen = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     // Each directory with whether it is a page. A page's kept entries point
     // at data the file still needs; an Exif, GPS or interoperability directory
     // is removed whole, so nothing in it is kept.
@@ -198,7 +198,7 @@ fn protected(reader: &Reader, first: usize) -> Option<Vec<(usize, usize)>> {
         if seen.len() >= MAX_DIRECTORIES {
             return None;
         }
-        seen.push(at);
+        seen.insert(at);
         let entries = reader.entries(at);
 
         for (offsets_tag, lengths_tag) in PIXEL_RANGES {
@@ -235,7 +235,22 @@ fn protected(reader: &Reader, first: usize) -> Option<Vec<(usize, usize)>> {
             queue.push((next as usize, is_page));
         }
     }
-    Some(out)
+    Some(merged(out))
+}
+
+/// Ranges sorted by start with overlapping and touching ones joined, so that
+/// a lookup is a binary search rather than a scan of every range.
+fn merged(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges.retain(|(s, e)| s < e);
+    ranges.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (s, e) in ranges {
+        match out.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => out.push((s, e)),
+        }
+    }
+    out
 }
 
 /// Remove a TIFF's identifying tags, leaving its pixels exactly where they are.
@@ -253,7 +268,7 @@ pub fn strip_tiff(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
     let mut out = bytes.to_vec();
     let mut destroyed = Destroyed::default();
     let mut directory = first;
-    let mut visited: Vec<usize> = Vec::new();
+    let mut visited = std::collections::HashSet::new();
 
     // Every page is walked. Stopping early left the later pages' tags in place
     // while the file was reported clean, so running out of bound refuses.
@@ -261,7 +276,7 @@ pub fn strip_tiff(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
         if visited.len() >= MAX_DIRECTORIES {
             return None;
         }
-        visited.push(directory);
+        visited.insert(directory);
         let entries = reader.entries(directory);
         if entries.is_empty() {
             break;
@@ -305,6 +320,9 @@ pub fn strip_tiff(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
         out[directory + 2..directory + 2 + kept.len()].copy_from_slice(&kept);
         let tail = directory + 2 + kept.len();
         out[tail..tail + 4].copy_from_slice(&order32(next));
+        // The slots the dropped entries leave after the new end still hold
+        // their bytes, and a value of four bytes or fewer lives in its slot.
+        destroyed.wipe(&mut out, tail + 4, directory + 2 + entries.len() * 12 + 4);
 
         directory = next as usize;
     }
@@ -318,7 +336,8 @@ pub fn strip_tiff(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
 /// points at, so summing declared sizes reports more bytes than the file has.
 #[derive(Default)]
 struct Destroyed {
-    ranges: Vec<(usize, usize)>,
+    /// Start to end, disjoint.
+    ranges: std::collections::BTreeMap<usize, usize>,
     bytes: usize,
 }
 
@@ -326,16 +345,15 @@ impl Destroyed {
     /// Zero `start..end` except where it overlaps a protected range. A tag's
     /// declared size can reach into the pixels or a kept array; the part that
     /// is metadata goes, the rest stays.
+    /// `keep` is sorted and disjoint, as `merged` leaves it.
     fn wipe_outside(&mut self, out: &mut [u8], keep: &[(usize, usize)], start: usize, end: usize) {
-        let mut cuts: Vec<(usize, usize)> =
-            keep.iter().filter(|(ks, ke)| *ks < end && start < *ke).map(|&(ks, ke)| (ks.max(start), ke.min(end))).collect();
-        cuts.sort_unstable();
         let mut cursor = start;
-        for (cs, ce) in cuts {
-            if cursor < cs {
-                self.wipe(out, cursor, cs);
+        let first = keep.partition_point(|&(_, ke)| ke <= start);
+        for &(ks, ke) in keep[first..].iter().take_while(|&&(ks, _)| ks < end) {
+            if cursor < ks {
+                self.wipe(out, cursor, ks);
             }
-            cursor = cursor.max(ce);
+            cursor = cursor.max(ke);
         }
         if cursor < end {
             self.wipe(out, cursor, end);
@@ -349,18 +367,22 @@ impl Destroyed {
         out[start..end].fill(0);
         let (mut s, mut e) = (start, end);
         let mut already = 0;
-        let mut merged = Vec::with_capacity(self.ranges.len() + 1);
-        for &(rs, re) in &self.ranges {
-            if re <= start || end <= rs {
-                merged.push((rs, re));
-            } else {
-                already += re.min(end) - rs.max(start);
-                s = s.min(rs);
-                e = e.max(re);
-            }
+        // Ranges that overlap this one: the last starting before it, and every
+        // one starting inside it. Each is folded in and removed.
+        let overlapping: Vec<(usize, usize)> = self
+            .ranges
+            .range(..end)
+            .rev()
+            .take_while(|&(_, &re)| re > start)
+            .map(|(&rs, &re)| (rs, re))
+            .collect();
+        for (rs, re) in overlapping {
+            already += re.min(end) - rs.max(start);
+            s = s.min(rs);
+            e = e.max(re);
+            self.ranges.remove(&rs);
         }
-        merged.push((s, e));
-        self.ranges = merged;
+        self.ranges.insert(s, e);
         self.bytes += (end - start) - already;
     }
 }
@@ -554,6 +576,22 @@ mod tests {
         let (out, _) = strip_tiff(&tiff).expect("a well formed tiff");
         assert!(!contains(&out, b"Acme Camera"), "the maker survived");
         assert_eq!(&out[pixels_at..pixels_at + 32], &[0xAA; 32], "the pixels were touched");
+    }
+
+    /// A removed tag whose value fits in four bytes is held in the entry
+    /// itself. Rewriting the directory shorter left the old entries' bytes
+    /// after the new end, value included.
+    #[test]
+    fn a_removed_inline_value_does_not_survive_in_the_vacated_directory_slots() {
+        // Software, four bytes, held inline in the entry itself.
+        let inline = u32::from_le_bytes(*b"Ben\0");
+        let tiff = tiff_from(
+            &[&[0xAA; 16]],
+            &[(0x0111, 4, 1, 8), (0x0117, 4, 1, 16), (0x0131, 2, 4, inline)],
+        );
+        let (out, _) = strip_tiff(&tiff).expect("a well formed tiff");
+        assert!(!contains(&out, b"Ben\0"), "the value stayed in the old directory bytes");
+        assert_eq!(&out[8..24], &[0xAA; 16], "the pixels were touched");
     }
 
     /// An overrun that ends inside the strip-offsets array zeroed the array,
