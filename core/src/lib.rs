@@ -1468,6 +1468,45 @@ mod tests {
         assert!(!out.windows(11).any(|w| w == b"ICC_PROFILE"));
     }
 
+    /// Adobe's APP14 segment says how a four-component scan is to be read: CMYK
+    /// or YCCK, and whether the channels are inverted. It holds a version and
+    /// flags and nothing about the photographer. Dropping it with the other APPn
+    /// segments made a Photoshop CMYK JPEG render as a colour negative after a
+    /// Strip that promises identical pixels.
+    #[test]
+    fn the_adobe_colour_transform_segment_survives_a_strip() {
+        let adobe: &[u8] = b"Adobe\x00\x64\x00\x00\x00\x00\x02";
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xEE, 0x00, (adobe.len() + 2) as u8];
+        jpeg.extend_from_slice(adobe);
+        jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x11, 0x22, 0xFF, 0xD9]);
+        let out = metadata::strip_jpeg(&jpeg).expect("walks cleanly");
+        assert_eq!(out, jpeg, "the Adobe segment must be kept byte for byte");
+    }
+
+    /// Only Adobe's own segment is kept. Anything else in APP14 is dropped like
+    /// every other application segment.
+    #[test]
+    fn other_app14_payloads_are_still_removed() {
+        let other: &[u8] = b"Ducky\x00camera owner";
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xEE, 0x00, (other.len() + 2) as u8];
+        jpeg.extend_from_slice(other);
+        jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x11, 0x22, 0xFF, 0xD9]);
+        let out = metadata::strip_jpeg(&jpeg).expect("walks cleanly");
+        assert!(!out.windows(5).any(|w| w == b"Ducky"));
+    }
+
+    /// Adobe's segment is exactly twelve bytes. One that opens the same way
+    /// and carries more is not that segment and goes, whatever it carries.
+    #[test]
+    fn an_app14_that_only_starts_like_adobes_is_removed() {
+        let longer: &[u8] = b"Adobe\x00\x64\x00\x00\x00\x00\x02owner Ben Meadows";
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xEE, 0x00, (longer.len() + 2) as u8];
+        jpeg.extend_from_slice(longer);
+        jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x11, 0x22, 0xFF, 0xD9]);
+        let out = metadata::strip_jpeg(&jpeg).expect("walks cleanly");
+        assert!(!out.windows(10).any(|w| w == b"Ben Meadow"), "the extra bytes survived");
+    }
+
     #[test]
     fn a_png_re_encode_carries_the_colour_chunks_across() {
         let source = png_with_text();
