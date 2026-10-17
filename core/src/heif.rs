@@ -609,19 +609,35 @@ fn apple_headroom(item: &[u8]) -> Option<Headroom> {
     Some([rational(33)?, rational(48)?])
 }
 
-/// The namespaces whose properties an Apple auxiliary image is rendered by.
-/// An XMP packet holding nothing else is left in place.
-const RENDERING_NAMESPACES: [&str; 2] =
-    ["http://ns.apple.com/HDRGainMap/1.0/", "http://ns.apple.com/semanticSegmentationMatte/1.0/"];
+/// The namespaces whose properties a gain map or an Apple auxiliary image is
+/// rendered by. An XMP packet holding nothing else is left in place.
+const RENDERING_NAMESPACES: [&str; 4] = [
+    "http://ns.apple.com/HDRGainMap/1.0/",
+    "http://ns.apple.com/semanticSegmentationMatte/1.0/",
+    // Apple's description of an auxiliary image: what kind it is and how its
+    // pixels are stored.
+    "http://ns.apple.com/pixeldatainfo/1.0/",
+    // Google's Ultra HDR gain map parameters.
+    "http://ns.adobe.com/hdr-gain-map/1.0/",
+];
+
+/// The only values besides numbers that a rendering property may hold.
+const RENDERING_WORDS: [&str; 3] = ["True", "False", "urn:com:apple:photo:2020:aux:hdrgainmap"];
+
+/// Whether a property value, or the text between two tags, is a number, one
+/// of `RENDERING_WORDS`, or nothing at all.
+fn is_rendering_value(value: &str) -> bool {
+    let value = value.trim();
+    value.chars().all(|c| c.is_ascii_digit() || ".+-eE".contains(c)) || RENDERING_WORDS.contains(&value)
+}
 
 /// Whether an XMP packet holds nothing but rendering properties.
 ///
 /// Fails closed: anything not recognised, including a namespace not in
 /// `RENDERING_NAMESPACES`, a DOCTYPE or comment, a non-empty `rdf:about`, or a
-/// property value that is not a number, makes the packet a candidate for
-/// removal. A packet kept by mistake can leak; one removed by mistake costs a
-/// version number the renderer can do without.
-fn xmp_is_rendering_only(packet: &[u8]) -> bool {
+/// property value that is neither a number nor one of `RENDERING_WORDS`, makes
+/// the packet a candidate for removal. A packet kept by mistake can leak.
+pub(crate) fn xmp_is_rendering_only(packet: &[u8]) -> bool {
     let end = packet.iter().rposition(|b| *b != 0 && !b.is_ascii_whitespace()).map_or(0, |e| e + 1);
     let Ok(text) = std::str::from_utf8(&packet[..end]) else {
         return false;
@@ -633,8 +649,7 @@ fn xmp_is_rendering_only(packet: &[u8]) -> bool {
     let mut found_property = false;
     let mut rest = text;
     while let Some(open) = rest.find('<') {
-        let between = &rest[..open];
-        if !between.trim().chars().all(|c| c.is_ascii_digit() || ".+-eE".contains(c)) {
+        if !is_rendering_value(&rest[..open]) {
             return false;
         }
         let Some(close) = rest[open..].find('>') else {
@@ -649,29 +664,45 @@ fn xmp_is_rendering_only(packet: &[u8]) -> bool {
             continue;
         }
         let tag = tag.trim_start_matches('/').trim_end_matches('/');
-        let mut parts = tag.split_whitespace();
-        let Some(name) = parts.next() else {
+        let Some(name) = tag.split_whitespace().next() else {
             return false;
         };
-        for attribute in tag[name.len()..].split('"').collect::<Vec<_>>().chunks(2) {
-            let key = attribute[0].trim().trim_end_matches('=').trim();
-            if key.is_empty() {
-                continue;
-            }
-            let value = attribute.get(1).copied().unwrap_or("");
-            match key.split_once(':') {
-                Some(("xmlns", prefix)) => match value {
+        let attributes: Vec<(&str, &str)> = tag[name.len()..]
+            .split('"')
+            .collect::<Vec<_>>()
+            .chunks(2)
+            .map(|pair| (pair[0].trim().trim_end_matches('=').trim(), pair.get(1).copied().unwrap_or("")))
+            .filter(|(key, _)| !key.is_empty())
+            .collect();
+        // Declarations first, because a property can be written before the
+        // namespace it belongs to is declared on the same tag.
+        for (key, value) in &attributes {
+            if let Some(prefix) = key.strip_prefix("xmlns:") {
+                match *value {
                     "adobe:ns:meta/" | "http://www.w3.org/1999/02/22-rdf-syntax-ns#" => {}
                     v if RENDERING_NAMESPACES.contains(&v) => allowed_prefixes.push(prefix),
                     _ => return false,
-                },
-                Some(("x", "xmptk")) => {}
+                }
+            }
+        }
+        for (key, value) in &attributes {
+            match key.split_once(':') {
+                Some(("xmlns", _)) | Some(("x", "xmptk")) => {}
                 Some(("rdf", "about")) if value.is_empty() => {}
+                // Ultra HDR writes its parameters as attributes of the description.
+                Some((prefix, _))
+                    if name == "rdf:Description"
+                        && allowed_prefixes[2..].contains(&prefix)
+                        && is_rendering_value(value) =>
+                {
+                    found_property = true
+                }
                 _ => return false,
             }
         }
         match name.split_once(':') {
-            Some(("x", "xmpmeta")) | Some(("rdf", "RDF")) | Some(("rdf", "Description")) => {}
+            Some(("x", "xmpmeta"))
+            | Some(("rdf", "RDF" | "Description" | "Seq" | "li")) => {}
             Some((prefix, _)) if allowed_prefixes[2..].contains(&prefix) => found_property = true,
             _ => return false,
         }
@@ -1068,6 +1099,43 @@ pub(crate) mod tests {
       </rdf:Description>
    </rdf:RDF>
 </x:xmpmeta>"#;
+    /// The XMP an iPhone writes into the gain map of a JPEG, verbatim from a
+    /// camera file. Beside the HEIF packet it names the auxiliary image's kind
+    /// and pixel format, and the kind is a word rather than a number.
+    pub(crate) const IPHONE_JPEG_GAIN_MAP_XMP: &str = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="XMP Core 6.0.0">
+   <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+      <rdf:Description rdf:about=""
+            xmlns:apdi="http://ns.apple.com/pixeldatainfo/1.0/"
+            xmlns:HDRGainMap="http://ns.apple.com/HDRGainMap/1.0/">
+         <apdi:AuxiliaryImageType>urn:com:apple:photo:2020:aux:hdrgainmap</apdi:AuxiliaryImageType>
+         <apdi:NativeFormat>1278226488</apdi:NativeFormat>
+         <apdi:StoredFormat>1278226488</apdi:StoredFormat>
+         <HDRGainMap:HDRGainMapVersion>131072</HDRGainMap:HDRGainMapVersion>
+         <HDRGainMap:HDRGainMapHeadroom>2.839412</HDRGainMap:HDRGainMapHeadroom>
+      </rdf:Description>
+   </rdf:RDF>
+</x:xmpmeta>"#;
+    /// The XMP of an Ultra HDR gain map, verbatim from a file. Google writes
+    /// its parameters as attributes of the description, not as elements.
+    pub(crate) const ULTRA_HDR_GAIN_MAP_XMP: &str = r#"<x:xmpmeta
+  xmlns:x="adobe:ns:meta/"
+  x:xmptk="Adobe XMP Core 5.1.2">
+  <rdf:RDF
+    xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description
+      xmlns:hdrgm="http://ns.adobe.com/hdr-gain-map/1.0/"
+      hdrgm:Version="1.0"
+      hdrgm:GainMapMin="0"
+      hdrgm:GainMapMax="15.9993"
+      hdrgm:Gamma="1"
+      hdrgm:OffsetSDR="0.015625"
+      hdrgm:OffsetHDR="0.015625"
+      hdrgm:HDRCapacityMin="0"
+      hdrgm:HDRCapacityMax="15.9993"
+      hdrgm:BaseRenditionIsHDR="False"/>
+  </rdf:RDF>
+</x:xmpmeta>
+"#;
 
     #[test]
     fn rendering_xmp_is_kept_and_anything_else_is_not() {
@@ -1094,6 +1162,45 @@ pub(crate) mod tests {
         }
         assert!(!xmp_is_rendering_only(b""));
         assert!(!xmp_is_rendering_only(&[0xFF, 0xFE, 0x3C]));
+    }
+
+    /// The gain maps inside JPEGs, from both vendors, are rendering parameters
+    /// too, and the same packets with anything personal added are not.
+    #[test]
+    fn jpeg_gain_map_xmp_is_kept_and_anything_added_to_it_is_not() {
+        assert!(xmp_is_rendering_only(IPHONE_JPEG_GAIN_MAP_XMP.as_bytes()));
+        assert!(xmp_is_rendering_only(ULTRA_HDR_GAIN_MAP_XMP.as_bytes()));
+        // Ultra HDR writes one value per colour channel as a sequence.
+        let per_channel = ULTRA_HDR_GAIN_MAP_XMP.replace(
+            "/>\n  </rdf:RDF>",
+            "><hdrgm:GainMapMax><rdf:Seq><rdf:li>15.9</rdf:li><rdf:li>14.2</rdf:li>\
+             <rdf:li>13.0</rdf:li></rdf:Seq></hdrgm:GainMapMax></rdf:Description>\n  </rdf:RDF>",
+        );
+        assert!(xmp_is_rendering_only(per_channel.as_bytes()), "{per_channel}");
+
+        let apple = IPHONE_JPEG_GAIN_MAP_XMP;
+        let google = ULTRA_HDR_GAIN_MAP_XMP;
+        let refused = [
+            // A different word where the auxiliary image's kind goes.
+            apple.replace("aux:hdrgainmap<", "aux:hdrgainmap Ben's iPhone<"),
+            // Location written as an attribute, in its own namespace.
+            google.replace(
+                "hdrgm:Version=\"1.0\"",
+                "xmlns:exif=\"http://ns.adobe.com/exif/1.0/\" exif:GPSLatitude=\"51.5\" hdrgm:Version=\"1.0\"",
+            ),
+            // A prefix nobody declared.
+            google.replace("hdrgm:Gamma=", "exif:Gamma="),
+            // Words where numbers go, as an attribute and inside a sequence.
+            google.replace("hdrgm:Gamma=\"1\"", "hdrgm:Gamma=\"Ben\""),
+            per_channel.replace("<rdf:li>14.2</rdf:li>", "<rdf:li>Ben</rdf:li>"),
+            // An attribute without a namespace at all.
+            google.replace("hdrgm:Gamma=", "Gamma="),
+            // A rendering attribute somewhere other than the description.
+            per_channel.replace("<rdf:li>15.9", "<rdf:li hdrgm:Gamma=\"1\">15.9"),
+        ];
+        for packet in &refused {
+            assert!(!xmp_is_rendering_only(packet.as_bytes()), "kept: {packet}");
+        }
     }
 
     #[test]
