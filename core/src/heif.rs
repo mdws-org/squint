@@ -491,16 +491,27 @@ fn free_metadata_boxes(bytes: &[u8], out: &mut [u8]) -> usize {
     freed
 }
 
-/// `udta` and `meta` in a movie box and in each `trak` inside it.
+/// `udta` and `meta` in a movie box and in each `trak` inside it, and the
+/// creation and modification times in the movie, track and media headers.
 fn free_movie_metadata(bytes: &[u8], out: &mut [u8], moov: std::ops::Range<usize>) -> usize {
     let mut freed = 0;
     for (kind, b) in boxes(bytes, moov) {
         match kind {
             b"udta" | b"meta" => freed += free_in_place(out, &b),
+            b"mvhd" => freed += zero_header_times(bytes, out, &b),
             b"trak" => {
                 for (inner, t) in boxes(bytes, b.body()) {
-                    if inner == b"udta" || inner == b"meta" {
-                        freed += free_in_place(out, &t);
+                    match inner {
+                        b"udta" | b"meta" => freed += free_in_place(out, &t),
+                        b"tkhd" => freed += zero_header_times(bytes, out, &t),
+                        b"mdia" => {
+                            for (media, m) in boxes(bytes, t.body()) {
+                                if media == b"mdhd" {
+                                    freed += zero_header_times(bytes, out, &m);
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -508,6 +519,24 @@ fn free_movie_metadata(bytes: &[u8], out: &mut [u8], moov: std::ops::Range<usize
         }
     }
     freed
+}
+
+/// Zero the creation and modification times that open an `mvhd`, `tkhd` or
+/// `mdhd` body after its version and flags: two 32-bit counts in version 0,
+/// two 64-bit counts in version 1. Returns how many bytes were not zero.
+fn zero_header_times(bytes: &[u8], out: &mut [u8], b: &Box) -> usize {
+    let body = b.body();
+    let Some(&version) = bytes.get(body.start) else {
+        return 0;
+    };
+    let width = if version == 1 { 16 } else { 8 };
+    let times = body.start + 4..body.start + 4 + width;
+    if times.end > body.end {
+        return 0;
+    }
+    let changed = bytes[times.clone()].iter().filter(|b| **b != 0).count();
+    out[times].fill(0);
+    changed
 }
 
 /// Rename a box to `free` and zero its body; returns the bytes zeroed.
@@ -921,6 +950,33 @@ pub(crate) mod tests {
         assert!(!contains(&out, b"+33.4484"), "the location survived");
         assert!(!contains(&out, b"Ben Meadows"), "the copyright survived");
         assert!(contains(&out, b"mvhd") && contains(&out, b"tkhd"), "the movie structure must stay");
+    }
+
+    /// A sequence's movie, track and media headers each record when it was
+    /// created and last modified: the moment the burst was taken. Version 0
+    /// holds them as two 32-bit counts, version 1 as two 64-bit counts.
+    #[test]
+    fn a_sequences_creation_and_modification_times_are_zeroed() {
+        let (mut heif, _) = heif_with_exif();
+        let times32 = [0xE0, 0, 0, 1, 0xE0, 0, 0, 2];
+        let times64 = [0, 0, 0, 0, 0xE0, 0, 0, 3, 0, 0, 0, 0, 0xE0, 0, 0, 4];
+        let timescale = 600u32.to_be_bytes();
+        let mvhd = bmff_box(b"mvhd", &[&[1, 0, 0, 0][..], &times64, &timescale, &[0; 84]].concat());
+        let tkhd = bmff_box(b"tkhd", &[&[0, 0, 0, 3][..], &times32, &[0; 72]].concat());
+        let mdhd = bmff_box(b"mdhd", &[&[0, 0, 0, 0][..], &times32, &timescale, &[0; 8]].concat());
+        let trak = bmff_box(b"trak", &[tkhd, bmff_box(b"mdia", &mdhd)].concat());
+        heif.extend(bmff_box(b"moov", &[mvhd, trak].concat()));
+
+        let (out, wiped) = strip_heif(&heif).expect("a well formed heif");
+        assert_eq!(out.len(), heif.len(), "nothing moves");
+        for stamp in [&[0xE0, 0, 0, 1][..], &[0xE0, 0, 0, 2], &[0xE0, 0, 0, 3], &[0xE0, 0, 0, 4]] {
+            assert!(!contains(&out, stamp), "a timestamp survived: {stamp:02X?}");
+        }
+        assert!(contains(&out, b"mvhd") && contains(&out, b"tkhd") && contains(&out, b"mdhd"));
+        assert_eq!(out.windows(4).filter(|w| *w == timescale).count(), 2, "the timescales went too");
+        assert!(wiped > 0);
+        let (twice, _) = strip_heif(&out).expect("still well formed");
+        assert_eq!(twice, out, "a second strip changed the file again");
     }
 
     #[test]
