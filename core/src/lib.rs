@@ -126,7 +126,7 @@ impl std::fmt::Display for Error {
             Error::NothingToRemove => write!(f, "nothing to remove; the file was not changed"),
             Error::StripWouldGrow { best_bytes, original_bytes } => write!(
                 f,
-                "metadata was found, but the file without it would be {best_bytes} bytes, larger than the original {original_bytes}; the original was kept with its metadata"
+                "metadata was found, but the file without it would be {best_bytes} bytes, no smaller than the original {original_bytes}; the original was kept with its metadata"
             ),
             Error::TooLarge { width, height } => write!(
                 f,
@@ -1550,8 +1550,11 @@ mod tests {
         let err_strip_grew = Error::StripWouldGrow { best_bytes: 1210, original_bytes: 1180 };
         assert_eq!(
             err_strip_grew.to_string(),
-            "metadata was found, but the file without it would be 1210 bytes, larger than the original 1180; the original was kept with its metadata"
+            "metadata was found, but the file without it would be 1210 bytes, no smaller than the original 1180; the original was kept with its metadata"
         );
+        // Raised at equal size too, where "larger" would be false.
+        let same = Error::StripWouldGrow { best_bytes: 1180, original_bytes: 1180 }.to_string();
+        assert!(!same.contains("larger"), "{same}");
 
         let err_too_large = Error::TooLarge { width: 60000, height: 60000 };
         assert_eq!(
