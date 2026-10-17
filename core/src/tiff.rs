@@ -28,8 +28,10 @@ fn type_size(kind: u16) -> usize {
 /// Tags naming a person, a place, a device or a moment.
 ///
 /// Orientation and the colour profile are deliberately absent: one decides which
-/// way up the picture goes, the other how to read its colour.
-const REMOVE: [u16; 11] = [
+/// way up the picture goes, the other how to read its colour. So is a DNG's
+/// UniqueCameraModel, which the format requires for choosing the colour profile
+/// a raw file is developed with.
+const REMOVE: [u16; 24] = [
     0x010D, // DocumentName
     0x010E, // ImageDescription
     0x010F, // Make
@@ -41,7 +43,26 @@ const REMOVE: [u16; 11] = [
     0x8298, // Copyright
     0x02BC, // XMP
     0x83BB, // IPTC
+    0x8649, // Photoshop image resources, which carry IPTC
+    0x9003, // DateTimeOriginal, when a writer puts it here
+    0x9286, // UserComment, likewise
+    0x927C, // MakerNote, likewise
+    0x9C9B, // XPTitle
+    0x9C9C, // XPComment
+    0x9C9D, // XPAuthor
+    0x9C9E, // XPKeywords
+    0x9C9F, // XPSubject
+    0xC615, // LocalizedCameraModel (DNG)
+    0xC62F, // CameraSerialNumber (DNG)
+    0xC65D, // RawDataUniqueID (DNG)
+    0xC68B, // OriginalRawFileName (DNG)
 ];
+
+/// Directories walked, pages and their Exif, GPS and interoperability
+/// directories together, before a file is refused rather than half stripped.
+/// A long scan runs to a few hundred pages; the bound is against a chain built
+/// to waste time.
+const MAX_DIRECTORIES: usize = 4096;
 
 /// Tags whose value is the offset of another directory.
 const SUB_IFDS: [u16; 3] = [
@@ -151,14 +172,20 @@ impl<'a> Reader<'a> {
 /// real photograph the Exif directory sits at offset 8 and one of its entries
 /// reaches past 2606, which is where the first image strip begins; zeroing on
 /// the strength of the declaration alone destroyed the picture.
-fn protected(reader: &Reader, first: usize) -> Vec<(usize, usize)> {
+///
+/// `None` when the directories run past `MAX_DIRECTORIES`: a page left out of
+/// this walk has no protection, so stripping it could zero its pixels.
+fn protected(reader: &Reader, first: usize) -> Option<Vec<(usize, usize)>> {
     let mut out = Vec::new();
     let mut seen = Vec::new();
     let mut queue = vec![first];
 
     while let Some(at) = queue.pop() {
-        if at == 0 || seen.contains(&at) || seen.len() > 8 {
+        if at == 0 || seen.contains(&at) {
             continue;
+        }
+        if seen.len() >= MAX_DIRECTORIES {
+            return None;
         }
         seen.push(at);
         let entries = reader.entries(at);
@@ -193,7 +220,7 @@ fn protected(reader: &Reader, first: usize) -> Vec<(usize, usize)> {
             queue.push(next as usize);
         }
     }
-    out
+    Some(out)
 }
 
 /// Remove a TIFF's identifying tags, leaving its pixels exactly where they are.
@@ -206,7 +233,7 @@ pub fn strip_tiff(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
     }
     let reader = Reader { bytes, big_endian: bytes[0] == b'M' };
     let first = reader.u32(4)? as usize;
-    let keep_clear = protected(&reader, first);
+    let keep_clear = protected(&reader, first)?;
     let safe = |start: usize, end: usize| {
         !keep_clear.iter().any(|(ps, pe)| start < *pe && *ps < end)
     };
@@ -216,7 +243,12 @@ pub fn strip_tiff(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
     let mut directory = first;
     let mut visited: Vec<usize> = Vec::new();
 
-    while directory != 0 && visited.len() < 8 && !visited.contains(&directory) {
+    // Every page is walked. Stopping early left the later pages' tags in place
+    // while the file was reported clean, so running out of bound refuses.
+    while directory != 0 && !visited.contains(&directory) {
+        if visited.len() >= MAX_DIRECTORIES {
+            return None;
+        }
         visited.push(directory);
         let entries = reader.entries(directory);
         if entries.is_empty() {
@@ -366,6 +398,83 @@ mod tests {
 
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// A little-endian TIFF of chained pages. Each page has its own 16 bytes of
+    /// pixels and the given extra entries, whose data (longer than four bytes)
+    /// is written out of line before the page's directory.
+    fn tiff_pages(pages: &[Vec<(u16, u16, Vec<u8>)>]) -> (Vec<u8>, Vec<std::ops::Range<usize>>) {
+        let mut out = b"II\x2A\x00\0\0\0\0".to_vec();
+        let mut pixels = Vec::new();
+        let mut link = 4; // where the offset of the next directory goes
+        for (n, extra) in pages.iter().enumerate() {
+            let px = out.len();
+            out.extend_from_slice(&[0xA0 | (n % 16) as u8; 16]);
+            pixels.push(px..px + 16);
+            let mut entries = vec![(0x0111u16, 4u16, 1u32, px as u32), (0x0117, 4, 1, 16)];
+            for (tag, kind, data) in extra {
+                let at = out.len();
+                out.extend_from_slice(data);
+                entries.push((*tag, *kind, data.len() as u32, at as u32));
+            }
+            entries.sort_by_key(|e| e.0);
+            let dir = out.len();
+            out[link..link + 4].copy_from_slice(&(dir as u32).to_le_bytes());
+            out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+            for (tag, kind, count, value) in entries {
+                out.extend_from_slice(&tag.to_le_bytes());
+                out.extend_from_slice(&kind.to_le_bytes());
+                out.extend_from_slice(&count.to_le_bytes());
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+            link = out.len();
+            out.extend_from_slice(&0u32.to_le_bytes());
+        }
+        (out, pixels)
+    }
+
+    /// Photoshop keeps IPTC (city, byline) in its image resources, Windows
+    /// keeps title, comment, author, keywords and subject in its XP tags, and a
+    /// DNG names the camera's serial and the raw file it came from. All of it
+    /// sits in the first directory, and all of it survived a Strip.
+    #[test]
+    fn photoshop_windows_and_dng_identity_tags_are_removed() {
+        let page = vec![
+            (0x8649, 1, b"8BIM IPTC city Springfield".to_vec()), // Photoshop
+            (0x9C9D, 1, b"B\0e\0n\0 \0M\0\0\0".to_vec()),       // XPAuthor, UCS-2
+            (0x9C9C, 1, b"a\0t\0 \0h\0o\0m\0e\0\0\0".to_vec()), // XPComment
+            (0xC62F, 2, b"SN-48151623\0".to_vec()),            // CameraSerialNumber
+            (0xC68B, 2, b"IMG_4242.CR3\0".to_vec()),           // OriginalRawFileName
+        ];
+        let (tiff, pixels) = tiff_pages(&[page]);
+        let (out, _) = strip_tiff(&tiff).expect("a well formed tiff");
+        for leak in [&b"Springfield"[..], b"B\0e\0n\0", b"h\0o\0m\0e\0", b"SN-48151623", b"IMG_4242"] {
+            assert!(!contains(&out, leak), "survived: {:?}", String::from_utf8_lossy(leak));
+        }
+        assert_eq!(&out[pixels[0].clone()], &tiff[pixels[0].clone()], "the pixels moved");
+    }
+
+    /// A scanned document has dozens of pages. The walk stopped after eight
+    /// and the rest kept their dates while the file was reported clean.
+    #[test]
+    fn every_page_of_a_long_document_is_stripped() {
+        let pages: Vec<_> = (0..10)
+            .map(|n| vec![(0x0132u16, 2u16, format!("PAGE{n:02}-2026:10:17\0").into_bytes())])
+            .collect();
+        let (tiff, pixels) = tiff_pages(&pages);
+        let (out, _) = strip_tiff(&tiff).expect("a well formed tiff");
+        assert!(!contains(&out, b"-2026:10:17"), "a page kept its date");
+        for range in pixels {
+            assert_eq!(&out[range.clone()], &tiff[range], "a page's pixels moved");
+        }
+    }
+
+    /// A chain longer than the walk will follow is refused, not half stripped.
+    #[test]
+    fn a_directory_chain_longer_than_the_bound_is_refused() {
+        let pages: Vec<_> = (0..MAX_DIRECTORIES + 1).map(|_| Vec::new()).collect();
+        let (tiff, _) = tiff_pages(&pages);
+        assert!(strip_tiff(&tiff).is_none());
     }
 
     #[test]
