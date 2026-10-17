@@ -21,7 +21,7 @@ use std::collections::BTreeSet;
 
 use lopdf::{Document, Object, ObjectId};
 
-use crate::{encode_jpeg, metadata, search_as, Error, Image, Mode, OutputFormat};
+use crate::{encode_jpeg, search_as, Error, Image, Mode, OutputFormat};
 
 /// Resolution the presets cap at, in dots per inch.
 ///
