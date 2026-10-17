@@ -494,10 +494,12 @@ fn strip_document_metadata(doc: &mut Document) -> usize {
 /// data. An annotation's /T names its author and /M and /CreationDate date it;
 /// its /Contents is the comment itself and stays. /PieceInfo, on a page or the
 /// catalog, is where Illustrator, Acrobat and others keep their own data, and
-/// /LastModified dates the page.
+/// /LastModified dates the page. A page may hold its annotations in an array
+/// of its own, through a reference to one, or as dictionaries in the array.
 fn strip_annotations_and_piece_info(doc: &mut Document) -> usize {
     let mut removed = 0;
     let mut annotations: BTreeSet<ObjectId> = BTreeSet::new();
+    let mut arrays: BTreeSet<ObjectId> = BTreeSet::new();
     for object in doc.objects.values_mut() {
         let dict = match object {
             Object::Dictionary(dict) => dict,
@@ -507,16 +509,55 @@ fn strip_annotations_and_piece_info(doc: &mut Document) -> usize {
         for key in [&b"PieceInfo"[..], b"LastModified"] {
             removed += usize::from(dict.remove(key).is_some());
         }
-        if let Ok(Object::Array(annots)) = dict.get(b"Annots") {
-            annotations.extend(annots.iter().filter_map(|a| a.as_reference().ok()));
+        match dict.get_mut(b"Annots") {
+            Ok(Object::Array(items)) => removed += scrub_annotation_array(items, &mut annotations),
+            Ok(Object::Reference(id)) => {
+                arrays.insert(*id);
+            }
+            _ => {}
+        }
+    }
+    for id in arrays {
+        if let Ok(Object::Array(items)) = doc.get_object_mut(id) {
+            removed += scrub_annotation_array(items, &mut annotations);
         }
     }
     for id in annotations {
         if let Ok(annot) = doc.get_dictionary_mut(id) {
-            for key in [&b"T"[..], b"M", b"CreationDate"] {
-                removed += usize::from(annot.remove(key).is_some());
-            }
+            removed += scrub_annotation(annot);
         }
+    }
+    removed
+}
+
+/// Scrub the annotations held in an /Annots array itself, and collect the ones
+/// it refers to.
+fn scrub_annotation_array(items: &mut [Object], referred: &mut BTreeSet<ObjectId>) -> usize {
+    let mut removed = 0;
+    for item in items {
+        match item {
+            Object::Reference(id) => {
+                referred.insert(*id);
+            }
+            Object::Dictionary(annot) => removed += scrub_annotation(annot),
+            _ => {}
+        }
+    }
+    removed
+}
+
+/// Remove an annotation's author and dates. A form field's widget keeps its
+/// /T: there it is the field's name, which the form is filled, scripted and
+/// submitted by, not a person.
+fn scrub_annotation(annot: &mut lopdf::Dictionary) -> usize {
+    let is_field = annot.has(b"FT")
+        || annot.get(b"Subtype").and_then(|s| s.as_name()).map(|n| n == b"Widget").unwrap_or(false);
+    let mut removed = 0;
+    for key in [&b"M"[..], b"CreationDate"] {
+        removed += usize::from(annot.remove(key).is_some());
+    }
+    if !is_field {
+        removed += usize::from(annot.remove(b"T").is_some());
     }
     removed
 }
@@ -799,6 +840,94 @@ mod tests {
             Ok(Object::Array(id)) => assert!(id.len() == 2 && id[0] != original_id, "the /ID was not replaced"),
             other => panic!("expected a fresh /ID, found {other:?}"),
         }
+    }
+
+    /// Whether any object in a document, strings and decoded streams
+    /// included, still holds `needle`.
+    fn mentions(doc: &Document, needle: &[u8]) -> bool {
+        fn holds(o: &Object, needle: &[u8]) -> bool {
+            match o {
+                Object::String(s, _) | Object::Name(s) => s.windows(needle.len()).any(|w| w == needle),
+                Object::Array(items) => items.iter().any(|i| holds(i, needle)),
+                Object::Dictionary(d) => d.iter().any(|(_, v)| holds(v, needle)),
+                Object::Stream(s) => {
+                    s.dict.iter().any(|(_, v)| holds(v, needle))
+                        || s.decompressed_content().unwrap_or_else(|_| s.content.clone()).windows(needle.len()).any(|w| w == needle)
+                }
+                _ => false,
+            }
+        }
+        doc.objects.values().any(|o| holds(o, needle))
+    }
+
+    fn strip_and_reload(doc: &mut Document) -> Document {
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        let out = rewrite(&bytes, Mode::Strip, 0.0, 0.0, 0, None).unwrap_or_else(|e| panic!("{e}"));
+        Document::load_mem(&out.data).unwrap()
+    }
+
+    fn note(author: Object) -> lopdf::Dictionary {
+        dictionary! {
+            "Type" => name("Annot"), "Subtype" => name("Text"), "Rect" => rect(10, 10),
+            "T" => author, "Contents" => Object::string_literal("move this paragraph up"),
+        }
+    }
+
+    /// A page may hold its annotations through a reference to an array, as
+    /// qpdf and incremental Acrobat saves write it, or hold an annotation
+    /// dictionary in the array itself. Neither was visited.
+    #[test]
+    fn authors_in_indirect_arrays_and_inline_annotations_go() {
+        let mut doc = Document::with_version("1.5");
+        let first = doc.add_object(note(Object::string_literal("Ben Meadows")));
+        let array = doc.add_object(Object::Array(vec![Object::Reference(first)]));
+        one_page(&mut doc, dictionary! { "Annots" => Object::Reference(array) }, dictionary! { "MediaBox" => rect(612, 792) });
+        assert!(!mentions(&strip_and_reload(&mut doc), b"Ben Meadows"), "an indirect array kept its author");
+
+        let mut doc = Document::with_version("1.5");
+        let inline = Object::Dictionary(note(Object::string_literal("Ben Meadows")));
+        one_page(&mut doc, dictionary! { "Annots" => Object::Array(vec![inline]) }, dictionary! { "MediaBox" => rect(612, 792) });
+        assert!(!mentions(&strip_and_reload(&mut doc), b"Ben Meadows"), "an inline annotation kept its author");
+    }
+
+    /// A form field's widget is an annotation too, and there /T is the field's
+    /// name, which the form is filled, scripted and submitted by. It stays.
+    #[test]
+    fn a_form_fields_name_is_kept() {
+        let mut doc = Document::with_version("1.5");
+        let field = doc.add_object(dictionary! {
+            "Type" => name("Annot"), "Subtype" => name("Widget"), "FT" => name("Tx"), "Rect" => rect(10, 10),
+            "T" => Object::string_literal("customer_name"), "V" => Object::string_literal("filled in"),
+        });
+        one_page(&mut doc, dictionary! { "Annots" => Object::Array(vec![Object::Reference(field)]) }, dictionary! { "MediaBox" => rect(612, 792) });
+        let after = strip_and_reload(&mut doc);
+        let widget = after
+            .objects
+            .values()
+            .filter_map(|o| o.as_dict().ok())
+            .find(|d| d.get(b"Subtype").and_then(|s| s.as_name()).map(|n| n == b"Widget").unwrap_or(false))
+            .expect("the field is still there");
+        assert_eq!(widget.get(b"T").unwrap().as_str().unwrap(), b"customer_name", "the field lost its name");
+    }
+
+    /// An author or editing data held in an object of its own stayed in the
+    /// file after the reference to it was removed, because the save writes
+    /// every object.
+    #[test]
+    fn what_a_removed_reference_pointed_at_goes_too() {
+        let mut doc = Document::with_version("1.5");
+        let author = doc.add_object(Object::string_literal("Ben Meadows"));
+        let private = doc.add_object(dictionary! { "Illustrator" => dictionary! { "Private" => Object::string_literal("layer history") } });
+        let first = doc.add_object(note(Object::Reference(author)));
+        one_page(
+            &mut doc,
+            dictionary! { "Annots" => Object::Array(vec![Object::Reference(first)]), "PieceInfo" => Object::Reference(private) },
+            dictionary! { "MediaBox" => rect(612, 792) },
+        );
+        let after = strip_and_reload(&mut doc);
+        assert!(!mentions(&after, b"Ben Meadows"), "the author object survived");
+        assert!(!mentions(&after, b"layer history"), "the editing data survived");
     }
 
     fn first_image_filter(bytes: &[u8]) -> Object {
