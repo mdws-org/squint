@@ -178,9 +178,12 @@ impl<'a> Reader<'a> {
 fn protected(reader: &Reader, first: usize) -> Option<Vec<(usize, usize)>> {
     let mut out = Vec::new();
     let mut seen = Vec::new();
-    let mut queue = vec![first];
+    // Each directory with whether it is a page. A page's kept entries point
+    // at data the file still needs; an Exif, GPS or interoperability directory
+    // is removed whole, so nothing in it is kept.
+    let mut queue = vec![(first, true)];
 
-    while let Some(at) = queue.pop() {
+    while let Some((at, is_page)) = queue.pop() {
         if at == 0 || seen.contains(&at) {
             continue;
         }
@@ -204,20 +207,24 @@ fn protected(reader: &Reader, first: usize) -> Option<Vec<(usize, usize)>> {
         }
 
         for (entry, tag, kind, count) in &entries {
-            if *tag == ICC {
+            // The profile, and on a page every entry that survives the strip:
+            // strip offsets and counts, a colour map, tile tables. An overrun
+            // from a removed entry must not zero what a kept one points at.
+            let kept = is_page && !REMOVE.contains(tag) && !SUB_IFDS.contains(tag);
+            if *tag == ICC || kept {
                 if let Some((at, size)) = reader.data_at(*entry, *kind, *count) {
                     out.push((at, at + size));
                 }
             }
             if SUB_IFDS.contains(tag) {
                 if let Some(sub) = reader.u32(entry + 8) {
-                    queue.push(sub as usize);
+                    queue.push((sub as usize, false));
                 }
             }
         }
 
         if let Some(next) = reader.u32(at + 2 + entries.len() * 12) {
-            queue.push(next as usize);
+            queue.push((next as usize, is_page));
         }
     }
     Some(out)
@@ -234,9 +241,6 @@ pub fn strip_tiff(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
     let reader = Reader { bytes, big_endian: bytes[0] == b'M' };
     let first = reader.u32(4)? as usize;
     let keep_clear = protected(&reader, first)?;
-    let safe = |start: usize, end: usize| {
-        !keep_clear.iter().any(|(ps, pe)| start < *pe && *ps < end)
-    };
 
     let mut out = bytes.to_vec();
     let mut destroyed = Destroyed::default();
@@ -270,20 +274,16 @@ pub fn strip_tiff(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
                 if let Some(sub) = reader.u32(entry + 8).map(|v| v as usize) {
                     for (sub_entry, _, sub_kind, sub_count) in reader.entries(sub) {
                         if let Some((at, size)) = reader.data_at(sub_entry, sub_kind, sub_count) {
-                            if safe(at, at + size) {
-                                destroyed.wipe(&mut out, at, at + size);
-                            }
+                            destroyed.wipe_outside(&mut out, &keep_clear, at, at + size);
                         }
                     }
                     let end = sub + 2 + reader.entries(sub).len() * 12 + 4;
-                    if end <= out.len() && safe(sub, end) {
-                        destroyed.wipe(&mut out, sub, end);
+                    if end <= out.len() {
+                        destroyed.wipe_outside(&mut out, &keep_clear, sub, end);
                     }
                 }
             } else if let Some((at, size)) = reader.data_at(*entry, *kind, *count) {
-                if safe(at, at + size) {
-                    destroyed.wipe(&mut out, at, at + size);
-                }
+                destroyed.wipe_outside(&mut out, &keep_clear, at, at + size);
             }
         }
 
@@ -315,6 +315,25 @@ struct Destroyed {
 }
 
 impl Destroyed {
+    /// Zero `start..end` except where it overlaps a protected range. A tag's
+    /// declared size can reach into the pixels or a kept array; the part that
+    /// is metadata goes, the rest stays.
+    fn wipe_outside(&mut self, out: &mut [u8], keep: &[(usize, usize)], start: usize, end: usize) {
+        let mut cuts: Vec<(usize, usize)> =
+            keep.iter().filter(|(ks, ke)| *ks < end && start < *ke).map(|&(ks, ke)| (ks.max(start), ke.min(end))).collect();
+        cuts.sort_unstable();
+        let mut cursor = start;
+        for (cs, ce) in cuts {
+            if cursor < cs {
+                self.wipe(out, cursor, cs);
+            }
+            cursor = cursor.max(ce);
+        }
+        if cursor < end {
+            self.wipe(out, cursor, end);
+        }
+    }
+
     fn wipe(&mut self, out: &mut [u8], start: usize, end: usize) {
         if start >= end || end > out.len() {
             return;
@@ -467,6 +486,68 @@ mod tests {
         for range in pixels {
             assert_eq!(&out[range.clone()], &tiff[range], "a page's pixels moved");
         }
+    }
+
+    /// A little-endian, one-directory TIFF from raw blocks placed in order
+    /// after the header, then entries `(tag, type, count, value)`.
+    fn tiff_from(blocks: &[&[u8]], entries: &[(u16, u16, u32, u32)]) -> Vec<u8> {
+        let mut out = b"II\x2A\x00\0\0\0\0".to_vec();
+        for block in blocks {
+            out.extend_from_slice(block);
+        }
+        let dir = out.len() as u32;
+        out[4..8].copy_from_slice(&dir.to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for (tag, kind, count, value) in entries {
+            for field in [&tag.to_le_bytes()[..], &kind.to_le_bytes(), &count.to_le_bytes(), &value.to_le_bytes()] {
+                out.extend_from_slice(field);
+            }
+        }
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out
+    }
+
+    /// A camera wrote Make with a count that runs into the first strip. The
+    /// entry was dropped but nothing was wiped, because the range touched the
+    /// pixels, so the maker's name stayed in the file while it was reported
+    /// clean. The part before the pixels is now wiped.
+    #[test]
+    fn metadata_whose_count_runs_into_the_pixels_is_still_wiped() {
+        const MAKE: &[u8] = b"Acme Camera Co\0";
+        let pixels_at = 8 + MAKE.len();
+        let tiff = tiff_from(
+            &[MAKE, &[0xAA; 32]],
+            &[(0x010F, 2, MAKE.len() as u32 + 8, 8), (0x0111, 4, 1, pixels_at as u32), (0x0117, 4, 1, 32)],
+        );
+        let (out, _) = strip_tiff(&tiff).expect("a well formed tiff");
+        assert!(!contains(&out, b"Acme Camera"), "the maker survived");
+        assert_eq!(&out[pixels_at..pixels_at + 32], &[0xAA; 32], "the pixels were touched");
+    }
+
+    /// An overrun that ends inside the strip-offsets array zeroed the array,
+    /// which leaves a file that points its pixels at offset zero. The arrays a
+    /// kept entry points at are protected like the pixels.
+    #[test]
+    fn an_overrun_into_a_kept_array_does_not_zero_it() {
+        const MAKE: &[u8] = b"Acme\0\0\0\0";
+        let offsets_at = 8 + MAKE.len();
+        let counts_at = offsets_at + 8;
+        let first = counts_at + 8;
+        let second = first + 16;
+        let offsets = [(first as u32).to_le_bytes(), (second as u32).to_le_bytes()].concat();
+        let counts = [16u32.to_le_bytes(), 16u32.to_le_bytes()].concat();
+        let tiff = tiff_from(
+            &[MAKE, &offsets, &counts, &[0xAA; 16], &[0xBB; 16]],
+            &[
+                (0x010F, 2, MAKE.len() as u32 + 8, 8), // runs over the offsets array
+                (0x0111, 4, 2, offsets_at as u32),
+                (0x0117, 4, 2, counts_at as u32),
+            ],
+        );
+        let (out, _) = strip_tiff(&tiff).expect("a well formed tiff");
+        assert!(!contains(&out, b"Acme"), "the maker survived");
+        assert_eq!(&out[offsets_at..offsets_at + 8], &offsets[..], "the strip offsets were zeroed");
+        assert_eq!(&out[first..second + 16], &tiff[first..second + 16], "the pixels were touched");
     }
 
     /// A chain longer than the walk will follow is refused, not half stripped.
