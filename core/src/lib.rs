@@ -1495,6 +1495,18 @@ mod tests {
         assert!(!out.windows(5).any(|w| w == b"Ducky"));
     }
 
+    /// Adobe's segment is exactly twelve bytes. One that opens the same way
+    /// and carries more is not that segment and goes, whatever it carries.
+    #[test]
+    fn an_app14_that_only_starts_like_adobes_is_removed() {
+        let longer: &[u8] = b"Adobe\x00\x64\x00\x00\x00\x00\x02owner Ben Meadows";
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xEE, 0x00, (longer.len() + 2) as u8];
+        jpeg.extend_from_slice(longer);
+        jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x11, 0x22, 0xFF, 0xD9]);
+        let out = metadata::strip_jpeg(&jpeg).expect("walks cleanly");
+        assert!(!out.windows(10).any(|w| w == b"Ben Meadow"), "the extra bytes survived");
+    }
+
     #[test]
     fn a_png_re_encode_carries_the_colour_chunks_across() {
         let source = png_with_text();
