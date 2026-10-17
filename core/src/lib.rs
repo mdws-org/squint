@@ -1468,6 +1468,89 @@ mod tests {
         assert!(!out.windows(11).any(|w| w == b"ICC_PROFILE"));
     }
 
+    /// One marker segment: FF, the marker, a big-endian length, the payload.
+    fn segment(marker: u8, payload: &[u8]) -> Vec<u8> {
+        let mut s = vec![0xFF, marker];
+        s.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        s.extend_from_slice(payload);
+        s
+    }
+
+    const XMP_GPS: &[u8] =
+        b"http://ns.adobe.com/xap/1.0/\0<exif:GPSLatitude>33,26.9N</exif:GPSLatitude>";
+
+    /// A progressive JPEG carries several scans, and the format allows APPn and
+    /// comment segments before any of them, not only before the first. Those
+    /// used to be copied with the scan data, so the location survived a Strip.
+    #[test]
+    fn metadata_between_scans_is_removed() {
+        let first_scan = [0x12, 0xFF, 0x00, 0x34, 0xFF, 0xD0, 0x56];
+        let second_scan = [0x78, 0x9A];
+        let mut jpeg = vec![0xFF, 0xD8];
+        jpeg.extend(segment(0xC2, b"frame"));
+        jpeg.extend(segment(0xDA, b"\x01\x01\x00"));
+        jpeg.extend_from_slice(&first_scan);
+        jpeg.extend(segment(0xE1, XMP_GPS));
+        jpeg.extend(segment(0xFE, b"taken at home"));
+        jpeg.extend(segment(0xC4, b"table"));
+        jpeg.extend(segment(0xDA, b"\x01\x01\x00"));
+        jpeg.extend_from_slice(&second_scan);
+        jpeg.extend_from_slice(&[0xFF, 0xD9]);
+
+        let mut expected = vec![0xFF, 0xD8];
+        expected.extend(segment(0xC2, b"frame"));
+        expected.extend(segment(0xDA, b"\x01\x01\x00"));
+        expected.extend_from_slice(&first_scan);
+        expected.extend(segment(0xC4, b"table"));
+        expected.extend(segment(0xDA, b"\x01\x01\x00"));
+        expected.extend_from_slice(&second_scan);
+        expected.extend_from_slice(&[0xFF, 0xD9]);
+
+        assert_eq!(metadata::strip_jpeg(&jpeg).expect("walks cleanly"), expected);
+    }
+
+    /// An APPn segment between scans can hold a whole thumbnail JPEG, end marker
+    /// included. Searching the scan data for the first FFD9 stopped there and
+    /// wrote a picture with its later scans cut off.
+    #[test]
+    fn an_end_marker_inside_metadata_between_scans_does_not_cut_the_picture() {
+        let mut thumbnail = b"Exif\0\0".to_vec();
+        thumbnail.extend_from_slice(&[0xFF, 0xD8, 0x01, 0x02, 0xFF, 0xD9]);
+        let mut jpeg = vec![0xFF, 0xD8];
+        jpeg.extend(segment(0xDA, b"\x01\x01\x00"));
+        jpeg.push(0x11);
+        jpeg.extend(segment(0xE1, &thumbnail));
+        jpeg.extend(segment(0xDA, b"\x01\x01\x00"));
+        jpeg.extend_from_slice(&[0x22, 0xFF, 0xD9]);
+
+        let out = metadata::strip_jpeg(&jpeg).expect("walks cleanly");
+        assert!(out.ends_with(&[0x22, 0xFF, 0xD9]), "the second scan was cut off");
+        assert!(!out.windows(4).any(|w| w == b"Exif"));
+    }
+
+    /// A single-scan file, restart markers and fill bytes included, strips to
+    /// exactly what the scan copy produced before: headers filtered, the scan
+    /// and end marker byte for byte.
+    #[test]
+    fn a_single_scan_jpeg_strips_exactly_as_before() {
+        let scan = [0x11, 0xFF, 0x00, 0x22, 0xFF, 0xD3, 0x33, 0xFF, 0xFF];
+        let mut jpeg = vec![0xFF, 0xD8];
+        jpeg.extend(segment(0xE1, XMP_GPS));
+        jpeg.extend(segment(0xC0, b"frame"));
+        jpeg.extend(segment(0xDA, b"\x01\x01\x00"));
+        jpeg.extend_from_slice(&scan);
+        jpeg.extend_from_slice(&[0xFF, 0xD9]);
+        jpeg.extend_from_slice(b"trailing MPF data past the end of the image");
+
+        let mut expected = vec![0xFF, 0xD8];
+        expected.extend(segment(0xC0, b"frame"));
+        expected.extend(segment(0xDA, b"\x01\x01\x00"));
+        expected.extend_from_slice(&scan);
+        expected.extend_from_slice(&[0xFF, 0xD9]);
+
+        assert_eq!(metadata::strip_jpeg(&jpeg).expect("walks cleanly"), expected);
+    }
+
     #[test]
     fn a_png_re_encode_carries_the_colour_chunks_across() {
         let source = png_with_text();
