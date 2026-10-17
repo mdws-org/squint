@@ -456,7 +456,66 @@ pub fn strip_heif(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
         }
         wiped += old.len();
     }
+    wiped += free_metadata_boxes(bytes, &mut out);
     Some((out, wiped))
+}
+
+/// `uuid` user types of top-level boxes holding metadata: C2PA content
+/// credentials (author, tools, edit history) and XMP in Adobe's box form.
+const METADATA_UUIDS: [[u8; 16]; 2] = [
+    [0xD8, 0xFE, 0xC3, 0xD6, 0x1B, 0x0E, 0x48, 0x3C, 0x92, 0x97, 0x58, 0x28, 0x87, 0x7E, 0xC4, 0x81],
+    [0xBE, 0x7A, 0xCF, 0xCB, 0x97, 0xA9, 0x42, 0xE8, 0x9C, 0x71, 0x99, 0x94, 0x91, 0xE3, 0xAF, 0xAC],
+];
+
+/// Metadata held in boxes rather than items, removed by turning each box into
+/// a `free` box of the same size with a zeroed body. Every reader skips a
+/// `free` box, and nothing moves, so the chunk offsets a sequence's movie box
+/// records stay true.
+///
+/// - A top-level `uuid` box whose user type is in `METADATA_UUIDS`.
+/// - `udta` and `meta` inside the movie box and inside each of its tracks:
+///   an animated AVIF or a HEIF sequence keeps location (`©xyz`), copyright
+///   and the like there.
+///
+/// Returns the number of bytes zeroed.
+fn free_metadata_boxes(bytes: &[u8], out: &mut [u8]) -> usize {
+    let mut freed = 0;
+    for (kind, b) in boxes(bytes, 0..bytes.len()) {
+        let body = b.body();
+        if kind == b"uuid" && body.len() >= 16 && METADATA_UUIDS.iter().any(|u| bytes[body.start..body.start + 16] == u[..]) {
+            freed += free_in_place(out, &b);
+        } else if kind == b"moov" {
+            freed += free_movie_metadata(bytes, out, body);
+        }
+    }
+    freed
+}
+
+/// `udta` and `meta` in a movie box and in each `trak` inside it.
+fn free_movie_metadata(bytes: &[u8], out: &mut [u8], moov: std::ops::Range<usize>) -> usize {
+    let mut freed = 0;
+    for (kind, b) in boxes(bytes, moov) {
+        match kind {
+            b"udta" | b"meta" => freed += free_in_place(out, &b),
+            b"trak" => {
+                for (inner, t) in boxes(bytes, b.body()) {
+                    if inner == b"udta" || inner == b"meta" {
+                        freed += free_in_place(out, &t);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    freed
+}
+
+/// Rename a box to `free` and zero its body; returns the bytes zeroed.
+fn free_in_place(out: &mut [u8], b: &Box) -> usize {
+    out[b.at + 4..b.at + 8].copy_from_slice(b"free");
+    let body = b.body();
+    out[body.clone()].fill(0);
+    body.len()
 }
 
 fn is_xmp(content_type: &[u8]) -> bool {
@@ -771,7 +830,7 @@ pub(crate) mod tests {
         out.extend_from_slice(&meta);
 
         let mdat_at = out.len();
-        out.extend_from_slice(&be32(8 + 16 + 24));
+        out.extend_from_slice(&be32(0)); // size, patched once the payloads are in
         out.extend_from_slice(b"mdat");
         let picture_at = out.len();
         out.extend_from_slice(&[0xAA; 16]); // stands in for coded picture
@@ -779,7 +838,9 @@ pub(crate) mod tests {
         let exif_at = out.len();
         out.extend_from_slice(EXIF);
         let exif_len = EXIF.len();
-        let _ = mdat_at;
+        // Sized from what it holds, so a box appended after it is found.
+        let mdat_len = (out.len() - mdat_at) as u32;
+        out[mdat_at..mdat_at + 4].copy_from_slice(&be32(mdat_len));
 
         // Patch the two extents now that the payloads have addresses.
         let base = meta_at + iloc_in_meta + 16;
@@ -814,6 +875,52 @@ pub(crate) mod tests {
         assert!(out[exif].iter().all(|b| *b == 0), "the payload should be zeroed");
         // The coded picture is sixteen bytes of 0xAA and must be untouched.
         assert_eq!(out.iter().filter(|b| **b == 0xAA).count(), 16);
+    }
+
+    /// One ISOBMFF box with a 32-bit size.
+    fn bmff_box(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut b = be32((body.len() + 8) as u32).to_vec();
+        b.extend_from_slice(kind);
+        b.extend_from_slice(body);
+        b
+    }
+
+    const C2PA_UUID: [u8; 16] =
+        [0xD8, 0xFE, 0xC3, 0xD6, 0x1B, 0x0E, 0x48, 0x3C, 0x92, 0x97, 0x58, 0x28, 0x87, 0x7E, 0xC4, 0x81];
+
+    /// Content credentials sit in a top-level `uuid` box: who made the
+    /// picture, with what, and its edit history. Strip read only the item index
+    /// and left the box whole.
+    #[test]
+    fn c2pa_content_credentials_are_removed() {
+        let (mut heif, _) = heif_with_exif();
+        let mut body = C2PA_UUID.to_vec();
+        body.extend_from_slice(b"manifest\0signed by Ben Meadows, Leica M11");
+        heif.extend(bmff_box(b"uuid", &body));
+
+        let (out, _) = strip_heif(&heif).expect("a well formed heif");
+        assert_eq!(out.len(), heif.len(), "nothing moves");
+        assert!(!contains(&out, b"Ben Meadows"), "the credentials survived");
+        assert!(contains(&out, b"free"), "the box should stay as free space");
+        assert_eq!(out.iter().filter(|b| **b == 0xAA).count(), 16, "the picture changed");
+    }
+
+    /// An animated AVIF or a HEIF sequence carries a movie box, and the movie's
+    /// user data holds the location (`©xyz`) and copyright. Strip read only
+    /// the item index and reported the file clean.
+    #[test]
+    fn location_in_a_sequences_movie_box_is_removed() {
+        let (mut heif, _) = heif_with_exif();
+        let udta = bmff_box(b"udta", &bmff_box(b"\xA9xyz", b"+33.4484-112.0740/"));
+        let trak_udta = bmff_box(b"udta", &bmff_box(b"cprt", b"(c) Ben Meadows"));
+        let trak = bmff_box(b"trak", &[bmff_box(b"tkhd", &[0; 12]), trak_udta].concat());
+        heif.extend(bmff_box(b"moov", &[bmff_box(b"mvhd", &[0; 12]), udta, trak].concat()));
+
+        let (out, _) = strip_heif(&heif).expect("a well formed heif");
+        assert_eq!(out.len(), heif.len(), "nothing moves");
+        assert!(!contains(&out, b"+33.4484"), "the location survived");
+        assert!(!contains(&out, b"Ben Meadows"), "the copyright survived");
+        assert!(contains(&out, b"mvhd") && contains(&out, b"tkhd"), "the movie structure must stay");
     }
 
     #[test]
