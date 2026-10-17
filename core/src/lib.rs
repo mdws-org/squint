@@ -1540,6 +1540,22 @@ mod tests {
         assert_eq!(metadata::strip_jpeg(&jpeg).expect("walks cleanly"), expected);
     }
 
+    /// Arithmetic-coded scans may carry the TEM marker, FF01, which stands
+    /// alone like a restart marker. It is scan data, not the end of the scan.
+    #[test]
+    fn a_tem_marker_inside_a_scan_is_scan_data() {
+        let scan = [0x11, 0xFF, 0x01, 0x22, 0x33];
+        let mut jpeg = vec![0xFF, 0xD8];
+        jpeg.extend(segment(0xC9, b"frame"));
+        jpeg.extend(segment(0xDA, b"\x01\x01\x00"));
+        jpeg.extend_from_slice(&scan);
+        jpeg.extend_from_slice(&[0xFF, 0xD9]);
+        let mut with_xmp = jpeg.clone();
+        with_xmp.splice(2..2, segment(0xE1, XMP_GPS));
+
+        assert_eq!(metadata::strip_jpeg(&with_xmp).expect("a TEM marker refused the file"), jpeg);
+    }
+
     /// The profile is kept in APP2, where it is read from, and nowhere else.
     #[test]
     fn a_profile_tag_on_some_other_segment_does_not_survive() {

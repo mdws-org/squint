@@ -200,8 +200,9 @@ pub fn strip_jpeg(jpeg: &[u8]) -> Option<Vec<u8>> {
             // secondary image and its XMP past EOI.
             //
             // Inside entropy-coded data a literal FF is stored as FF00, restart
-            // markers FFD0 through FFD7 may appear, and any marker may be preceded
-            // by FF fill bytes. Everything else is a marker that ends the scan.
+            // markers FFD0 through FFD7 and the arithmetic coder's TEM, FF01, may
+            // appear, and any marker may be preceded by FF fill bytes. Everything
+            // else is a marker that ends the scan.
             if i + 4 > jpeg.len() {
                 return None;
             }
@@ -212,7 +213,8 @@ pub fn strip_jpeg(jpeg: &[u8]) -> Option<Vec<u8>> {
             let mut j = i + 2 + len;
             while j + 1 < jpeg.len() {
                 let next = jpeg[j + 1];
-                if jpeg[j] == 0xFF && next != 0x00 && next != 0xFF && !(0xD0..=0xD7).contains(&next) {
+                let in_scan = matches!(next, 0x00 | 0x01 | 0xFF | 0xD0..=0xD7);
+                if jpeg[j] == 0xFF && !in_scan {
                     break;
                 }
                 j += 1;
