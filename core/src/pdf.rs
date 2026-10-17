@@ -263,12 +263,17 @@ pub fn rewrite(
     let mut doc = Document::load_mem(bytes)
         .map_err(|e| Error::Decode(format!("this PDF could not be read: {e}")))?;
 
-    let metadata_removed = strip_document_metadata(&mut doc);
+    let metadata_removed =
+        strip_document_metadata(&mut doc) + strip_image_metadata(&mut doc, mode == Mode::Strip)?;
 
     // Strip means the pixels are not touched, in a PDF as anywhere else. The
-    // document's own metadata has already gone; the pictures inside it keep
-    // every byte they arrived with.
+    // document's own metadata has already gone, and so has the EXIF inside its
+    // JPEG pictures; their scans keep every byte they arrived with.
     if mode == Mode::Strip {
+        // An object nothing refers to any more is still written out by the
+        // save, so a removed reference would leave its target (an annotation's
+        // author, an editor's private data) in the file.
+        doc.prune_objects();
         let mut out = Vec::new();
         doc.save_modern(&mut out)
             .map_err(|e| Error::Encode(format!("this PDF could not be written: {e}")))?;
@@ -415,13 +420,22 @@ fn encode_one(
 fn strip_document_metadata(doc: &mut Document) -> usize {
     let mut removed = 0;
 
-    // The trailer points at the info dictionary; emptying it is enough, and
-    // leaves a valid reference for any reader that expects one.
-    if let Ok(Object::Reference(id)) = doc.trailer.get(b"Info").cloned() {
-        if let Ok(info) = doc.get_dictionary_mut(id) {
-            removed += info.len();
-            *info = lopdf::Dictionary::new();
+    // The trailer usually points at the info dictionary; emptying it is enough,
+    // and leaves a valid reference for any reader that expects one. A writer
+    // may also put the dictionary in the trailer itself, and that copy is
+    // emptied in place.
+    match doc.trailer.get(b"Info").cloned() {
+        Ok(Object::Reference(id)) => {
+            if let Ok(info) = doc.get_dictionary_mut(id) {
+                removed += info.len();
+                *info = lopdf::Dictionary::new();
+            }
         }
+        Ok(Object::Dictionary(info)) => {
+            removed += info.len();
+            doc.trailer.set("Info", lopdf::Dictionary::new());
+        }
+        _ => {}
     }
 
     let mut packets: BTreeSet<ObjectId> = BTreeSet::new();
@@ -452,7 +466,217 @@ fn strip_document_metadata(doc: &mut Document) -> usize {
         doc.delete_object(id);
     }
 
+    // A PDF 1.5 cross-reference stream is an object whose dictionary is the
+    // trailer, info dictionary included when the writer put it there directly.
+    // lopdf loads it like any other object and writes it back out beside the
+    // fresh cross-reference it builds on save, so the old trailer, author and
+    // all, would ride along. It describes the file as it arrived and nothing
+    // reads it once the document is rewritten.
+    let stale_xref: Vec<ObjectId> = doc
+        .objects
+        .iter()
+        .filter(|(_, o)| {
+            o.as_stream().ok().and_then(|s| s.dict.get(b"Type").ok()).and_then(|t| t.as_name().ok())
+                == Some(&b"XRef"[..])
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    for id in stale_xref {
+        doc.objects.remove(&id);
+    }
+
+    removed += strip_annotations_and_piece_info(doc);
+    refresh_file_id(doc);
     removed
+}
+
+/// Who wrote each comment and when, and an application's private editing
+/// data. An annotation's /T names its author and /M and /CreationDate date it;
+/// its /Contents is the comment itself and stays. /PieceInfo, on a page or the
+/// catalog, is where Illustrator, Acrobat and others keep their own data, and
+/// /LastModified dates the page. A page may hold its annotations in an array
+/// of its own, through a reference to one, or as dictionaries in the array.
+fn strip_annotations_and_piece_info(doc: &mut Document) -> usize {
+    let mut removed = 0;
+    let mut annotations: BTreeSet<ObjectId> = BTreeSet::new();
+    let mut arrays: BTreeSet<ObjectId> = BTreeSet::new();
+    for object in doc.objects.values_mut() {
+        let dict = match object {
+            Object::Dictionary(dict) => dict,
+            Object::Stream(stream) => &mut stream.dict,
+            _ => continue,
+        };
+        for key in [&b"PieceInfo"[..], b"LastModified"] {
+            removed += usize::from(dict.remove(key).is_some());
+        }
+        match dict.get_mut(b"Annots") {
+            Ok(Object::Array(items)) => removed += scrub_annotation_array(items, &mut annotations),
+            Ok(Object::Reference(id)) => {
+                arrays.insert(*id);
+            }
+            _ => {}
+        }
+    }
+    for id in arrays {
+        if let Ok(Object::Array(items)) = doc.get_object_mut(id) {
+            removed += scrub_annotation_array(items, &mut annotations);
+        }
+    }
+    for id in annotations {
+        if let Ok(annot) = doc.get_dictionary_mut(id) {
+            removed += scrub_annotation(annot);
+        }
+    }
+    removed
+}
+
+/// Scrub the annotations held in an /Annots array itself, and collect the ones
+/// it refers to.
+fn scrub_annotation_array(items: &mut [Object], referred: &mut BTreeSet<ObjectId>) -> usize {
+    let mut removed = 0;
+    for item in items {
+        match item {
+            Object::Reference(id) => {
+                referred.insert(*id);
+            }
+            Object::Dictionary(annot) => removed += scrub_annotation(annot),
+            _ => {}
+        }
+    }
+    removed
+}
+
+/// Remove an annotation's author and dates. A form field's widget keeps its
+/// /T: there it is the field's name, which the form is filled, scripted and
+/// submitted by, not a person.
+fn scrub_annotation(annot: &mut lopdf::Dictionary) -> usize {
+    let is_field = annot.has(b"FT")
+        || annot.get(b"Subtype").and_then(|s| s.as_name()).map(|n| n == b"Widget").unwrap_or(false);
+    let mut removed = 0;
+    for key in [&b"M"[..], b"CreationDate"] {
+        removed += usize::from(annot.remove(key).is_some());
+    }
+    if !is_field {
+        removed += usize::from(annot.remove(b"T").is_some());
+    }
+    removed
+}
+
+/// Replace the trailer's /ID, which ties this file to every other copy and
+/// version of the same document, with a fresh one. An encrypted document's
+/// keys are derived from its /ID, so it is left alone there. Not counted as
+/// metadata removed: nearly every PDF has one, and counting it would make a
+/// second Strip report something removed every time.
+fn refresh_file_id(doc: &mut Document) {
+    if doc.trailer.has(b"Encrypt") || !doc.trailer.has(b"ID") {
+        return;
+    }
+    use std::hash::{BuildHasher, Hasher};
+    let random = std::collections::hash_map::RandomState::new();
+    let mut id = Vec::with_capacity(16);
+    for half in 0..2u8 {
+        let mut h = random.build_hasher();
+        h.write_u8(half);
+        id.extend_from_slice(&h.finish().to_le_bytes());
+    }
+    let fresh = Object::String(id, lopdf::StringFormat::Hexadecimal);
+    doc.trailer.set("ID", Object::Array(vec![fresh.clone(), fresh]));
+}
+
+/// Remove EXIF, XMP and the other application segments from the JPEG pictures
+/// inside a document, the way a JPEG Strip does, leaving each scan byte for
+/// byte. A scanner or img2pdf stores a photograph as its whole JPEG file, GPS
+/// and camera serial included; ReportLab and qpdf wrap it in ASCII or Flate
+/// first. Outer filters are undone and the stripped JPEG is stored bare.
+///
+/// With `strict`, which Strip asks for, a picture whose filters cannot be
+/// undone or whose JPEG does not walk refuses the document, because what it
+/// carries cannot be shown to be gone. Returns the number of pictures that
+/// lost metadata.
+fn strip_image_metadata(doc: &mut Document, strict: bool) -> Result<usize, Error> {
+    let unreadable = || Error::Decode("a picture inside this PDF could not be read, so its metadata cannot be shown to be removed".into());
+    let mut work = Vec::new();
+    for (id, object) in &doc.objects {
+        let Ok(stream) = object.as_stream() else { continue };
+        let is_image = stream.dict.get(b"Subtype").and_then(|o| o.as_name()).map(|n| n == b"Image").unwrap_or(false);
+        if !is_image {
+            continue;
+        }
+        let Some(filters) = filter_names(doc, &stream.dict) else { continue };
+        if filters.last().map(Vec::as_slice) != Some(&b"DCTDecode"[..]) {
+            continue;
+        }
+        work.push((*id, filters));
+    }
+
+    let mut stripped = 0;
+    for (id, filters) in work {
+        let Ok(stream) = doc.get_object_mut(id).and_then(Object::as_stream_mut) else { continue };
+        let outer = &filters[..filters.len() - 1];
+        let jpeg = if outer.is_empty() {
+            stream.content.clone()
+        } else {
+            let mut wrapper = lopdf::Dictionary::new();
+            wrapper.set("Filter", Object::Array(outer.iter().map(|n| Object::Name(n.clone())).collect()));
+            if let (1, Ok(Object::Array(params))) = (outer.len(), stream.dict.get(b"DecodeParms")) {
+                if let Some(Object::Dictionary(first)) = params.first() {
+                    wrapper.set("DecodeParms", first.clone());
+                }
+            }
+            match lopdf::Stream::new(wrapper, stream.content.clone()).decompressed_content_with_limit(MAX_DECODED) {
+                Ok(bytes) => bytes,
+                Err(_) if strict => return Err(unreadable()),
+                Err(_) => continue,
+            }
+        };
+        let clean = match crate::strip_jpeg_file(&jpeg, 1) {
+            Ok(Some((clean, _))) => clean,
+            Ok(None) if strict => return Err(unreadable()),
+            Err(e) if strict => return Err(e),
+            _ => continue,
+        };
+        if clean == jpeg {
+            continue;
+        }
+        let dct_params = match stream.dict.get(b"DecodeParms") {
+            Ok(Object::Array(params)) => params.last().filter(|p| p.as_dict().is_ok()).cloned(),
+            Ok(params @ Object::Dictionary(_)) if outer.is_empty() => Some(params.clone()),
+            _ => None,
+        };
+        stream.dict.set("Filter", Object::Name(b"DCTDecode".to_vec()));
+        match dct_params {
+            Some(params) => stream.dict.set("DecodeParms", params),
+            None => {
+                stream.dict.remove(b"DecodeParms");
+            }
+        }
+        stream.set_content(clean);
+        stripped += 1;
+    }
+    Ok(stripped)
+}
+
+/// Decoded size allowed for one picture's outer filters, against a stream
+/// built to expand without limit.
+const MAX_DECODED: usize = 512 * 1024 * 1024;
+
+/// A stream's filters in decoding order, following references, or `None` when
+/// it has none or they are not names.
+fn filter_names(doc: &Document, dict: &lopdf::Dictionary) -> Option<Vec<Vec<u8>>> {
+    let resolve = |o: &Object| -> Option<Object> {
+        match o {
+            Object::Reference(id) => doc.get_object(*id).ok().cloned(),
+            other => Some(other.clone()),
+        }
+    };
+    match resolve(dict.get(b"Filter").ok()?)? {
+        Object::Name(n) => Some(vec![n]),
+        Object::Array(items) => items
+            .iter()
+            .map(|o| resolve(o).and_then(|o| o.as_name().ok().map(<[u8]>::to_vec)))
+            .collect(),
+        _ => None,
+    }
 }
 
 /// Pages a document declares, for the harness to report.
@@ -492,6 +716,309 @@ mod tests {
         let catalog = doc.add_object(dictionary! { "Type" => name("Catalog"), "Pages" => Object::Reference(pages) });
         doc.trailer.set("Root", Object::Reference(catalog));
         (pages, page)
+    }
+
+    /// The smallest JPEG `strip_jpeg` walks: an EXIF segment naming a place,
+    /// then a scan.
+    const SCAN_ONLY: [u8; 10] = [0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x02, 0x11, 0x22, 0xFF, 0xD9];
+
+    fn jpeg_with_exif() -> Vec<u8> {
+        let exif: &[u8] = b"Exif\0\0GPS 33.4484N 112.0740W";
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        jpeg.extend_from_slice(&((exif.len() + 2) as u16).to_be_bytes());
+        jpeg.extend_from_slice(exif);
+        jpeg.extend_from_slice(&SCAN_ONLY[2..]);
+        jpeg
+    }
+
+    /// A one-page PDF drawing one image stream stored under `filter`.
+    fn pdf_with_image(filter: Object, content: Vec<u8>) -> Vec<u8> {
+        let mut doc = Document::with_version("1.5");
+        let picture = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {
+                "Type" => name("XObject"), "Subtype" => name("Image"), "Width" => 1, "Height" => 1,
+                "ColorSpace" => name("DeviceRGB"), "BitsPerComponent" => 8, "Filter" => filter,
+            },
+            content,
+        )));
+        one_page(
+            &mut doc,
+            dictionary! { "Resources" => dictionary! { "XObject" => dictionary! {
+                "Im0" => Object::Reference(picture) } } },
+            dictionary! { "MediaBox" => rect(612, 792) },
+        );
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn first_image_content(bytes: &[u8]) -> Vec<u8> {
+        let doc = Document::load_mem(bytes).unwrap();
+        doc.objects
+            .values()
+            .filter_map(|o| o.as_stream().ok())
+            .find(|s| s.dict.get(b"Subtype").and_then(|n| n.as_name()).map(|n| n == b"Image").unwrap_or(false))
+            .expect("the image is still there")
+            .content
+            .clone()
+    }
+
+    /// An img2pdf or scanner PDF stores each photograph as its JPEG file, EXIF
+    /// and GPS included. Strip removed the document's metadata and left every
+    /// picture's, while the row said the location was gone.
+    #[test]
+    fn strip_removes_exif_from_the_pictures_inside() {
+        let bytes = pdf_with_image(name("DCTDecode"), jpeg_with_exif());
+        let out = rewrite(&bytes, Mode::Strip, 0.0, 0.0, 0, None).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!out.data.windows(4).any(|w| w == b"Exif"), "the picture's EXIF survived");
+        assert_eq!(first_image_content(&out.data), SCAN_ONLY, "the scan must be untouched");
+        assert!(out.metadata_removed >= 1, "a picture's EXIF is metadata removed");
+    }
+
+    /// The trailer may hold the info dictionary itself rather than a reference
+    /// to one. Only the reference was emptied, so a direct dictionary kept the
+    /// author, and a file carrying nothing else reported nothing to remove. A
+    /// 1.5 file also keeps a copy of the trailer in its old cross-reference
+    /// stream, which lopdf wrote back out unchanged.
+    #[test]
+    fn an_info_dictionary_written_into_the_trailer_is_emptied() {
+        let mut doc = Document::with_version("1.5");
+        one_page(&mut doc, dictionary! {}, dictionary! { "MediaBox" => rect(612, 792) });
+        doc.trailer.set("Info", dictionary! { "Author" => Object::string_literal("Ben Meadows") });
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+
+        let out = rewrite(&bytes, Mode::Strip, 0.0, 0.0, 0, None).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!out.data.windows(11).any(|w| w == b"Ben Meadows"), "the author survived");
+        assert_eq!(out.metadata_removed, 1);
+    }
+
+    /// A reviewed PDF names each commenter in the annotation's /T and dates
+    /// every comment; an Illustrator or Acrobat export keeps its private
+    /// editing data in /PieceInfo; and /ID ties the file to every other copy
+    /// of the same document. Strip kept all of it.
+    #[test]
+    fn comment_authors_editing_data_and_the_file_id_go() {
+        let mut doc = Document::with_version("1.5");
+        let note = doc.add_object(dictionary! {
+            "Type" => name("Annot"), "Subtype" => name("Text"), "Rect" => rect(10, 10),
+            "T" => Object::string_literal("Ben Meadows"),
+            "M" => Object::string_literal("D:20261017120000-07'00'"),
+            "CreationDate" => Object::string_literal("D:20261016090000-07'00'"),
+            "Contents" => Object::string_literal("move this paragraph up"),
+        });
+        one_page(
+            &mut doc,
+            dictionary! {
+                "Annots" => Object::Array(vec![Object::Reference(note)]),
+                "PieceInfo" => dictionary! { "Illustrator" => dictionary! { "Private" => Object::string_literal("layer history") } },
+            },
+            dictionary! { "MediaBox" => rect(612, 792) },
+        );
+        let original_id = Object::string_literal("0123456789ABCDEF");
+        doc.trailer.set("ID", Object::Array(vec![original_id.clone(), original_id.clone()]));
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+
+        let out = rewrite(&bytes, Mode::Strip, 0.0, 0.0, 0, None).unwrap_or_else(|e| panic!("{e}"));
+        // Read back through the parser: the writer packs plain objects into
+        // compressed object streams, so a string missing from the raw bytes
+        // proves nothing.
+        let after = Document::load_mem(&out.data).unwrap();
+        let annot = after
+            .objects
+            .values()
+            .filter_map(|o| o.as_dict().ok())
+            .find(|d| d.get(b"Subtype").and_then(|s| s.as_name()).map(|n| n == b"Text").unwrap_or(false))
+            .expect("the annotation is still there");
+        for key in [&b"T"[..], b"M", b"CreationDate"] {
+            assert!(!annot.has(key), "/{} survived", String::from_utf8_lossy(key));
+        }
+        assert_eq!(annot.get(b"Contents").unwrap().as_str().unwrap(), b"move this paragraph up");
+        assert!(after.objects.values().filter_map(|o| o.as_dict().ok()).all(|d| !d.has(b"PieceInfo")));
+        match after.trailer.get(b"ID") {
+            Ok(Object::Array(id)) => assert!(id.len() == 2 && id[0] != original_id, "the /ID was not replaced"),
+            other => panic!("expected a fresh /ID, found {other:?}"),
+        }
+    }
+
+    /// Whether any object in a document, strings and decoded streams
+    /// included, still holds `needle`.
+    fn mentions(doc: &Document, needle: &[u8]) -> bool {
+        fn holds(o: &Object, needle: &[u8]) -> bool {
+            match o {
+                Object::String(s, _) | Object::Name(s) => s.windows(needle.len()).any(|w| w == needle),
+                Object::Array(items) => items.iter().any(|i| holds(i, needle)),
+                Object::Dictionary(d) => d.iter().any(|(_, v)| holds(v, needle)),
+                Object::Stream(s) => {
+                    s.dict.iter().any(|(_, v)| holds(v, needle))
+                        || s.decompressed_content().unwrap_or_else(|_| s.content.clone()).windows(needle.len()).any(|w| w == needle)
+                }
+                _ => false,
+            }
+        }
+        doc.objects.values().any(|o| holds(o, needle))
+    }
+
+    fn strip_and_reload(doc: &mut Document) -> Document {
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        let out = rewrite(&bytes, Mode::Strip, 0.0, 0.0, 0, None).unwrap_or_else(|e| panic!("{e}"));
+        Document::load_mem(&out.data).unwrap()
+    }
+
+    fn note(author: Object) -> lopdf::Dictionary {
+        dictionary! {
+            "Type" => name("Annot"), "Subtype" => name("Text"), "Rect" => rect(10, 10),
+            "T" => author, "Contents" => Object::string_literal("move this paragraph up"),
+        }
+    }
+
+    /// A page may hold its annotations through a reference to an array, as
+    /// qpdf and incremental Acrobat saves write it, or hold an annotation
+    /// dictionary in the array itself. Neither was visited.
+    #[test]
+    fn authors_in_indirect_arrays_and_inline_annotations_go() {
+        let mut doc = Document::with_version("1.5");
+        let first = doc.add_object(note(Object::string_literal("Ben Meadows")));
+        let array = doc.add_object(Object::Array(vec![Object::Reference(first)]));
+        one_page(&mut doc, dictionary! { "Annots" => Object::Reference(array) }, dictionary! { "MediaBox" => rect(612, 792) });
+        assert!(!mentions(&strip_and_reload(&mut doc), b"Ben Meadows"), "an indirect array kept its author");
+
+        let mut doc = Document::with_version("1.5");
+        let inline = Object::Dictionary(note(Object::string_literal("Ben Meadows")));
+        one_page(&mut doc, dictionary! { "Annots" => Object::Array(vec![inline]) }, dictionary! { "MediaBox" => rect(612, 792) });
+        assert!(!mentions(&strip_and_reload(&mut doc), b"Ben Meadows"), "an inline annotation kept its author");
+    }
+
+    /// A form field's widget is an annotation too, and there /T is the field's
+    /// name, which the form is filled, scripted and submitted by. It stays.
+    #[test]
+    fn a_form_fields_name_is_kept() {
+        let mut doc = Document::with_version("1.5");
+        let field = doc.add_object(dictionary! {
+            "Type" => name("Annot"), "Subtype" => name("Widget"), "FT" => name("Tx"), "Rect" => rect(10, 10),
+            "T" => Object::string_literal("customer_name"), "V" => Object::string_literal("filled in"),
+        });
+        one_page(&mut doc, dictionary! { "Annots" => Object::Array(vec![Object::Reference(field)]) }, dictionary! { "MediaBox" => rect(612, 792) });
+        let after = strip_and_reload(&mut doc);
+        let widget = after
+            .objects
+            .values()
+            .filter_map(|o| o.as_dict().ok())
+            .find(|d| d.get(b"Subtype").and_then(|s| s.as_name()).map(|n| n == b"Widget").unwrap_or(false))
+            .expect("the field is still there");
+        assert_eq!(widget.get(b"T").unwrap().as_str().unwrap(), b"customer_name", "the field lost its name");
+    }
+
+    /// An author or editing data held in an object of its own stayed in the
+    /// file after the reference to it was removed, because the save writes
+    /// every object.
+    #[test]
+    fn what_a_removed_reference_pointed_at_goes_too() {
+        let mut doc = Document::with_version("1.5");
+        let author = doc.add_object(Object::string_literal("Ben Meadows"));
+        let private = doc.add_object(dictionary! { "Illustrator" => dictionary! { "Private" => Object::string_literal("layer history") } });
+        let first = doc.add_object(note(Object::Reference(author)));
+        one_page(
+            &mut doc,
+            dictionary! { "Annots" => Object::Array(vec![Object::Reference(first)]), "PieceInfo" => Object::Reference(private) },
+            dictionary! { "MediaBox" => rect(612, 792) },
+        );
+        let after = strip_and_reload(&mut doc);
+        assert!(!mentions(&after, b"Ben Meadows"), "the author object survived");
+        assert!(!mentions(&after, b"layer history"), "the editing data survived");
+    }
+
+    fn first_image_filter(bytes: &[u8]) -> Object {
+        let doc = Document::load_mem(bytes).unwrap();
+        doc.objects
+            .values()
+            .filter_map(|o| o.as_stream().ok())
+            .find(|s| s.dict.get(b"Subtype").and_then(|n| n.as_name()).map(|n| n == b"Image").unwrap_or(false))
+            .expect("the image is still there")
+            .dict
+            .get(b"Filter")
+            .unwrap()
+            .clone()
+    }
+
+    /// ReportLab and qpdf store a JPEG under an outer filter, ASCII hex or
+    /// Flate before DCTDecode. The picture was skipped and kept its EXIF. The
+    /// outer filters are undone and the JPEG is stored bare.
+    #[test]
+    fn a_picture_under_a_filter_chain_loses_its_exif_too() {
+        // Long enough that Flate shrinks it, which lopdf requires before it
+        // will compress at all.
+        let exif = [&b"Exif\0\0"[..], &[b'x'; 400], b"GPS 33.4484N 112.0740W"].concat();
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        jpeg.extend_from_slice(&((exif.len() + 2) as u16).to_be_bytes());
+        jpeg.extend_from_slice(&exif);
+        jpeg.extend_from_slice(&SCAN_ONLY[2..]);
+        let hex: Vec<u8> = jpeg.iter().map(|b| format!("{b:02X}")).collect::<String>().into_bytes();
+        let mut flate = lopdf::Stream::new(dictionary! {}, jpeg.clone());
+        flate.compress().unwrap();
+        assert!(flate.dict.has(b"Filter"), "lopdf did not compress the fixture");
+        for (outer, stored) in [("ASCIIHexDecode", [hex, b">".to_vec()].concat()), ("FlateDecode", flate.content)] {
+            let chain = Object::Array(vec![name(outer), name("DCTDecode")]);
+            let out = rewrite(&pdf_with_image(chain, stored), Mode::Strip, 0.0, 0.0, 0, None)
+                .unwrap_or_else(|e| panic!("{outer}: {e}"));
+            assert_eq!(first_image_content(&out.data), SCAN_ONLY, "{outer}: the EXIF survived");
+            assert_eq!(first_image_filter(&out.data).as_name().unwrap(), b"DCTDecode");
+        }
+    }
+
+    /// A filter may be named through a reference. It still names DCTDecode.
+    #[test]
+    fn a_filter_given_by_reference_is_followed() {
+        let mut doc = Document::with_version("1.5");
+        let filter = doc.add_object(name("DCTDecode"));
+        let picture = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {
+                "Type" => name("XObject"), "Subtype" => name("Image"), "Width" => 1, "Height" => 1,
+                "ColorSpace" => name("DeviceRGB"), "BitsPerComponent" => 8, "Filter" => Object::Reference(filter),
+            },
+            jpeg_with_exif(),
+        )));
+        one_page(
+            &mut doc,
+            dictionary! { "Resources" => dictionary! { "XObject" => dictionary! { "Im0" => Object::Reference(picture) } } },
+            dictionary! { "MediaBox" => rect(612, 792) },
+        );
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        let out = rewrite(&bytes, Mode::Strip, 0.0, 0.0, 0, None).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(first_image_content(&out.data), SCAN_ONLY, "the EXIF survived");
+    }
+
+    /// A picture Strip cannot walk keeps whatever it carries, so the document
+    /// is refused rather than written with it and reported clean.
+    #[test]
+    fn a_picture_that_cannot_be_read_refuses_the_strip() {
+        let mut truncated = jpeg_with_exif();
+        truncated.truncate(truncated.len() - 2); // no end of image
+        let bytes = pdf_with_image(name("DCTDecode"), truncated);
+        assert!(rewrite(&bytes, Mode::Strip, 0.0, 0.0, 0, None).is_err(), "written with its EXIF");
+    }
+
+    /// An HDR photograph placed whole in a PDF keeps its gain map, as it does
+    /// when stripped on its own. Cutting at the primary's end of image threw
+    /// the map away.
+    #[test]
+    fn a_picture_inside_keeps_its_gain_map() {
+        let iso: &[u8] = b"urn:iso:std:iso:ts:21496:-1\0\0\0";
+        let mut map = vec![0xFF, 0xD8, 0xFF, 0xE2];
+        map.extend_from_slice(&((iso.len() + 2) as u16).to_be_bytes());
+        map.extend_from_slice(iso);
+        map.extend_from_slice(&SCAN_ONLY[2..]);
+        let photo = crate::gainmap::attach(&jpeg_with_exif(), &[map], None).unwrap();
+
+        let out = rewrite(&pdf_with_image(name("DCTDecode"), photo), Mode::Strip, 0.0, 0.0, 0, None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let stored = first_image_content(&out.data);
+        assert!(!stored.windows(4).any(|w| w == b"Exif"), "the EXIF survived");
+        let found = crate::gainmap::extract(&stored).expect("the gain map was cut off");
+        assert_eq!(found.images.len(), 1);
     }
 
     #[test]

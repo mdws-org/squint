@@ -159,7 +159,8 @@ pub fn orientation_segment(orientation: u16) -> Vec<u8> {
 /// and sanitising one: a photograph being delivered as finished work should lose
 /// its location data without being re-encoded.
 ///
-/// Every `APPn` segment is dropped except the ICC colour profile. That covers
+/// Every `APPn` segment is dropped except the ICC colour profile and Adobe's
+/// colour-transform flag (APP14). That covers
 /// EXIF and its embedded thumbnail (APP1), XMP (APP1), IPTC (APP13), Multi
 /// Picture Format and HDR gain maps (APP2), Apple's rotation block (APP10), and
 /// C2PA content credentials (APP11), without needing to recognise any of them:
@@ -227,7 +228,14 @@ pub fn strip_jpeg(jpeg: &[u8]) -> Option<Vec<u8>> {
         // there. Without the marker test, any segment at all that opened with
         // the tag would survive a strip.
         let is_profile = marker == 0xE2 && payload.starts_with(b"ICC_PROFILE\0");
-        let keep = (!is_app && !is_comment) || is_profile;
+        // Adobe's APP14 says whether a four-component scan is CMYK or YCCK and
+        // whether it is inverted: a version and flags, nothing identifying.
+        // Without it a CMYK JPEG decodes as a colour negative. The segment is
+        // exactly twelve bytes, "Adobe" and seven of version and flags, so one
+        // of any other length is not it.
+        let is_adobe_transform =
+            marker == 0xEE && payload.len() == 12 && payload.starts_with(b"Adobe");
+        let keep = (!is_app && !is_comment) || is_profile || is_adobe_transform;
 
         if keep {
             out.extend_from_slice(&jpeg[i..i + 2 + len]);

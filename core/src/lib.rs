@@ -302,6 +302,47 @@ fn strip_gain_map(map: &[u8]) -> Option<Vec<u8>> {
     gainmap::insert_segments(&bare, &gainmap::descriptive_segments(map))
 }
 
+/// Strip a JPEG file, keeping the secondary images its Multi Picture Format
+/// index lists, each stripped of its own metadata.
+///
+/// A secondary image is picture data, not metadata. Stripping a photograph of
+/// its location should not also take away half its brightness, or one eye of
+/// a stereo pair. An `orientation` other than 1 goes back on the primary as a
+/// tag, before anything else, because it lengthens the picture and the index
+/// records where the picture ends. Returns the file and what became of a gain
+/// map; `None` when the primary does not walk as a JPEG.
+pub(crate) fn strip_jpeg_file(bytes: &[u8], orientation: u16) -> Result<Option<(Vec<u8>, Hdr)>, Error> {
+    let bare = metadata::strip_jpeg(bytes).and_then(|stripped| match orientation {
+        1 => Some(stripped),
+        turned => gainmap::insert_segments(&stripped, &[(0xE1, metadata::orientation_segment(turned))]),
+    });
+    let Some(bare) = bare else {
+        return Ok(None);
+    };
+    Ok(Some(match gainmap::extract(bytes) {
+        Some(found) => {
+            let cleaned = found
+                .images
+                .iter()
+                .map(|img| strip_gain_map(img))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| Error::Encode("could not strip a secondary image".into()))?;
+            let hdr = if found.has_gain_map { Hdr::Preserved } else { Hdr::Absent };
+            match gainmap::attach(&bare, &cleaned, found.iso_segment.as_deref()) {
+                Some(joined) => (joined, hdr),
+                // Reattaching failed, so whatever was carried is gone.
+                None if found.has_gain_map => (bare, Hdr::Dropped),
+                None => (bare, Hdr::Absent),
+            }
+        }
+        // No index to read. The marker in the primary can still say a map was
+        // there, and stripping cuts at the end of the primary, so it is gone
+        // either way and must not be reported as absent.
+        None if gainmap::signals_hdr(bytes) => (bare, Hdr::Dropped),
+        None => (bare, Hdr::Absent),
+    }))
+}
+
 /// One encode plus one measurement.
 #[derive(Debug, Clone)]
 pub struct Probe {
@@ -758,42 +799,9 @@ pub fn optimize_as(
         let (stripped, hdr) = if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
             (png::strip_png(bytes), Hdr::Absent)
         } else {
-            // The orientation tag goes back on before anything else, because it
-            // lengthens the picture and the gain map's index records where the
-            // picture ends.
-            let bare = metadata::strip_jpeg(bytes).and_then(|stripped| {
-                match extract_orientation(bytes) {
-                    1 => Some(stripped),
-                    turned => gainmap::insert_segments(
-                        &stripped,
-                        &[(0xE1, metadata::orientation_segment(turned))],
-                    ),
-                }
-            });
-            // A secondary image is picture data, not metadata. Stripping a
-            // photograph of its location should not also take away half its
-            // brightness, or one eye of a stereo pair.
-            match (bare, gainmap::extract(bytes)) {
-                (Some(bare), Some(found)) => {
-                    let cleaned = found
-                        .images
-                        .iter()
-                        .map(|img| strip_gain_map(img))
-                        .collect::<Option<Vec<_>>>()
-                        .ok_or_else(|| Error::Encode("could not strip a secondary image".into()))?;
-                    let hdr = if found.has_gain_map { Hdr::Preserved } else { Hdr::Absent };
-                    match gainmap::attach(&bare, &cleaned, found.iso_segment.as_deref()) {
-                        Some(joined) => (Some(joined), hdr),
-                        // Reattaching failed, so whatever was carried is gone.
-                        None if found.has_gain_map => (Some(bare), Hdr::Dropped),
-                        None => (Some(bare), Hdr::Absent),
-                    }
-                }
-                // No index to read. The marker in the primary can still say a map
-                // was there, and stripping cuts at the end of the primary, so it
-                // is gone either way and must not be reported as absent.
-                (Some(bare), None) if gainmap::signals_hdr(bytes) => (Some(bare), Hdr::Dropped),
-                (bare, _) => (bare, Hdr::Absent),
+            match strip_jpeg_file(bytes, extract_orientation(bytes))? {
+                Some((file, hdr)) => (Some(file), hdr),
+                None => (None, Hdr::Absent),
             }
         };
         let stripped = stripped.ok_or_else(|| Error::Decode("not a JPEG or PNG".into()))?;
@@ -1466,6 +1474,45 @@ mod tests {
         jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x11, 0x22, 0xFF, 0xD9]);
         let out = metadata::strip_jpeg(&jpeg).expect("walks cleanly");
         assert!(!out.windows(11).any(|w| w == b"ICC_PROFILE"));
+    }
+
+    /// Adobe's APP14 segment says how a four-component scan is to be read: CMYK
+    /// or YCCK, and whether the channels are inverted. It holds a version and
+    /// flags and nothing about the photographer. Dropping it with the other APPn
+    /// segments made a Photoshop CMYK JPEG render as a colour negative after a
+    /// Strip that promises identical pixels.
+    #[test]
+    fn the_adobe_colour_transform_segment_survives_a_strip() {
+        let adobe: &[u8] = b"Adobe\x00\x64\x00\x00\x00\x00\x02";
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xEE, 0x00, (adobe.len() + 2) as u8];
+        jpeg.extend_from_slice(adobe);
+        jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x11, 0x22, 0xFF, 0xD9]);
+        let out = metadata::strip_jpeg(&jpeg).expect("walks cleanly");
+        assert_eq!(out, jpeg, "the Adobe segment must be kept byte for byte");
+    }
+
+    /// Only Adobe's own segment is kept. Anything else in APP14 is dropped like
+    /// every other application segment.
+    #[test]
+    fn other_app14_payloads_are_still_removed() {
+        let other: &[u8] = b"Ducky\x00camera owner";
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xEE, 0x00, (other.len() + 2) as u8];
+        jpeg.extend_from_slice(other);
+        jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x11, 0x22, 0xFF, 0xD9]);
+        let out = metadata::strip_jpeg(&jpeg).expect("walks cleanly");
+        assert!(!out.windows(5).any(|w| w == b"Ducky"));
+    }
+
+    /// Adobe's segment is exactly twelve bytes. One that opens the same way
+    /// and carries more is not that segment and goes, whatever it carries.
+    #[test]
+    fn an_app14_that_only_starts_like_adobes_is_removed() {
+        let longer: &[u8] = b"Adobe\x00\x64\x00\x00\x00\x00\x02owner Ben Meadows";
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xEE, 0x00, (longer.len() + 2) as u8];
+        jpeg.extend_from_slice(longer);
+        jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x11, 0x22, 0xFF, 0xD9]);
+        let out = metadata::strip_jpeg(&jpeg).expect("walks cleanly");
+        assert!(!out.windows(10).any(|w| w == b"Ben Meadow"), "the extra bytes survived");
     }
 
     #[test]
