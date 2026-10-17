@@ -230,8 +230,11 @@ pub fn strip_jpeg(jpeg: &[u8]) -> Option<Vec<u8>> {
         let is_profile = marker == 0xE2 && payload.starts_with(b"ICC_PROFILE\0");
         // Adobe's APP14 says whether a four-component scan is CMYK or YCCK and
         // whether it is inverted: a version and flags, nothing identifying.
-        // Without it a CMYK JPEG decodes as a colour negative.
-        let is_adobe_transform = marker == 0xEE && payload.starts_with(b"Adobe");
+        // Without it a CMYK JPEG decodes as a colour negative. The segment is
+        // exactly twelve bytes, "Adobe" and seven of version and flags, so one
+        // of any other length is not it.
+        let is_adobe_transform =
+            marker == 0xEE && payload.len() == 12 && payload.starts_with(b"Adobe");
         let keep = (!is_app && !is_comment) || is_profile || is_adobe_transform;
 
         if keep {
