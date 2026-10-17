@@ -199,18 +199,19 @@ pub fn signals_hdr(jpeg: &[u8]) -> bool {
 /// to its values — so dropping them leaves a greyscale picture nothing can read.
 /// EXIF is not among them and goes the way of the primary's.
 ///
-/// XMP is kept only when it holds nothing but rendering parameters. A gain map
-/// whose XMP holds anything more gives `None`, because removing the packet
-/// would leave the map unreadable while it was reported as kept. Any other
-/// secondary has no use for XMP and loses it.
+/// XMP is kept only when it holds nothing but rendering parameters. A packet
+/// that holds rendering parameters and anything more gives `None`: removing it
+/// would leave the map unreadable while it was reported as kept, and keeping
+/// it would keep the rest. A packet that names no rendering parameters at all
+/// carries nothing a renderer needs, and goes.
 pub fn descriptive_segments(map: &[u8]) -> Option<Vec<(u8, Vec<u8>)>> {
-    let is_gain_map = GAIN_MAP_NEEDLES.iter().any(|n| contains(map, n));
     let mut kept = Vec::new();
     for (m, _, p) in segments(map) {
         if m == 0xE1 && p.starts_with(XMP_TAG) {
-            if crate::heif::xmp_is_rendering_only(&p[XMP_TAG.len()..]) {
+            let packet = &p[XMP_TAG.len()..];
+            if crate::heif::xmp_is_rendering_only(packet) {
                 kept.push((m, p.to_vec()));
-            } else if is_gain_map {
+            } else if crate::heif::RENDERING_NAMESPACES.iter().any(|ns| contains(packet, ns.as_bytes())) {
                 return None;
             }
         } else if m == 0xE2 && p.starts_with(ISO_TAG) {

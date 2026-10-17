@@ -1503,6 +1503,18 @@ mod tests {
         }
     }
 
+    /// A secondary whose bytes happen to match a gain map's markers but whose
+    /// XMP names no rendering parameters at all is not refused: there is
+    /// nothing in that packet a renderer needs, so it goes.
+    #[test]
+    fn strip_drops_xmp_that_holds_no_rendering_parameters_even_on_a_likely_gain_map() {
+        let container = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:GContainer="http://ns.google.com/photos/1.0/container/" GContainer:Directory="depth map at home"/></rdf:RDF></x:xmpmeta>"#;
+        let out = optimize(&joined_with(&[container]), Mode::Strip, 0.0, 0.0, None, 0, None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(!holds(&out.data, b"depth map at home"), "the packet survived");
+        assert_eq!(gainmap::extract(&out.data).map(|found| found.images.len()), Some(1));
+    }
+
     /// Any other secondary has no use for XMP, so it loses the packet and
     /// keeps its place in the file.
     #[test]
