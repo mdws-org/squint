@@ -98,6 +98,8 @@ final class Job: ObservableObject, Identifiable {
             value /= 1024
             unit += 1
         }
-        return String(format: unit == 0 ? "%.0f %@" : "%.1f %@", value, units[unit])
+        // Megabytes keep one decimal, since "3.6 MB to 3.1 MB" is the comparison
+        // people read; bytes and kilobytes are whole numbers.
+        return String(format: unit == 2 ? "%.1f %@" : "%.0f %@", value, units[unit])
     }
 }

@@ -167,7 +167,7 @@ sh tools/build-store.sh ~/squint-signing/squint-app-store.provisionprofile \
     <Apple Distribution SHA-1> <Mac Installer Distribution SHA-1> "$KC"
 ```
 
-The script refuses a profile issued for another bundle identifier. It writes `app/build/Squint-<version>-appstore.pkg`. Over SSH, `productbuild` prints four `write: Permission denied` lines to stderr and still exits 0; the package it writes is complete, and `pkgutil --check-signature` and App Store Connect validation both pass on it. With `ASC_KEY_ID`, `ASC_ISSUER_ID` and `API_PRIVATE_KEYS_DIR=~/squint-signing` set, App Store Connect also validates the package. Uploading needs `UPLOAD=1` in addition, and it is a separate decision from building.
+The script refuses a profile issued for another bundle identifier. It writes `app/build/Squint-<version>-appstore.pkg`, which installs `/Applications/Squint Image Optimizer.app`, so it never collides with the full edition's `Squint.app`. Over SSH, `productbuild` prints four `write: Permission denied` lines to stderr and still exits 0; the package it writes is complete, and `pkgutil --check-signature` and App Store Connect validation both pass on it. With `ASC_KEY_ID`, `ASC_ISSUER_ID` and `API_PRIVATE_KEYS_DIR=~/squint-signing` set, App Store Connect also validates the package. Uploading needs `UPLOAD=1` in addition, and it is a separate decision from building.
 
 The two certificates are issued against keys generated on svk in `~/squint-signing/` (`appstore-distribution.key`, `appstore-installer.key`) and escrowed in the Fleet vault as `squint App Store distribution private key` and `squint Mac Installer distribution private key`. Install each pair once, as for the Developer ID pair:
 
