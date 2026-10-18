@@ -263,12 +263,17 @@ pub fn rewrite(
     let mut doc = Document::load_mem(bytes)
         .map_err(|e| Error::Decode(format!("this PDF could not be read: {e}")))?;
 
-    let metadata_removed = strip_document_metadata(&mut doc);
+    let metadata_removed =
+        strip_document_metadata(&mut doc) + strip_image_metadata(&mut doc, mode == Mode::Strip)?;
 
     // Strip means the pixels are not touched, in a PDF as anywhere else. The
-    // document's own metadata has already gone; the pictures inside it keep
-    // every byte they arrived with.
+    // document's own metadata has already gone, and so has the EXIF inside its
+    // JPEG pictures; their scans keep every byte they arrived with.
     if mode == Mode::Strip {
+        // An object nothing refers to any more is still written out by the
+        // save, so a removed reference would leave its target (an annotation's
+        // author, an editor's private data) in the file.
+        doc.prune_objects();
         let mut out = Vec::new();
         doc.save_modern(&mut out)
             .map_err(|e| Error::Encode(format!("this PDF could not be written: {e}")))?;
@@ -415,13 +420,22 @@ fn encode_one(
 fn strip_document_metadata(doc: &mut Document) -> usize {
     let mut removed = 0;
 
-    // The trailer points at the info dictionary; emptying it is enough, and
-    // leaves a valid reference for any reader that expects one.
-    if let Ok(Object::Reference(id)) = doc.trailer.get(b"Info").cloned() {
-        if let Ok(info) = doc.get_dictionary_mut(id) {
-            removed += info.len();
-            *info = lopdf::Dictionary::new();
+    // The trailer usually points at the info dictionary; emptying it is enough,
+    // and leaves a valid reference for any reader that expects one. A writer
+    // may also put the dictionary in the trailer itself, and that copy is
+    // emptied in place.
+    match doc.trailer.get(b"Info").cloned() {
+        Ok(Object::Reference(id)) => {
+            if let Ok(info) = doc.get_dictionary_mut(id) {
+                removed += info.len();
+                *info = lopdf::Dictionary::new();
+            }
         }
+        Ok(Object::Dictionary(info)) => {
+            removed += info.len();
+            doc.trailer.set("Info", lopdf::Dictionary::new());
+        }
+        _ => {}
     }
 
     let mut packets: BTreeSet<ObjectId> = BTreeSet::new();
@@ -452,7 +466,122 @@ fn strip_document_metadata(doc: &mut Document) -> usize {
         doc.delete_object(id);
     }
 
+    // A PDF 1.5 cross-reference stream is an object whose dictionary is the
+    // trailer, info dictionary included when the writer put it there directly.
+    // lopdf loads it like any other object and writes it back out beside the
+    // fresh cross-reference it builds on save, so the old trailer, author and
+    // all, would ride along. It describes the file as it arrived and nothing
+    // reads it once the document is rewritten.
+    let stale_xref: Vec<ObjectId> = doc
+        .objects
+        .iter()
+        .filter(|(_, o)| {
+            o.as_stream().ok().and_then(|s| s.dict.get(b"Type").ok()).and_then(|t| t.as_name().ok())
+                == Some(&b"XRef"[..])
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    for id in stale_xref {
+        doc.objects.remove(&id);
+    }
+
     removed
+}
+
+/// Remove EXIF, XMP and the other application segments from the JPEG pictures
+/// inside a document, the way a JPEG Strip does, leaving each scan byte for
+/// byte. A scanner or img2pdf stores a photograph as its whole JPEG file, GPS
+/// and camera serial included; ReportLab and qpdf wrap it in ASCII or Flate
+/// first. Outer filters are undone and the stripped JPEG is stored bare.
+///
+/// With `strict`, which Strip asks for, a picture whose filters cannot be
+/// undone or whose JPEG does not walk refuses the document, because what it
+/// carries cannot be shown to be gone. Returns the number of pictures that
+/// lost metadata.
+fn strip_image_metadata(doc: &mut Document, strict: bool) -> Result<usize, Error> {
+    let unreadable = || Error::Decode("a picture inside this PDF could not be read, so its metadata cannot be shown to be removed".into());
+    let mut work = Vec::new();
+    for (id, object) in &doc.objects {
+        let Ok(stream) = object.as_stream() else { continue };
+        let is_image = stream.dict.get(b"Subtype").and_then(|o| o.as_name()).map(|n| n == b"Image").unwrap_or(false);
+        if !is_image {
+            continue;
+        }
+        let Some(filters) = filter_names(doc, &stream.dict) else { continue };
+        if filters.last().map(Vec::as_slice) != Some(&b"DCTDecode"[..]) {
+            continue;
+        }
+        work.push((*id, filters));
+    }
+
+    let mut stripped = 0;
+    for (id, filters) in work {
+        let Ok(stream) = doc.get_object_mut(id).and_then(Object::as_stream_mut) else { continue };
+        let outer = &filters[..filters.len() - 1];
+        let jpeg = if outer.is_empty() {
+            stream.content.clone()
+        } else {
+            let mut wrapper = lopdf::Dictionary::new();
+            wrapper.set("Filter", Object::Array(outer.iter().map(|n| Object::Name(n.clone())).collect()));
+            if let (1, Ok(Object::Array(params))) = (outer.len(), stream.dict.get(b"DecodeParms")) {
+                if let Some(Object::Dictionary(first)) = params.first() {
+                    wrapper.set("DecodeParms", first.clone());
+                }
+            }
+            match lopdf::Stream::new(wrapper, stream.content.clone()).decompressed_content_with_limit(MAX_DECODED) {
+                Ok(bytes) => bytes,
+                Err(_) if strict => return Err(unreadable()),
+                Err(_) => continue,
+            }
+        };
+        let clean = match crate::strip_jpeg_file(&jpeg, 1) {
+            Ok(Some((clean, _))) => clean,
+            Ok(None) if strict => return Err(unreadable()),
+            Err(e) if strict => return Err(e),
+            _ => continue,
+        };
+        if clean == jpeg {
+            continue;
+        }
+        let dct_params = match stream.dict.get(b"DecodeParms") {
+            Ok(Object::Array(params)) => params.last().filter(|p| p.as_dict().is_ok()).cloned(),
+            Ok(params @ Object::Dictionary(_)) if outer.is_empty() => Some(params.clone()),
+            _ => None,
+        };
+        stream.dict.set("Filter", Object::Name(b"DCTDecode".to_vec()));
+        match dct_params {
+            Some(params) => stream.dict.set("DecodeParms", params),
+            None => {
+                stream.dict.remove(b"DecodeParms");
+            }
+        }
+        stream.set_content(clean);
+        stripped += 1;
+    }
+    Ok(stripped)
+}
+
+/// Decoded size allowed for one picture's outer filters, against a stream
+/// built to expand without limit.
+const MAX_DECODED: usize = 512 * 1024 * 1024;
+
+/// A stream's filters in decoding order, following references, or `None` when
+/// it has none or they are not names.
+fn filter_names(doc: &Document, dict: &lopdf::Dictionary) -> Option<Vec<Vec<u8>>> {
+    let resolve = |o: &Object| -> Option<Object> {
+        match o {
+            Object::Reference(id) => doc.get_object(*id).ok().cloned(),
+            other => Some(other.clone()),
+        }
+    };
+    match resolve(dict.get(b"Filter").ok()?)? {
+        Object::Name(n) => Some(vec![n]),
+        Object::Array(items) => items
+            .iter()
+            .map(|o| resolve(o).and_then(|o| o.as_name().ok().map(<[u8]>::to_vec)))
+            .collect(),
+        _ => None,
+    }
 }
 
 /// Pages a document declares, for the harness to report.
@@ -492,6 +621,172 @@ mod tests {
         let catalog = doc.add_object(dictionary! { "Type" => name("Catalog"), "Pages" => Object::Reference(pages) });
         doc.trailer.set("Root", Object::Reference(catalog));
         (pages, page)
+    }
+
+    /// The smallest JPEG `strip_jpeg` walks: an EXIF segment naming a place,
+    /// then a scan.
+    const SCAN_ONLY: [u8; 10] = [0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x02, 0x11, 0x22, 0xFF, 0xD9];
+
+    fn jpeg_with_exif() -> Vec<u8> {
+        let exif: &[u8] = b"Exif\0\0GPS 33.4484N 112.0740W";
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        jpeg.extend_from_slice(&((exif.len() + 2) as u16).to_be_bytes());
+        jpeg.extend_from_slice(exif);
+        jpeg.extend_from_slice(&SCAN_ONLY[2..]);
+        jpeg
+    }
+
+    /// A one-page PDF drawing one image stream stored under `filter`.
+    fn pdf_with_image(filter: Object, content: Vec<u8>) -> Vec<u8> {
+        let mut doc = Document::with_version("1.5");
+        let picture = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {
+                "Type" => name("XObject"), "Subtype" => name("Image"), "Width" => 1, "Height" => 1,
+                "ColorSpace" => name("DeviceRGB"), "BitsPerComponent" => 8, "Filter" => filter,
+            },
+            content,
+        )));
+        one_page(
+            &mut doc,
+            dictionary! { "Resources" => dictionary! { "XObject" => dictionary! {
+                "Im0" => Object::Reference(picture) } } },
+            dictionary! { "MediaBox" => rect(612, 792) },
+        );
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn first_image_content(bytes: &[u8]) -> Vec<u8> {
+        let doc = Document::load_mem(bytes).unwrap();
+        doc.objects
+            .values()
+            .filter_map(|o| o.as_stream().ok())
+            .find(|s| s.dict.get(b"Subtype").and_then(|n| n.as_name()).map(|n| n == b"Image").unwrap_or(false))
+            .expect("the image is still there")
+            .content
+            .clone()
+    }
+
+    /// An img2pdf or scanner PDF stores each photograph as its JPEG file, EXIF
+    /// and GPS included. Strip removed the document's metadata and left every
+    /// picture's, while the row said the location was gone.
+    #[test]
+    fn strip_removes_exif_from_the_pictures_inside() {
+        let bytes = pdf_with_image(name("DCTDecode"), jpeg_with_exif());
+        let out = rewrite(&bytes, Mode::Strip, 0.0, 0.0, 0, None).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!out.data.windows(4).any(|w| w == b"Exif"), "the picture's EXIF survived");
+        assert_eq!(first_image_content(&out.data), SCAN_ONLY, "the scan must be untouched");
+        assert!(out.metadata_removed >= 1, "a picture's EXIF is metadata removed");
+    }
+
+    /// The trailer may hold the info dictionary itself rather than a reference
+    /// to one. Only the reference was emptied, so a direct dictionary kept the
+    /// author, and a file carrying nothing else reported nothing to remove. A
+    /// 1.5 file also keeps a copy of the trailer in its old cross-reference
+    /// stream, which lopdf wrote back out unchanged.
+    #[test]
+    fn an_info_dictionary_written_into_the_trailer_is_emptied() {
+        let mut doc = Document::with_version("1.5");
+        one_page(&mut doc, dictionary! {}, dictionary! { "MediaBox" => rect(612, 792) });
+        doc.trailer.set("Info", dictionary! { "Author" => Object::string_literal("Ben Meadows") });
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+
+        let out = rewrite(&bytes, Mode::Strip, 0.0, 0.0, 0, None).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!out.data.windows(11).any(|w| w == b"Ben Meadows"), "the author survived");
+        assert_eq!(out.metadata_removed, 1);
+    }
+
+    fn first_image_filter(bytes: &[u8]) -> Object {
+        let doc = Document::load_mem(bytes).unwrap();
+        doc.objects
+            .values()
+            .filter_map(|o| o.as_stream().ok())
+            .find(|s| s.dict.get(b"Subtype").and_then(|n| n.as_name()).map(|n| n == b"Image").unwrap_or(false))
+            .expect("the image is still there")
+            .dict
+            .get(b"Filter")
+            .unwrap()
+            .clone()
+    }
+
+    /// ReportLab and qpdf store a JPEG under an outer filter, ASCII hex or
+    /// Flate before DCTDecode. The picture was skipped and kept its EXIF. The
+    /// outer filters are undone and the JPEG is stored bare.
+    #[test]
+    fn a_picture_under_a_filter_chain_loses_its_exif_too() {
+        // Long enough that Flate shrinks it, which lopdf requires before it
+        // will compress at all.
+        let exif = [&b"Exif\0\0"[..], &[b'x'; 400], b"GPS 33.4484N 112.0740W"].concat();
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        jpeg.extend_from_slice(&((exif.len() + 2) as u16).to_be_bytes());
+        jpeg.extend_from_slice(&exif);
+        jpeg.extend_from_slice(&SCAN_ONLY[2..]);
+        let hex: Vec<u8> = jpeg.iter().map(|b| format!("{b:02X}")).collect::<String>().into_bytes();
+        let mut flate = lopdf::Stream::new(dictionary! {}, jpeg.clone());
+        flate.compress().unwrap();
+        assert!(flate.dict.has(b"Filter"), "lopdf did not compress the fixture");
+        for (outer, stored) in [("ASCIIHexDecode", [hex, b">".to_vec()].concat()), ("FlateDecode", flate.content)] {
+            let chain = Object::Array(vec![name(outer), name("DCTDecode")]);
+            let out = rewrite(&pdf_with_image(chain, stored), Mode::Strip, 0.0, 0.0, 0, None)
+                .unwrap_or_else(|e| panic!("{outer}: {e}"));
+            assert_eq!(first_image_content(&out.data), SCAN_ONLY, "{outer}: the EXIF survived");
+            assert_eq!(first_image_filter(&out.data).as_name().unwrap(), b"DCTDecode");
+        }
+    }
+
+    /// A filter may be named through a reference. It still names DCTDecode.
+    #[test]
+    fn a_filter_given_by_reference_is_followed() {
+        let mut doc = Document::with_version("1.5");
+        let filter = doc.add_object(name("DCTDecode"));
+        let picture = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! {
+                "Type" => name("XObject"), "Subtype" => name("Image"), "Width" => 1, "Height" => 1,
+                "ColorSpace" => name("DeviceRGB"), "BitsPerComponent" => 8, "Filter" => Object::Reference(filter),
+            },
+            jpeg_with_exif(),
+        )));
+        one_page(
+            &mut doc,
+            dictionary! { "Resources" => dictionary! { "XObject" => dictionary! { "Im0" => Object::Reference(picture) } } },
+            dictionary! { "MediaBox" => rect(612, 792) },
+        );
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        let out = rewrite(&bytes, Mode::Strip, 0.0, 0.0, 0, None).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(first_image_content(&out.data), SCAN_ONLY, "the EXIF survived");
+    }
+
+    /// A picture Strip cannot walk keeps whatever it carries, so the document
+    /// is refused rather than written with it and reported clean.
+    #[test]
+    fn a_picture_that_cannot_be_read_refuses_the_strip() {
+        let mut truncated = jpeg_with_exif();
+        truncated.truncate(truncated.len() - 2); // no end of image
+        let bytes = pdf_with_image(name("DCTDecode"), truncated);
+        assert!(rewrite(&bytes, Mode::Strip, 0.0, 0.0, 0, None).is_err(), "written with its EXIF");
+    }
+
+    /// An HDR photograph placed whole in a PDF keeps its gain map, as it does
+    /// when stripped on its own. Cutting at the primary's end of image threw
+    /// the map away.
+    #[test]
+    fn a_picture_inside_keeps_its_gain_map() {
+        let iso: &[u8] = b"urn:iso:std:iso:ts:21496:-1\0\0\0";
+        let mut map = vec![0xFF, 0xD8, 0xFF, 0xE2];
+        map.extend_from_slice(&((iso.len() + 2) as u16).to_be_bytes());
+        map.extend_from_slice(iso);
+        map.extend_from_slice(&SCAN_ONLY[2..]);
+        let photo = crate::gainmap::attach(&jpeg_with_exif(), &[map], None).unwrap();
+
+        let out = rewrite(&pdf_with_image(name("DCTDecode"), photo), Mode::Strip, 0.0, 0.0, 0, None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let stored = first_image_content(&out.data);
+        assert!(!stored.windows(4).any(|w| w == b"Exif"), "the EXIF survived");
+        let found = crate::gainmap::extract(&stored).expect("the gain map was cut off");
+        assert_eq!(found.images.len(), 1);
     }
 
     #[test]
