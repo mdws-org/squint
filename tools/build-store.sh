@@ -38,10 +38,18 @@ if ! xcodebuild -scheme SquintStore -configuration Release -derivedDataPath buil
     tail -40 build/store-build.log
     exit 1
 fi
-APP="$ROOT/app/build/Build/Products/Release-AppStore/Squint.app"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
+
+# The store edition installs as "Squint Image Optimizer.app", its App Store
+# name, so it never lands on the full edition's Squint.app; the installer would
+# otherwise put it beside it as "Squint 2.app". Only the bundle's folder is
+# renamed: the executable, the menu bar name and the Services port stay Squint.
+APP="$ROOT/app/build/AppStore/Squint Image Optimizer.app"
+rm -rf "$(dirname "$APP")"
+mkdir -p "$(dirname "$APP")"
+ditto "$ROOT/app/build/Build/Products/Release-AppStore/Squint.app" "$APP"
 
 # A provisioning profile is a signed message; its content says which
 # application and team it was issued for. A profile for another bundle would
