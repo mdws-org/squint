@@ -87,6 +87,11 @@ pub enum Error {
     /// application reports it as one, under the same code as an already
     /// optimal file.
     NothingToRemove,
+    /// Strip found metadata, but the file without it would be larger than the
+    /// original, so the original is kept, metadata included. Not an outcome
+    /// like `NothingToRemove`: the user asked for the metadata to go and it is
+    /// still there, so it carries its own code and is shown as a failure.
+    StripWouldGrow { best_bytes: usize, original_bytes: usize },
     /// The picture declares more pixels than the engine will decode.
     TooLarge { width: usize, height: usize },
     /// The colour count could not be brought down to the floor that was asked
@@ -119,6 +124,10 @@ impl std::fmt::Display for Error {
                 "the result would be {best_bytes} bytes, no smaller than the original {original_bytes}; keeping the original"
             ),
             Error::NothingToRemove => write!(f, "nothing to remove; the file was not changed"),
+            Error::StripWouldGrow { best_bytes, original_bytes } => write!(
+                f,
+                "metadata was found, but the file without it would be {best_bytes} bytes, no smaller than the original {original_bytes}; the original was kept with its metadata"
+            ),
             Error::TooLarge { width, height } => write!(
                 f,
                 "image declares {width}x{height} pixels, beyond the {MAX_PIXELS} the engine will decode; the file was not changed"
@@ -709,7 +718,7 @@ pub fn optimize_as(
             // back larger. A larger result is refused as it is for every
             // other format, and the original stands.
             if r.data.len() >= bytes.len() {
-                return Err(Error::NoSmallerResult {
+                return Err(Error::StripWouldGrow {
                     best_bytes: r.data.len(),
                     original_bytes: bytes.len(),
                 });
@@ -812,7 +821,7 @@ pub fn optimize_as(
         // Something came out but the file did not shrink: the orientation
         // block written back can outweigh a very small amount removed.
         if stripped.len() >= bytes.len() {
-            return Err(Error::NoSmallerResult {
+            return Err(Error::StripWouldGrow {
                 best_bytes: stripped.len(),
                 original_bytes: bytes.len(),
             });
@@ -1194,7 +1203,7 @@ mod tests {
             rewritten.data.len()
         );
         match optimize(&tiny, Mode::Strip, 0.0, 0.0, None, 0, None) {
-            Err(Error::NoSmallerResult { best_bytes, original_bytes }) => {
+            Err(Error::StripWouldGrow { best_bytes, original_bytes }) => {
                 assert_eq!(original_bytes, tiny.len());
                 assert_eq!(best_bytes, rewritten.data.len());
             }
@@ -1683,6 +1692,15 @@ mod tests {
         );
 
         assert_eq!(Error::NothingToRemove.to_string(), "nothing to remove; the file was not changed");
+
+        let err_strip_grew = Error::StripWouldGrow { best_bytes: 1210, original_bytes: 1180 };
+        assert_eq!(
+            err_strip_grew.to_string(),
+            "metadata was found, but the file without it would be 1210 bytes, no smaller than the original 1180; the original was kept with its metadata"
+        );
+        // Raised at equal size too, where "larger" would be false.
+        let same = Error::StripWouldGrow { best_bytes: 1180, original_bytes: 1180 }.to_string();
+        assert!(!same.contains("larger"), "{same}");
 
         let err_too_large = Error::TooLarge { width: 60000, height: 60000 };
         assert_eq!(

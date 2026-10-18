@@ -36,6 +36,10 @@ pub const SQUINT_ERR_COLOURS: c_int = 10;
 pub const SQUINT_ERR_READ_ONLY: c_int = 11;
 pub const SQUINT_ERR_UNKNOWN_FORMAT: c_int = 12;
 pub const SQUINT_ERR_UNKNOWN_MODE: c_int = 13;
+/// Strip found metadata but the file without it would be larger, so the
+/// original was kept with its metadata. Distinct from `SQUINT_ERR_NO_SMALLER`,
+/// which the app reports as "nothing to remove" in Strip mode.
+pub const SQUINT_ERR_STRIP_GREW: c_int = 14;
 
 /// The result of one optimization.
 ///
@@ -84,6 +88,7 @@ fn code_for(e: &Error) -> c_int {
         Error::TooSmall { .. } => SQUINT_ERR_TOO_SMALL,
         Error::Unreachable { .. } => SQUINT_ERR_UNREACHABLE,
         Error::NoSmallerResult { .. } | Error::NothingToRemove => SQUINT_ERR_NO_SMALLER,
+        Error::StripWouldGrow { .. } => SQUINT_ERR_STRIP_GREW,
         Error::TooLarge { .. } => SQUINT_ERR_TOO_LARGE,
         Error::ColoursUnreachable { .. } => SQUINT_ERR_COLOURS,
         Error::ReadOnlyFormat { .. } => SQUINT_ERR_READ_ONLY,
@@ -270,6 +275,40 @@ mod tests {
         unsafe { squint_result_free(r) };
     }
 
+    /// Three hand-written objects with no room to spare: removing the one
+    /// producer entry cannot pay for the object and cross-reference streams the
+    /// rewrite adds, so a Strip of it comes out larger.
+    fn tiny_pdf_with_producer() -> Vec<u8> {
+        let objects = ["<</Type/Catalog/Pages 2 0 R>>", "<</Type/Pages/Kids[]/Count 0>>", "<</Producer(x)>>"];
+        let mut out = String::from("%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for (i, body) in objects.iter().enumerate() {
+            offsets.push(out.len());
+            out.push_str(&format!("{} 0 obj{body}endobj\n", i + 1));
+        }
+        let xref = out.len();
+        out.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1));
+        for offset in offsets {
+            out.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        out.push_str(&format!("trailer<</Size {}/Root 1 0 R/Info 3 0 R>>\nstartxref\n{xref}\n%%EOF\n", objects.len() + 1));
+        out.into_bytes()
+    }
+
+    /// A Strip that found metadata but would have grown the file keeps the
+    /// original, metadata included. It came back under the already-optimal
+    /// code, which the app words as "nothing to remove" in Strip mode: a claim
+    /// about privacy that was false.
+    #[test]
+    fn a_strip_that_would_grow_is_not_reported_as_nothing_to_remove() {
+        let pdf = tiny_pdf_with_producer();
+        let r = unsafe { squint_optimize(pdf.as_ptr(), pdf.len(), SQUINT_MODE_STRIP, 80.0, 75.0, -1, 0) };
+        let code = r.error;
+        unsafe { squint_result_free(r) };
+        assert_ne!(code, SQUINT_OK, "the test premise is a Strip that grows");
+        assert_ne!(code, SQUINT_ERR_NO_SMALLER, "a grown Strip was reported as nothing to remove");
+    }
+
     #[test]
     fn the_plain_entry_point_still_means_the_input_format() {
         let png = noisy_png(64);
@@ -335,6 +374,7 @@ pub extern "C" fn squint_error_message(code: c_int) -> *const c_char {
         SQUINT_ERR_READ_ONLY => b"this format can have its location data removed but cannot be shrunk yet; the file was not changed\0",
         SQUINT_ERR_UNKNOWN_FORMAT => b"the output format asked for is not one squint writes; the file was not changed\0",
         SQUINT_ERR_UNKNOWN_MODE => b"the mode asked for is not one squint has; the file was not changed\0",
+        SQUINT_ERR_STRIP_GREW => b"metadata was found, but removing it would make the file larger; the original was kept with its metadata\0",
         _ => b"unknown error\0",
     };
     s.as_ptr() as *const c_char
