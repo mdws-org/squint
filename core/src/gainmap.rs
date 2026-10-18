@@ -128,8 +128,13 @@ fn mpf_images(jpeg: &[u8]) -> Option<Vec<(usize, usize)>> {
         let e = entries_at + k * 16;
         let size = u32at(e + 4)? as usize;
         let rel = u32at(e + 8)? as usize;
-        // The first image is recorded as offset zero and starts at the file head.
-        let start = if rel == 0 { 0 } else { tiff_base + rel };
+        // The first image is recorded as offset zero and starts at the file
+        // head. No other image can start there.
+        let start = match (k, rel) {
+            (0, 0) => 0,
+            (_, 0) => return None,
+            _ => tiff_base + rel,
+        };
         if start + size > jpeg.len() {
             return None;
         }
@@ -193,14 +198,27 @@ pub fn signals_hdr(jpeg: &[u8]) -> bool {
 /// to apply it — the headroom it was authored against, and the transfer applied
 /// to its values — so dropping them leaves a greyscale picture nothing can read.
 /// EXIF is not among them and goes the way of the primary's.
-pub fn descriptive_segments(map: &[u8]) -> Vec<(u8, Vec<u8>)> {
-    segments(map)
-        .into_iter()
-        .filter(|(m, _, p)| {
-            (*m == 0xE1 && p.starts_with(XMP_TAG)) || (*m == 0xE2 && p.starts_with(ISO_TAG))
-        })
-        .map(|(m, _, p)| (m, p.to_vec()))
-        .collect()
+///
+/// XMP is kept only when it holds nothing but rendering parameters. A packet
+/// that holds rendering parameters and anything more gives `None`: removing it
+/// would leave the map unreadable while it was reported as kept, and keeping
+/// it would keep the rest. A packet that names no rendering parameters at all
+/// carries nothing a renderer needs, and goes.
+pub fn descriptive_segments(map: &[u8]) -> Option<Vec<(u8, Vec<u8>)>> {
+    let mut kept = Vec::new();
+    for (m, _, p) in segments(map) {
+        if m == 0xE1 && p.starts_with(XMP_TAG) {
+            let packet = &p[XMP_TAG.len()..];
+            if crate::heif::xmp_is_rendering_only(packet) {
+                kept.push((m, p.to_vec()));
+            } else if crate::heif::RENDERING_NAMESPACES.iter().any(|ns| contains(packet, ns.as_bytes())) {
+                return None;
+            }
+        } else if m == 0xE2 && p.starts_with(ISO_TAG) {
+            kept.push((m, p.to_vec()));
+        }
+    }
+    Some(kept)
 }
 
 /// Insert APP segments into a JPEG, after any JFIF and EXIF headers.
@@ -412,14 +430,34 @@ mod tests {
         assert!(back.has_gain_map);
     }
 
+    /// Only the first picture is recorded at offset zero. A later entry that
+    /// claims it would hand the primary back as a secondary, with every
+    /// segment the primary's own strip had just removed.
+    #[test]
+    fn a_later_entry_cannot_point_back_at_the_primary() {
+        let map = stub(&[(0xE1, [XMP_TAG, b"hdrgainmap"].concat())]);
+        let mut joined = attach(&stub(&[]), &[map], None).unwrap();
+        let primary_len = mpf_images(&joined).unwrap()[0].1 as u32;
+        let tiff_base = segments(&joined)
+            .into_iter()
+            .find(|(m, _, p)| *m == 0xE2 && p.starts_with(MPF_TAG))
+            .map(|(_, s, _)| s + MPF_TAG.len())
+            .unwrap();
+        let second = tiff_base + MPF_ENTRIES_REL as usize + 16;
+        joined[second + 4..second + 8].copy_from_slice(&primary_len.to_be_bytes());
+        joined[second + 8..second + 12].copy_from_slice(&0u32.to_be_bytes());
+
+        assert!(extract(&joined).is_none(), "the primary came back as a secondary");
+    }
+
     #[test]
     fn keeps_the_maps_parameters_and_drops_its_exif() {
         let map = stub(&[
-            (0xE1, [XMP_TAG, b"gain map parameters"].concat()),
+            (0xE1, [XMP_TAG, crate::heif::tests::IPHONE_JPEG_GAIN_MAP_XMP.as_bytes()].concat()),
             (0xE1, b"Exif\0\0camera identity".to_vec()),
             (0xE2, [ISO_TAG, b":-1\0"].concat()),
         ]);
-        let kept = descriptive_segments(&map);
+        let kept = descriptive_segments(&map).expect("Apple's parameters are kept");
 
         assert_eq!(kept.len(), 2, "XMP and the ISO marker, and nothing else");
         assert!(kept.iter().all(|(_, p)| !contains(p, b"camera identity")));
