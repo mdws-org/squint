@@ -179,7 +179,7 @@ pub fn strip_jpeg(jpeg: &[u8]) -> Option<Vec<u8>> {
     out.extend_from_slice(&jpeg[0..2]); // SOI
 
     let mut i = 2;
-    while i + 4 <= jpeg.len() {
+    while i + 2 <= jpeg.len() {
         if jpeg[i] != 0xFF {
             return None; // the walk has lost the marker boundary
         }
@@ -191,31 +191,51 @@ pub fn strip_jpeg(jpeg: &[u8]) -> Option<Vec<u8>> {
             continue;
         }
         if marker == 0xDA {
-            // Start of scan. Copy the entropy-coded data, but stop at the end of
-            // image rather than the end of file. Apple writes trailing data past
-            // EOI — the Multi Picture Format secondary image and XMP live there —
-            // and copying to EOF would carry that metadata straight through.
+            // Start of scan: copy the scan header, then the entropy-coded data up
+            // to the next real marker, and hand that marker back to this walk. A
+            // progressive file has several scans, and APPn or comment segments may
+            // sit before any of them, so they are filtered here like the ones
+            // before the first scan. The walk still stops at the end of image
+            // rather than the end of file: Apple writes the Multi Picture Format
+            // secondary image and its XMP past EOI.
             //
-            // Scanning for FFD9 is safe inside entropy-coded data: a literal FF is
-            // stored as FF00, and the only other markers permitted are the restart
-            // markers FFD0 through FFD7.
-            let mut j = i + 2;
+            // Inside entropy-coded data a literal FF is stored as FF00, restart
+            // markers FFD0 through FFD7 and the arithmetic coder's TEM, FF01, may
+            // appear, and any marker may be preceded by FF fill bytes. Everything
+            // else is a marker that ends the scan.
+            if i + 4 > jpeg.len() {
+                return None;
+            }
+            let len = u16::from_be_bytes([jpeg[i + 2], jpeg[i + 3]]) as usize;
+            if len < 2 || i + 2 + len > jpeg.len() {
+                return None;
+            }
+            let mut j = i + 2 + len;
             while j + 1 < jpeg.len() {
-                if jpeg[j] == 0xFF && jpeg[j + 1] == 0xD9 {
-                    out.extend_from_slice(&jpeg[i..j + 2]);
-                    return Some(out);
+                let next = jpeg[j + 1];
+                let in_scan = matches!(next, 0x00 | 0x01 | 0xFF | 0xD0..=0xD7);
+                if jpeg[j] == 0xFF && !in_scan {
+                    break;
                 }
                 j += 1;
             }
-            // No end marker anywhere in the scan. The pixels cannot be shown to
-            // have survived, so the original is left as it is.
-            return None;
+            if j + 1 >= jpeg.len() {
+                // No marker after the scan. The pixels cannot be shown to have
+                // survived, so the original is left as it is.
+                return None;
+            }
+            out.extend_from_slice(&jpeg[i..j]);
+            i = j;
+            continue;
         }
         if marker == 0xD9 {
             out.extend_from_slice(&jpeg[i..i + 2]);
             return Some(out);
         }
 
+        if i + 4 > jpeg.len() {
+            return None;
+        }
         let len = u16::from_be_bytes([jpeg[i + 2], jpeg[i + 3]]) as usize;
         if len < 2 || i + 2 + len > jpeg.len() {
             return None; // a segment claiming to end past the end of the file
