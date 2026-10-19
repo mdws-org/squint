@@ -15,6 +15,15 @@ fn hdr_note(hdr: Hdr) -> &'static str {
     }
 }
 
+/// Files attached inside a PDF, which no mode reads, for the same line.
+fn attachments_note(n: usize) -> String {
+    match n {
+        0 => String::new(),
+        1 => "  1 attached file kept unread".into(),
+        n => format!("  {n} attached files kept unread"),
+    }
+}
+
 fn usage() -> ! {
     eprintln!(
         "usage: squint <image> [--mode fast|quality] [--target <score>] [--quality <n>] [--probes <n>]
@@ -115,12 +124,13 @@ fn main() {
         match optimize(&bytes, Mode::Strip, 0.0, 0.0, None, probes, None) {
             Ok(r) => {
                 println!(
-                    "{}  {:>7.0} KB -> {:>7.0} KB  {:>5.1}%  metadata removed, pixels untouched{}  {:.3}s",
+                    "{}  {:>7.0} KB -> {:>7.0} KB  {:>5.1}%  metadata removed, pixels untouched{}{}  {:.3}s",
                     path,
                     bytes.len() as f64 / 1024.0,
                     r.data.len() as f64 / 1024.0,
                     100.0 * r.data.len() as f64 / bytes.len() as f64,
                     hdr_note(r.hdr),
+                    attachments_note(r.attachments),
                     t0.elapsed().as_secs_f64()
                 );
                 if let Some(o) = &out_path {
@@ -277,7 +287,7 @@ fn main() {
                 None => format!("  {:>5.1}% of original", 100.0 * r.data.len() as f64 / bytes.len() as f64),
             };
             println!(
-                "{:<8} {:<6} {:>7.0} KB{}{}  {} probes  {:.3}s{}{}",
+                "{:<8} {:<6} {:>7.0} KB{}{}  {} probes  {:.3}s{}{}{}",
                 mode,
                 r.quality.map_or("-".to_string(), |q| format!("q{q:.1}")),
                 r.data.len() as f64 / 1024.0,
@@ -289,7 +299,8 @@ fn main() {
                 match r.converted_from {
                     Some(f) => format!("  written as {} (from {f})", format.extension().to_uppercase()),
                     None => "".into(),
-                }
+                },
+                attachments_note(r.attachments)
             );
             if let Some(o) = &out_path {
                 // A converted result is a different kind of file from its

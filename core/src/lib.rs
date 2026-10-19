@@ -103,6 +103,11 @@ pub enum Error {
     /// A PDF carries a digital signature. Any rewrite, Strip included, would
     /// break it, so the file is refused rather than returned unsigned.
     Signed,
+    /// Strip found nothing else to remove from a PDF, but the PDF carries
+    /// attached files, which no mode reads. Not `NothingToRemove`: a location
+    /// inside an attachment would still be there, so it carries its own code
+    /// and is shown as a failure.
+    AttachmentsUnread { attachments: usize },
     /// Something below panicked. Reported rather than allowed to unwind into C,
     /// where it would abort the process and take every other job with it.
     Panicked,
@@ -150,6 +155,11 @@ impl std::fmt::Display for Error {
             Error::Signed => write!(
                 f,
                 "this PDF is digitally signed, and any change would break the signature; the file was not changed"
+            ),
+            Error::AttachmentsUnread { attachments } => write!(
+                f,
+                "nothing else to remove, but this PDF carries {attachments} attached file{}, which Strip does not read; the file was not changed",
+                if *attachments == 1 { "" } else { "s" }
             ),
             Error::Panicked => write!(f, "the engine failed unexpectedly; the file was not changed"),
         }
@@ -671,6 +681,9 @@ pub struct Optimized {
     pub quantized: bool,
     pub original_bytes: usize,
     pub converted_from: Option<&'static str>,
+    /// Files attached inside a PDF, kept as they were: no mode reads them.
+    /// Zero for every other format.
+    pub attachments: usize,
 }
 
 /// Optimize an encoded image, dispatching on its format.
@@ -721,6 +734,11 @@ pub fn optimize_as(
         if pdf::is_pdf(bytes) {
             let r = pdf::rewrite(bytes, Mode::Strip, 0.0, 0.0, 0, None)?;
             if r.metadata_removed == 0 {
+                // A location inside an attached file would still be there, so
+                // "nothing to remove" would be the wrong claim.
+                if r.attachments > 0 {
+                    return Err(Error::AttachmentsUnread { attachments: r.attachments });
+                }
                 return Err(Error::NothingToRemove);
             }
             // A rewritten document is not always smaller: one its writer had
@@ -742,6 +760,7 @@ pub fn optimize_as(
                 quantized: false,
                 original_bytes: bytes.len(),
                 converted_from: None,
+                attachments: r.attachments,
             });
         }
 
@@ -764,6 +783,7 @@ pub fn optimize_as(
                 quantized: false,
                 original_bytes: bytes.len(),
                 converted_from: None,
+                attachments: 0,
             });
         }
 
@@ -785,6 +805,7 @@ pub fn optimize_as(
                 quantized: false,
                 original_bytes: bytes.len(),
                 converted_from: None,
+                attachments: 0,
             });
         }
 
@@ -812,6 +833,7 @@ pub fn optimize_as(
                 quantized: false,
                 original_bytes: bytes.len(),
                 converted_from: None,
+                attachments: 0,
             });
         }
 
@@ -845,6 +867,7 @@ pub fn optimize_as(
             quantized: false,
             original_bytes: bytes.len(),
             converted_from: None,
+            attachments: 0,
         });
     }
 
@@ -910,6 +933,7 @@ pub fn optimize_as(
             quantized: false,
             original_bytes: bytes.len(),
             converted_from: None,
+            attachments: r.attachments,
         });
     }
 
@@ -939,6 +963,7 @@ pub fn optimize_as(
             quantized: r.quantized,
             original_bytes: bytes.len(),
             converted_from: None,
+            attachments: 0,
         });
     }
 
@@ -1039,6 +1064,7 @@ pub fn optimize_as(
         quantized: false,
         original_bytes: bytes.len(),
         converted_from,
+        attachments: 0,
     })
 }
 
@@ -1115,6 +1141,7 @@ fn hdr_in_place(
         quantized: false,
         original_bytes: source.bytes.len(),
         converted_from: None,
+        attachments: 0,
     })
 }
 

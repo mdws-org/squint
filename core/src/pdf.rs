@@ -55,6 +55,65 @@ pub struct Rewritten {
     pub images_seen: usize,
     /// Entries removed from the document's own metadata.
     pub metadata_removed: usize,
+    /// Files attached to the document. No mode reads or changes them, so the
+    /// caller can say so rather than present the document as clean.
+    pub attachments: usize,
+}
+
+/// Files attached to the document, as a reader finds them: every filespec
+/// the trailer reaches whose /EF names an embedded file stream, through the
+/// EmbeddedFiles name tree, a file attachment annotation, or an associated
+/// file list. /Type on the stream is optional, so it is not what is counted.
+/// One file is counted once, whether two filespecs name the same stream or
+/// one filespec gives it as both /F and /UF.
+fn attachment_count(doc: &Document) -> usize {
+    let resolve = |o: &Object| -> Option<ObjectId> {
+        match o {
+            Object::Reference(id) => Some(*id),
+            _ => None,
+        }
+    };
+    let mut seen = BTreeSet::new();
+    let mut counted: BTreeSet<ObjectId> = BTreeSet::new();
+    let mut files = 0;
+    let mut stack: Vec<&Object> = doc.trailer.iter().map(|(_, v)| v).collect();
+    while let Some(object) = stack.pop() {
+        let dict = match object {
+            Object::Reference(id) => {
+                if seen.insert(*id) {
+                    if let Ok(o) = doc.get_object(*id) {
+                        stack.push(o);
+                    }
+                }
+                continue;
+            }
+            Object::Array(items) => {
+                stack.extend(items.iter());
+                continue;
+            }
+            Object::Dictionary(d) => d,
+            Object::Stream(s) => &s.dict,
+            _ => continue,
+        };
+        let ef = match dict.get(b"EF") {
+            Ok(Object::Dictionary(d)) => Some(d),
+            Ok(Object::Reference(id)) => doc.get_object(*id).and_then(Object::as_dict).ok(),
+            _ => None,
+        };
+        if let Some(ef) = ef {
+            let targets: BTreeSet<ObjectId> = ef
+                .iter()
+                .filter_map(|(_, v)| resolve(v))
+                .filter(|id| doc.get_object(*id).map(|o| o.as_stream().is_ok()).unwrap_or(false))
+                .collect();
+            if !targets.is_empty() && targets.is_disjoint(&counted) {
+                files += 1;
+            }
+            counted.extend(targets);
+        }
+        stack.extend(dict.iter().map(|(_, v)| v));
+    }
+    files
 }
 
 /// Whether these bytes are a PDF.
@@ -399,6 +458,7 @@ pub fn rewrite(
         // save, so a removed reference would leave its target (an annotation's
         // author, an editor's private data) in the file.
         doc.prune_objects();
+        let attachments = attachment_count(&doc);
         let mut out = Vec::new();
         doc.save_modern(&mut out)
             .map_err(|e| Error::Encode(format!("this PDF could not be written: {e}")))?;
@@ -407,6 +467,7 @@ pub fn rewrite(
             images_rewritten: 0,
             images_seen: 0,
             metadata_removed,
+            attachments,
         });
     }
 
@@ -486,7 +547,7 @@ pub fn rewrite(
     doc.save_modern(&mut out)
         .map_err(|e| Error::Encode(format!("this PDF could not be written: {e}")))?;
 
-    Ok(Rewritten { data: out, images_rewritten, images_seen, metadata_removed })
+    Ok(Rewritten { data: out, images_rewritten, images_seen, metadata_removed, attachments: attachment_count(&doc) })
 }
 
 /// Draw a picture smaller, through the same filter every other cap here uses.
@@ -1280,6 +1341,140 @@ mod tests {
         let bytes = pdf_with_signature_field(Some(stamp));
         assert!(matches!(rewrite(&bytes, Mode::Strip, 0.0, 0.0, 0, None), Err(Error::Signed)),
                 "a time-stamped PDF was rewritten");
+    }
+
+    /// A PDF with one attached file and an author.
+    fn pdf_with_attachment() -> Vec<u8> {
+        let mut doc = Document::with_version("1.7");
+        one_page(&mut doc, dictionary! {}, dictionary! { "MediaBox" => rect(612, 792) });
+        let file = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! { "Type" => name("EmbeddedFile") },
+            b"attached notes, taken at 33.4484N 112.0740W".to_vec(),
+        )));
+        let spec = doc.add_object(dictionary! {
+            "Type" => name("Filespec"), "F" => Object::string_literal("notes.txt"),
+            "EF" => dictionary! { "F" => Object::Reference(file) },
+        });
+        let root = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+        let catalog = doc.get_object_mut(root).unwrap().as_dict_mut().unwrap();
+        catalog.set("Names", dictionary! { "EmbeddedFiles" => dictionary! {
+            "Names" => vec![Object::string_literal("notes.txt"), Object::Reference(spec)] } });
+        doc.trailer.set("Info", dictionary! { "Author" => Object::string_literal("Ben Meadows") });
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn attachment_content(bytes: &[u8]) -> Option<Vec<u8>> {
+        let doc = Document::load_mem(bytes).unwrap();
+        doc.objects.values().filter_map(|o| o.as_stream().ok()).find_map(|s| {
+            let kind = s.dict.get(b"Type").and_then(Object::as_name).ok();
+            (kind == Some(&b"EmbeddedFile"[..])).then(|| s.decompressed_content().unwrap_or_else(|_| s.content.clone()))
+        })
+    }
+
+    /// A one-page PDF whose catalog lists the given filespecs as attachments,
+    /// with an author so that Strip has something else to remove.
+    fn pdf_with_filespecs(build: impl FnOnce(&mut Document) -> Vec<Object>) -> Vec<u8> {
+        let mut doc = Document::with_version("1.7");
+        one_page(&mut doc, dictionary! {}, dictionary! { "MediaBox" => rect(612, 792) });
+        let specs = build(&mut doc);
+        let mut names = Vec::new();
+        for (n, spec) in specs.into_iter().enumerate() {
+            names.push(Object::string_literal(format!("file{n}")));
+            names.push(spec);
+        }
+        let root = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+        let catalog = doc.get_object_mut(root).unwrap().as_dict_mut().unwrap();
+        catalog.set("Names", dictionary! { "EmbeddedFiles" => dictionary! { "Names" => names } });
+        doc.trailer.set("Info", dictionary! { "Author" => Object::string_literal("Ben Meadows") });
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn file_stream(doc: &mut Document, typed: bool, body: &[u8]) -> ObjectId {
+        let dict = if typed { dictionary! { "Type" => name("EmbeddedFile") } } else { dictionary! {} };
+        doc.add_object(Object::Stream(lopdf::Stream::new(dict, body.to_vec())))
+    }
+
+    fn filespec(doc: &mut Document, ef: lopdf::Dictionary) -> Object {
+        Object::Reference(doc.add_object(dictionary! { "Type" => name("Filespec"), "EF" => ef }))
+    }
+
+    /// /Type on an embedded file stream is optional; what makes a stream an
+    /// attachment is the filespec's /EF pointing at it.
+    #[test]
+    fn an_attachment_without_a_type_is_counted() {
+        let bytes = pdf_with_filespecs(|doc| {
+            let file = file_stream(doc, false, b"untyped attachment");
+            vec![filespec(doc, dictionary! { "F" => Object::Reference(file) })]
+        });
+        assert_eq!(rewrite(&bytes, Mode::Strip, 0.0, 0.0, 0, None).unwrap().attachments, 1);
+    }
+
+    /// One file is one attachment: two filespecs naming the same stream, or
+    /// one filespec giving the same file as /F and /UF in two streams.
+    #[test]
+    fn each_attached_file_is_counted_once() {
+        let bytes = pdf_with_filespecs(|doc| {
+            let shared = file_stream(doc, true, b"shared");
+            let (f, uf) = (file_stream(doc, true, b"same file"), file_stream(doc, true, b"same file"));
+            vec![
+                filespec(doc, dictionary! { "F" => Object::Reference(shared) }),
+                filespec(doc, dictionary! { "F" => Object::Reference(shared) }),
+                filespec(doc, dictionary! { "F" => Object::Reference(f), "UF" => Object::Reference(uf) }),
+            ]
+        });
+        assert_eq!(rewrite(&bytes, Mode::Fast, 80.0, 75.0, 8, None).unwrap().attachments, 2);
+    }
+
+    /// An embedded file stream that nothing refers to is not an attachment a
+    /// reader can open, and a shrink, which does not prune, must not count it.
+    #[test]
+    fn an_orphaned_file_stream_is_not_counted() {
+        let bytes = pdf_with_filespecs(|doc| {
+            file_stream(doc, true, b"orphan");
+            Vec::new()
+        });
+        assert_eq!(rewrite(&bytes, Mode::Fast, 80.0, 75.0, 8, None).unwrap().attachments, 0);
+    }
+
+    /// With nothing else to remove, a PDF that carries an attachment is not
+    /// "nothing to remove": Strip says what it left unread.
+    #[test]
+    fn a_strip_that_finds_only_attachments_says_so() {
+        let mut doc = Document::with_version("1.7");
+        one_page(&mut doc, dictionary! {}, dictionary! { "MediaBox" => rect(612, 792) });
+        let file = file_stream(&mut doc, true, b"the only thing in here");
+        let spec = filespec(&mut doc, dictionary! { "F" => Object::Reference(file) });
+        let root = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+        let catalog = doc.get_object_mut(root).unwrap().as_dict_mut().unwrap();
+        catalog.set("Names", dictionary! { "EmbeddedFiles" => dictionary! {
+            "Names" => vec![Object::string_literal("a.txt"), spec] } });
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        match crate::optimize(&bytes, Mode::Strip, 0.0, 0.0, None, 0, None) {
+            Err(Error::AttachmentsUnread { attachments: 1 }) => {}
+            other => panic!("expected the attachment to be reported, got {:?}", other.map(|o| o.data.len())),
+        }
+    }
+
+    /// A PDF can carry files of its own: an invoice's XML, a spreadsheet, a
+    /// photograph with its own location. No mode reads or changes them, and
+    /// Strip said nothing about them, so a document with an attachment came
+    /// back looking clean. They are kept as they are, and counted.
+    #[test]
+    fn files_attached_to_a_pdf_are_kept_and_counted() {
+        let bytes = pdf_with_attachment();
+        for mode in [Mode::Strip, Mode::Fast] {
+            let out = rewrite(&bytes, mode, 80.0, 75.0, 8, None).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(out.attachments, 1, "{mode:?} did not count the attached file");
+            assert_eq!(attachment_content(&out.data).as_deref(),
+                       Some(&b"attached notes, taken at 33.4484N 112.0740W"[..]), "{mode:?} changed the attachment");
+        }
+        let plain = pdf_with_image(name("DCTDecode"), jpeg_with_exif());
+        assert_eq!(rewrite(&plain, Mode::Strip, 0.0, 0.0, 0, None).unwrap().attachments, 0);
     }
 
     /// A picture Strip cannot walk keeps whatever it carries, so the document

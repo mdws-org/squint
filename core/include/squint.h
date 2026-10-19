@@ -25,6 +25,7 @@
 #define SQUINT_ERR_UNKNOWN_MODE   13
 #define SQUINT_ERR_STRIP_GREW     14
 #define SQUINT_ERR_SIGNED         15
+#define SQUINT_ERR_ATTACHMENTS    16
 
 #define SQUINT_MODE_FAST    0
 #define SQUINT_MODE_QUALITY 1
@@ -59,6 +60,10 @@ typedef struct {
     // JPEG made from a HEIC, WebP or SVG, or an AVIF made from anything. Such a
     // result must be written beside the original, never over it.
     int converted;
+    // Files attached inside a PDF. No mode reads or changes them, so they come
+    // through as they arrived; the app says so rather than calling the
+    // document clean. Zero for every other format and on failure.
+    int attachments;
 } SquintResult;
 
 // The input format is detected from the bytes. HEIC is decoded for fast and

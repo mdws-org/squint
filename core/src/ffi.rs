@@ -42,6 +42,9 @@ pub const SQUINT_ERR_UNKNOWN_MODE: c_int = 13;
 pub const SQUINT_ERR_STRIP_GREW: c_int = 14;
 /// The PDF is digitally signed; any rewrite would break the signature.
 pub const SQUINT_ERR_SIGNED: c_int = 15;
+/// Strip found nothing else to remove, but the PDF carries attached files,
+/// which no mode reads. 15 is SQUINT_ERR_SIGNED.
+pub const SQUINT_ERR_ATTACHMENTS: c_int = 16;
 
 /// The result of one optimization.
 ///
@@ -61,6 +64,9 @@ pub struct SquintResult {
     /// Human-readable error details allocated by Rust, or null when no message is set.
     pub error_message: *mut c_char,
     pub converted: c_int,
+    /// Files attached inside a PDF, kept as they were because no mode reads
+    /// them. Zero for every other format and on failure.
+    pub attachments: c_int,
 }
 
 impl SquintResult {
@@ -78,6 +84,7 @@ impl SquintResult {
             error,
             error_message,
             converted: 0,
+            attachments: 0,
         }
     }
 }
@@ -95,6 +102,7 @@ fn code_for(e: &Error) -> c_int {
         Error::ColoursUnreachable { .. } => SQUINT_ERR_COLOURS,
         Error::ReadOnlyFormat { .. } => SQUINT_ERR_READ_ONLY,
         Error::Signed => SQUINT_ERR_SIGNED,
+        Error::AttachmentsUnread { .. } => SQUINT_ERR_ATTACHMENTS,
         Error::Panicked => SQUINT_ERR_PANIC,
     }
 }
@@ -211,6 +219,7 @@ pub unsafe extern "C" fn squint_optimize_as(
                 error: SQUINT_OK,
                 error_message: std::ptr::null_mut(),
                 converted: if out.converted_from.is_some() { 1 } else { 0 },
+                attachments: c_int::try_from(out.attachments).unwrap_or(c_int::MAX),
             }
         }
         Err(e) => SquintResult::failure(code_for(&e), input_len, Some(&e.to_string())),
@@ -275,6 +284,43 @@ mod tests {
         let r = unsafe { call(&png, SQUINT_FORMAT_JPEG, 7) };
         assert_eq!(r.error, SQUINT_ERR_UNKNOWN_MODE);
         assert!(r.data.is_null());
+        unsafe { squint_result_free(r) };
+    }
+
+    /// A PDF with a long producer entry, so that a Strip of it shrinks, and
+    /// one attached file listed in its EmbeddedFiles name tree.
+    fn pdf_with_an_attachment() -> Vec<u8> {
+        let producer = "x".repeat(4000);
+        let objects = [
+            "<</Type/Catalog/Pages 2 0 R/Names<</EmbeddedFiles<</Names[(a.txt)4 0 R]>>>>>>".to_string(),
+            "<</Type/Pages/Kids[]/Count 0>>".to_string(),
+            format!("<</Producer({producer})>>"),
+            "<</Type/Filespec/F(a.txt)/EF<</F 5 0 R>>>>".to_string(),
+            "<</Type/EmbeddedFile/Length 5>>stream\nhello\nendstream".to_string(),
+        ];
+        let mut out = String::from("%PDF-1.7\n");
+        let mut offsets = Vec::new();
+        for (i, body) in objects.iter().enumerate() {
+            offsets.push(out.len());
+            out.push_str(&format!("{} 0 obj{body}endobj\n", i + 1));
+        }
+        let xref = out.len();
+        out.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1));
+        for offset in offsets {
+            out.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        out.push_str(&format!("trailer<</Size {}/Root 1 0 R/Info 3 0 R>>\nstartxref\n{xref}\n%%EOF\n", objects.len() + 1));
+        out.into_bytes()
+    }
+
+    /// The count of attached files reaches the app with the result, so the row
+    /// can say they were kept unread.
+    #[test]
+    fn a_strip_reports_the_files_attached_to_a_pdf() {
+        let pdf = pdf_with_an_attachment();
+        let r = unsafe { call(&pdf, SQUINT_FORMAT_JPEG, SQUINT_MODE_STRIP) };
+        assert_eq!(r.error, SQUINT_OK, "{:?}", unsafe { std::ffi::CStr::from_ptr(r.error_message) });
+        assert_eq!(r.attachments, 1);
         unsafe { squint_result_free(r) };
     }
 
@@ -379,6 +425,7 @@ pub extern "C" fn squint_error_message(code: c_int) -> *const c_char {
         SQUINT_ERR_UNKNOWN_MODE => b"the mode asked for is not one squint has; the file was not changed\0",
         SQUINT_ERR_STRIP_GREW => b"metadata was found, but removing it would make the file larger; the original was kept with its metadata\0",
         SQUINT_ERR_SIGNED => b"this PDF is digitally signed, and any change would break the signature; the file was not changed\0",
+        SQUINT_ERR_ATTACHMENTS => b"nothing else to remove, but this PDF carries attached files, which Strip does not read; the file was not changed\0",
         _ => b"unknown error\0",
     };
     s.as_ptr() as *const c_char
