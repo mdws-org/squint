@@ -179,6 +179,28 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// The directories a SubIFDs entry lists. `None` when they cannot be walked
+/// safely: an entry of a type that is not an offset (LONG or IFD) cannot be
+/// read, so the directories it names would keep their tags while the file was
+/// reported clean; and a list longer than the directory bound is refused at
+/// once rather than queued offset by offset.
+fn sub_ifds(reader: &Reader, entry: usize, kind: u16, count: u32) -> Option<Vec<usize>> {
+    if count == 0 {
+        return Some(Vec::new());
+    }
+    if !matches!(kind, 4 | 13) || count as usize > MAX_DIRECTORIES {
+        return None;
+    }
+    Some(reader.numbers(entry, kind, count).into_iter().map(|v| v as usize).filter(|&v| v != 0).collect())
+}
+
+/// Whether `start..end` overlaps a range in `ranges`, sorted and disjoint as
+/// `merged` leaves them.
+fn overlaps(ranges: &[(usize, usize)], start: usize, end: usize) -> bool {
+    let i = ranges.partition_point(|&(_, e)| e <= start);
+    i < ranges.len() && ranges[i].0 < end
+}
+
 /// Every region the picture occupies, gathered before anything is written.
 ///
 /// A tag's declared size cannot be trusted to stay inside the metadata. On a
@@ -190,20 +212,28 @@ impl<'a> Reader<'a> {
 /// this walk has no protection, so stripping it could zero its pixels.
 fn protected(reader: &Reader, first: usize) -> Option<Vec<(usize, usize)>> {
     let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
     // Each directory with whether it is a page. A page's kept entries point
     // at data the file still needs; an Exif, GPS or interoperability directory
-    // is removed whole, so nothing in it is kept.
+    // is removed whole, so nothing in it is kept. One directory reached in
+    // both roles would be stripped as a page and then wiped as metadata, so
+    // such a file is refused.
+    let mut seen: std::collections::HashMap<usize, bool> = std::collections::HashMap::new();
+    let mut queued = std::collections::HashSet::new();
     let mut queue = vec![(first, true)];
 
     while let Some((at, is_page)) = queue.pop() {
-        if at == 0 || seen.contains(&at) {
+        if at == 0 {
             continue;
+        }
+        match seen.get(&at) {
+            Some(&role) if role == is_page => continue,
+            Some(_) => return None,
+            None => {}
         }
         if seen.len() >= MAX_DIRECTORIES {
             return None;
         }
-        seen.insert(at);
+        seen.insert(at, is_page);
         let entries = reader.entries(at);
 
         for (offsets_tag, lengths_tag) in PIXEL_RANGES {
@@ -231,18 +261,24 @@ fn protected(reader: &Reader, first: usize) -> Option<Vec<(usize, usize)>> {
             }
             if SUB_IFDS.contains(tag) {
                 if let Some(sub) = reader.u32(entry + 8) {
-                    queue.push((sub as usize, false));
+                    if queued.insert((sub as usize, false)) {
+                        queue.push((sub as usize, false));
+                    }
                 }
             }
             if *tag == SUBIFDS && is_page {
-                for sub in reader.numbers(*entry, *kind, *count) {
-                    queue.push((sub as usize, true));
+                for sub in sub_ifds(reader, *entry, *kind, *count)? {
+                    if queued.insert((sub, true)) {
+                        queue.push((sub, true));
+                    }
                 }
             }
         }
 
         if let Some(next) = reader.u32(at + 2 + entries.len() * 12) {
-            queue.push((next as usize, is_page));
+            if queued.insert((next as usize, is_page)) {
+                queue.push((next as usize, is_page));
+            }
         }
     }
     Some(merged(out))
@@ -279,8 +315,9 @@ pub fn strip_tiff(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
     let mut destroyed = Destroyed::default();
     let mut visited = std::collections::HashSet::new();
     // Pages still to strip: the chain from the header, and every directory a
-    // page lists in SubIFDs.
+    // page lists in SubIFDs. Each offset is queued once.
     let mut queue = vec![first];
+    let mut queued = std::collections::HashSet::from([first]);
 
     // Every page is walked. Stopping early left the later pages' tags in place
     // while the file was reported clean, so running out of bound refuses.
@@ -299,11 +336,20 @@ pub fn strip_tiff(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
             return None;
         }
         let next = reader.u32(directory + 2 + entries.len() * 12)?;
+        // A directory lying over the pixels or kept data would have them
+        // rewritten as if they were entries. Such a file is malformed.
+        if overlaps(&keep_clear, directory, directory + 2 + entries.len() * 12 + 4) {
+            return None;
+        }
 
         let mut kept: Vec<u8> = Vec::with_capacity(entries.len() * 12);
         for (entry, tag, kind, count) in &entries {
             if *tag == SUBIFDS {
-                queue.extend(reader.numbers(*entry, *kind, *count).into_iter().map(|v| v as usize));
+                for sub in sub_ifds(&reader, *entry, *kind, *count)? {
+                    if queued.insert(sub) {
+                        queue.push(sub);
+                    }
+                }
             }
             let unwanted = REMOVE.contains(tag) || SUB_IFDS.contains(tag);
             if !unwanted {
@@ -344,7 +390,9 @@ pub fn strip_tiff(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
         // their bytes, and a value of four bytes or fewer lives in its slot.
         destroyed.wipe(&mut out, tail + 4, directory + 2 + entries.len() * 12 + 4);
 
-        queue.push(next as usize);
+        if queued.insert(next as usize) {
+            queue.push(next as usize);
+        }
     }
 
     Some((out, destroyed.bytes))
@@ -646,10 +694,12 @@ mod tests {
         for at in &subs {
             tiff.extend_from_slice(&at.to_le_bytes());
         }
-        let px = tiff.len();
+        let make = tiff.len() - 8 - 7; // seven bytes before the list ends, so the
+        let px = tiff.len();           // Make below runs over the whole list
         tiff.extend_from_slice(&[0xA1; 16]);
         let first = tiff.len();
         tiff.extend_from_slice(&directory(&[(0x0111, 4, 1, px as u32), (0x0117, 4, 1, 16),
+                                            (0x010F, 2, 7 + 8, make as u32),
                                             (0x014A, 4, 2, list as u32)]));
         tiff[4..8].copy_from_slice(&(first as u32).to_le_bytes());
 
@@ -687,20 +737,114 @@ mod tests {
         assert_eq!(&out[raw..raw + 16], &tiff[raw..raw + 16], "the raw pixels were zeroed");
     }
 
-    /// A sub-directory that lists its own parent must not walk forever.
+    /// A sub-directory that lists its own parent must not walk forever, and
+    /// is still stripped.
     #[test]
-    fn a_sub_directory_listing_its_parent_does_not_loop() {
+    fn a_sub_directory_listing_its_parent_is_stripped_without_looping() {
+        let mut tiff = b"II\x2A\x00\0\0\0\0".to_vec();
+        let px = tiff.len();
+        tiff.extend_from_slice(&[0xA1; 16]);
+        let artist = tiff.len();
+        tiff.extend_from_slice(b"Loop Artist\0");
+        let sub = tiff.len();
+        let first = sub + 2 + 4 * 12 + 4;
+        tiff.extend_from_slice(&directory(&[(0x0111, 4, 1, px as u32), (0x0117, 4, 1, 16),
+                                            (0x013B, 2, 12, artist as u32), (0x014A, 13, 1, first as u32)]));
+        tiff.extend_from_slice(&directory(&[(0x0111, 4, 1, px as u32), (0x0117, 4, 1, 16),
+                                            (0x014A, 13, 1, sub as u32)]));
+        tiff[4..8].copy_from_slice(&(first as u32).to_le_bytes());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(strip_tiff(&tiff));
+        });
+        let out = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("the walk looped");
+        let (out, _) = out.expect("a well formed tiff");
+        assert!(!contains(&out, b"Loop Artist"), "the sub-directory kept its artist");
+    }
+
+    /// One directory reached both as a page (through SubIFDs) and as an Exif
+    /// directory would be stripped as one and wiped as the other, losing a
+    /// page. Such a file is malformed and is refused.
+    #[test]
+    fn a_directory_that_is_both_a_page_and_an_exif_directory_is_refused() {
+        let mut tiff = b"II\x2A\x00\0\0\0\0".to_vec();
+        let px = tiff.len();
+        tiff.extend_from_slice(&[0xA1; 16]);
+        let shared = tiff.len();
+        tiff.extend_from_slice(&directory(&[(0x0111, 4, 1, px as u32), (0x0117, 4, 1, 16)]));
+        let first = tiff.len();
+        tiff.extend_from_slice(&directory(&[(0x0111, 4, 1, px as u32), (0x0117, 4, 1, 16),
+                                            (0x014A, 13, 1, shared as u32), (0x8769, 4, 1, shared as u32)]));
+        tiff[4..8].copy_from_slice(&(first as u32).to_le_bytes());
+        assert!(strip_tiff(&tiff).is_none(), "a directory with two roles was stripped");
+    }
+
+    /// A SubIFDs offset into the pixels would have the strip rewrite picture
+    /// bytes as if they were a directory. Refused instead.
+    #[test]
+    fn a_sub_directory_inside_the_pixels_is_refused() {
+        let mut tiff = b"II\x2A\x00\0\0\0\0".to_vec();
+        let px = tiff.len();
+        // Pixel bytes that read as a directory: one Make entry, inline.
+        tiff.extend_from_slice(&directory(&[(0x010F, 2, 4, u32::from_le_bytes(*b"Cam\0"))]));
+        tiff.extend_from_slice(&[0xA1; 8]);
+        let first = tiff.len();
+        tiff.extend_from_slice(&directory(&[(0x0111, 4, 1, px as u32), (0x0117, 4, 1, 26),
+                                            (0x014A, 13, 1, px as u32)]));
+        tiff[4..8].copy_from_slice(&(first as u32).to_le_bytes());
+        match strip_tiff(&tiff) {
+            None => {}
+            Some((out, _)) => assert_eq!(&out[px..px + 26], &tiff[px..px + 26], "the pixels were rewritten"),
+        }
+    }
+
+    /// A SubIFDs list longer than the directory bound is refused at once,
+    /// rather than queued offset by offset.
+    #[test]
+    fn a_subifds_list_longer_than_the_bound_is_refused_quickly() {
         let mut tiff = b"II\x2A\x00\0\0\0\0".to_vec();
         let px = tiff.len();
         tiff.extend_from_slice(&[0xA1; 16]);
         let sub = tiff.len();
-        let first = sub + 2 + 3 * 12 + 4;
+        tiff.extend_from_slice(&directory(&[(0x0111, 4, 1, px as u32), (0x0117, 4, 1, 16)]));
+        let list = tiff.len();
+        let n = MAX_DIRECTORIES as u32 + 1;
+        for _ in 0..n {
+            tiff.extend_from_slice(&(sub as u32).to_le_bytes());
+        }
+        let first = tiff.len();
         tiff.extend_from_slice(&directory(&[(0x0111, 4, 1, px as u32), (0x0117, 4, 1, 16),
-                                            (0x014A, 13, 1, first as u32)]));
-        tiff.extend_from_slice(&directory(&[(0x0111, 4, 1, px as u32), (0x0117, 4, 1, 16),
-                                            (0x014A, 13, 1, sub as u32)]));
+                                            (0x014A, 4, n, list as u32)]));
         tiff[4..8].copy_from_slice(&(first as u32).to_le_bytes());
-        let _ = strip_tiff(&tiff);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(strip_tiff(&tiff).is_none());
+        });
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(10)).expect("the walk did not finish"),
+                "an over-long SubIFDs list was accepted");
+    }
+
+    /// SubIFDs are offsets, LONG or IFD. Declared as anything else they cannot
+    /// be read, so the directories they name would keep their tags while the
+    /// file was reported clean. Refused instead.
+    #[test]
+    fn a_subifds_entry_of_the_wrong_type_is_refused() {
+        let mut tiff = b"II\x2A\x00\0\0\0\0".to_vec();
+        let px = tiff.len();
+        tiff.extend_from_slice(&[0xA1; 16]);
+        let artist = tiff.len();
+        tiff.extend_from_slice(b"Hidden Artist\0");
+        let sub = tiff.len();
+        tiff.extend_from_slice(&directory(&[(0x0111, 4, 1, px as u32), (0x0117, 4, 1, 16),
+                                            (0x013B, 2, 14, artist as u32)]));
+        let first = tiff.len();
+        tiff.extend_from_slice(&directory(&[(0x0111, 4, 1, px as u32), (0x0117, 4, 1, 16),
+                                            (0x014A, 7, 4, sub as u32)]));
+        tiff[4..8].copy_from_slice(&(first as u32).to_le_bytes());
+        match strip_tiff(&tiff) {
+            None => {}
+            Some((out, _)) => assert!(!contains(&out, b"Hidden Artist"), "reported clean with an unwalked directory"),
+        }
     }
 
     /// A scanned document has dozens of pages. The walk stopped after eight
