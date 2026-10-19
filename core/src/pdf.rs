@@ -247,16 +247,18 @@ fn image_candidates(doc: &Document) -> Vec<ObjectId> {
     pictures
 }
 
-/// Whether the document, as it stands, carries a person's digital signature:
-/// a signature dictionary (/Type /Sig or /DocTimeStamp, or any dictionary
-/// with /ByteRange and /Contents) that the trailer reaches. The walk follows
-/// references, so an entry written as a separate object is still seen. A
-/// field nobody has signed has no such dictionary, an earlier revision's
-/// signature that nothing refers to any more is not one, and Reader's
-/// usage-rights signature is left to `drop_usage_rights`.
-fn is_signed(doc: &Document) -> bool {
-    let mut seen = BTreeSet::new();
+/// Whether the document, as it stands, carries a person's digital signature,
+/// and every object the trailer reaches. A signature dictionary is /Type /Sig
+/// or /DocTimeStamp, or any dictionary with /ByteRange and /Contents. The walk
+/// follows references, so an entry written as a separate object is still
+/// seen. A field nobody has signed has no such dictionary, and an earlier
+/// revision's signature that nothing refers to any more is not reached.
+/// `skip` holds Reader's usage-rights signatures, found by where they sit
+/// rather than by what they claim.
+fn signature_walk(doc: &Document, skip: &BTreeSet<ObjectId>) -> (bool, BTreeSet<ObjectId>) {
+    let mut seen: BTreeSet<ObjectId> = skip.clone();
     let mut stack: Vec<&Object> = doc.trailer.iter().map(|(_, v)| v).collect();
+    let mut signed = false;
     while let Some(object) = stack.pop() {
         let dict = match object {
             Object::Reference(id) => {
@@ -275,12 +277,10 @@ fn is_signed(doc: &Document) -> bool {
             Object::Stream(s) => &s.dict,
             _ => continue,
         };
-        if is_signature(dict) && !is_usage_rights(doc, dict) {
-            return true;
-        }
+        signed |= is_signature(dict);
         stack.extend(dict.iter().map(|(_, v)| v));
     }
-    false
+    (signed, seen)
 }
 
 fn is_signature(dict: &lopdf::Dictionary) -> bool {
@@ -288,22 +288,46 @@ fn is_signature(dict: &lopdf::Dictionary) -> bool {
     matches!(kind, Some(b"Sig" | b"DocTimeStamp")) || (dict.has(b"ByteRange") && dict.has(b"Contents"))
 }
 
-/// A Reader usage-rights signature: made with Adobe's key to unlock form
-/// features in old versions of Reader, and naming no person. Its /Reference
-/// names the UR3 (or older UR) transform.
-fn is_usage_rights(doc: &Document, dict: &lopdf::Dictionary) -> bool {
-    fn resolve<'a>(doc: &'a Document, o: &'a Object) -> Option<&'a Object> {
-        match o {
-            Object::Reference(id) => doc.get_object(*id).ok(),
-            other => Some(other),
-        }
+/// Reader's usage-rights signatures: the objects at the catalog's /Perms /UR3
+/// (or older /UR). Made with Adobe's key to unlock form features in old
+/// versions of Reader, they name no person. Found by position, so a person's
+/// signature elsewhere cannot pass for one by naming the UR3 transform.
+fn usage_rights(doc: &Document) -> BTreeSet<ObjectId> {
+    let perms = doc
+        .catalog()
+        .and_then(|c| c.get(b"Perms"))
+        .and_then(|p| match p {
+            Object::Reference(id) => doc.get_object(*id),
+            other => Ok(other),
+        })
+        .and_then(Object::as_dict);
+    let Ok(perms) = perms else { return BTreeSet::new() };
+    [&b"UR3"[..], b"UR"]
+        .iter()
+        .filter_map(|k| perms.get(k).ok().and_then(|v| v.as_reference().ok()))
+        .collect()
+}
+
+/// Delete signature dictionaries the document no longer reaches, in every
+/// mode: an earlier revision's signature still names its signer, the place
+/// and the time, and only Strip prunes unreferenced objects. Returns how many
+/// went, which count as metadata removed.
+fn drop_orphaned_signatures(doc: &mut Document, reached: &BTreeSet<ObjectId>, rights: &BTreeSet<ObjectId>) -> usize {
+    let orphans: Vec<ObjectId> = doc
+        .objects
+        .iter()
+        .filter(|(id, _)| !reached.contains(id) || rights.contains(id))
+        .filter(|(_, o)| match o {
+            Object::Dictionary(d) => is_signature(d),
+            Object::Stream(s) => is_signature(&s.dict),
+            _ => false,
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    for id in &orphans {
+        doc.objects.remove(id);
     }
-    let Some(Ok(refs)) = dict.get(b"Reference").ok().and_then(|r| resolve(doc, r)).map(Object::as_array) else {
-        return false;
-    };
-    refs.iter().filter_map(|r| resolve(doc, r)).filter_map(|r| r.as_dict().ok()).any(|r| {
-        matches!(r.get(b"TransformMethod").and_then(Object::as_name), Ok(b"UR3" | b"UR"))
-    })
+    orphans.iter().filter(|id| !rights.contains(id)).count()
 }
 
 /// Remove Reader's usage rights from the catalog. A rewrite breaks their
@@ -355,13 +379,17 @@ pub fn rewrite(
     // signature itself names the signer, the place and the time. Writing the
     // file anyway would hand back a document that claims a signature it no
     // longer carries.
-    if is_signed(&doc) {
+    let rights = usage_rights(&doc);
+    let (signed, reached) = signature_walk(&doc, &rights);
+    if signed {
         return Err(Error::Signed);
     }
     drop_usage_rights(&mut doc);
+    let orphaned = drop_orphaned_signatures(&mut doc, &reached, &rights);
 
-    let metadata_removed =
-        strip_document_metadata(&mut doc) + strip_image_metadata(&mut doc, mode == Mode::Strip)?;
+    let metadata_removed = orphaned
+        + strip_document_metadata(&mut doc)
+        + strip_image_metadata(&mut doc, mode == Mode::Strip)?;
 
     // Strip means the pixels are not touched, in a PDF as anywhere else. The
     // document's own metadata has already gone, and so has the EXIF inside its
@@ -1145,18 +1173,35 @@ mod tests {
     /// signature, and so is a dictionary that says it is one without it.
     #[test]
     fn a_signature_is_found_whatever_form_its_entries_take() {
+        // The range as its own object, in the same document as the field.
         let mut doc = Document::with_version("1.7");
+        let (_, page) = one_page(&mut doc, dictionary! {}, dictionary! { "MediaBox" => rect(612, 792) });
         let range = doc.add_object(Object::Array(vec![0.into(), 840.into(), 960.into(), 240.into()]));
-        let mut indirect = signed_by("Ben Meadows");
-        indirect.remove(b"Type");
-        indirect.set("ByteRange", Object::Reference(range));
+        let mut sig = signed_by("Ben Meadows");
+        sig.remove(b"Type");
+        sig.set("ByteRange", Object::Reference(range));
+        let sig = doc.add_object(sig);
+        let field = doc.add_object(dictionary! {
+            "FT" => name("Sig"), "T" => Object::string_literal("Signature1"), "Type" => name("Annot"),
+            "Subtype" => name("Widget"), "Rect" => rect(0, 0), "P" => Object::Reference(page),
+            "V" => Object::Reference(sig),
+        });
+        let root = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+        doc.get_object_mut(root).unwrap().as_dict_mut().unwrap()
+            .set("AcroForm", dictionary! { "Fields" => vec![Object::Reference(field)] });
+        let mut indirect = Vec::new();
+        doc.save_to(&mut indirect).unwrap();
+        let reloaded = Document::load_mem(&indirect).unwrap();
+        let byte_range = reloaded.objects.values().filter_map(|o| o.as_dict().ok())
+            .find_map(|d| d.get(b"ByteRange").ok().cloned());
+        assert!(matches!(byte_range, Some(Object::Reference(_))), "the fixture lost its indirect range");
+        assert!(matches!(strip_or_refusal(&indirect), Err(Error::Signed)), "an indirect byte range was missed");
+
         let mut typed_only = signed_by("Ben Meadows");
         typed_only.remove(b"ByteRange");
         typed_only.remove(b"Contents");
-        for sig in [indirect, typed_only] {
-            let bytes = pdf_with_signature_field(Some(sig));
-            assert!(matches!(strip_or_refusal(&bytes), Err(Error::Signed)), "a signature was not recognised");
-        }
+        let bytes = pdf_with_signature_field(Some(typed_only));
+        assert!(matches!(strip_or_refusal(&bytes), Err(Error::Signed)), "a type-only signature was missed");
     }
 
     /// An earlier revision's signature that nothing refers to any more does
@@ -1169,8 +1214,11 @@ mod tests {
         doc.trailer.set("Info", dictionary! { "Author" => Object::string_literal("Ben Meadows") });
         let mut bytes = Vec::new();
         doc.save_to(&mut bytes).unwrap();
-        let out = strip_or_refusal(&bytes).unwrap_or_else(|e| panic!("{e}"));
-        assert!(!out.data.windows(10).any(|w| w == b"Old Signer"), "the stale signer survived");
+        for mode in [Mode::Strip, Mode::Fast] {
+            let out = rewrite(&bytes, mode, 80.0, 75.0, 8, None).unwrap_or_else(|e| panic!("{mode:?}: {e}"));
+            let written = Document::load_mem(&out.data).unwrap();
+            assert!(!mentions(&written, b"Old Signer"), "{mode:?} wrote the stale signer out");
+        }
     }
 
     /// A form Adobe extended for Reader carries a usage-rights signature
@@ -1199,6 +1247,18 @@ mod tests {
                 .and_then(|(_, p)| p.as_dict().ok().map(|d| d.has(b"UR3")));
             assert_ne!(rights, Some(true), "{mode:?} kept the usage-rights signature");
         }
+    }
+
+    /// Only the signature at the catalog's /Perms /UR3 is Reader's. A
+    /// person's signature in a form field that claims the UR3 transform is
+    /// still a person's signature.
+    #[test]
+    fn a_field_signature_claiming_usage_rights_is_still_refused() {
+        let mut sig = signed_by("Ben Meadows");
+        sig.set("Reference", vec![Object::Dictionary(dictionary! {
+            "Type" => name("SigRef"), "TransformMethod" => name("UR3") })]);
+        let bytes = pdf_with_signature_field(Some(sig));
+        assert!(matches!(strip_or_refusal(&bytes), Err(Error::Signed)), "a signer hid behind the UR3 transform");
     }
 
     /// A form with a signature field that nobody has signed carries no
