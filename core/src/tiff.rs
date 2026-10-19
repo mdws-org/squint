@@ -19,7 +19,7 @@ fn type_size(kind: u16) -> usize {
     match kind {
         1 | 2 | 6 | 7 => 1,
         3 | 8 => 2,
-        4 | 9 | 11 => 4,
+        4 | 9 | 11 | 13 => 4, // 13 is IFD, an offset written as a LONG
         5 | 10 | 12 => 8,
         _ => 0,
     }
@@ -78,6 +78,11 @@ const SUB_IFDS: [u16; 3] = [
     0x8825, // GPS
     0xA005, // Interoperability
 ];
+
+/// SubIFDs, the offsets of further image directories: a DNG's raw image and
+/// its previews live there rather than in the page chain. Each is a page in
+/// its own right, with pixels to keep and tags to remove.
+const SUBIFDS: u16 = 0x014A;
 
 /// Pairs of tags giving where the picture is and how long each piece runs.
 const PIXEL_RANGES: [(u16, u16); 3] = [
@@ -229,6 +234,11 @@ fn protected(reader: &Reader, first: usize) -> Option<Vec<(usize, usize)>> {
                     queue.push((sub as usize, false));
                 }
             }
+            if *tag == SUBIFDS && is_page {
+                for sub in reader.numbers(*entry, *kind, *count) {
+                    queue.push((sub as usize, true));
+                }
+            }
         }
 
         if let Some(next) = reader.u32(at + 2 + entries.len() * 12) {
@@ -267,12 +277,17 @@ pub fn strip_tiff(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
 
     let mut out = bytes.to_vec();
     let mut destroyed = Destroyed::default();
-    let mut directory = first;
     let mut visited = std::collections::HashSet::new();
+    // Pages still to strip: the chain from the header, and every directory a
+    // page lists in SubIFDs.
+    let mut queue = vec![first];
 
     // Every page is walked. Stopping early left the later pages' tags in place
     // while the file was reported clean, so running out of bound refuses.
-    while directory != 0 && !visited.contains(&directory) {
+    while let Some(directory) = queue.pop() {
+        if directory == 0 || visited.contains(&directory) {
+            continue;
+        }
         if visited.len() >= MAX_DIRECTORIES {
             return None;
         }
@@ -287,6 +302,9 @@ pub fn strip_tiff(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
 
         let mut kept: Vec<u8> = Vec::with_capacity(entries.len() * 12);
         for (entry, tag, kind, count) in &entries {
+            if *tag == SUBIFDS {
+                queue.extend(reader.numbers(*entry, *kind, *count).into_iter().map(|v| v as usize));
+            }
             let unwanted = REMOVE.contains(tag) || SUB_IFDS.contains(tag);
             if !unwanted {
                 kept.extend_from_slice(&bytes[*entry..*entry + 12]);
@@ -326,7 +344,7 @@ pub fn strip_tiff(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
         // their bytes, and a value of four bytes or fewer lives in its slot.
         destroyed.wipe(&mut out, tail + 4, directory + 2 + entries.len() * 12 + 4);
 
-        directory = next as usize;
+        queue.push(next as usize);
     }
 
     Some((out, destroyed.bytes))
@@ -550,6 +568,139 @@ mod tests {
             None => {}
             Some((out, _)) => assert!(!contains(&out, b"Ben Meadows"), "the page after it kept its artist"),
         }
+    }
+
+    /// A directory written out: entry count, entries, then no next directory.
+    fn directory(entries: &[(u16, u16, u32, u32)]) -> Vec<u8> {
+        let mut out = (entries.len() as u16).to_le_bytes().to_vec();
+        for (tag, kind, count, value) in entries {
+            for field in [&tag.to_le_bytes()[..], &kind.to_le_bytes(), &count.to_le_bytes(), &value.to_le_bytes()] {
+                out.extend_from_slice(field);
+            }
+        }
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out
+    }
+
+    fn tags_at(tiff: &[u8], at: usize) -> Vec<u16> {
+        Reader { bytes: tiff, big_endian: false }.entries(at).iter().map(|e| e.1).collect()
+    }
+
+    /// A DNG keeps its raw image, and often its previews, in sub-directories
+    /// listed by SubIFDs (0x014A) rather than in the page chain. They were
+    /// never walked, so their own tags stayed: here a camera, a date and the
+    /// original file name, in a raw directory whose pixels must not move.
+    #[test]
+    fn a_dng_raw_sub_directory_is_stripped_and_its_pixels_kept() {
+        let mut tiff = b"II\x2A\x00\0\0\0\0".to_vec();
+        let px = tiff.len();
+        tiff.extend_from_slice(&[0xA1; 16]);
+        let raw = tiff.len();
+        tiff.extend_from_slice(&[0xB2; 16]);
+        let make = tiff.len();
+        tiff.extend_from_slice(b"RawCam Body 7\0");
+        let date = tiff.len();
+        tiff.extend_from_slice(b"2026:10:18 09:41:00\0");
+        let name = tiff.len();
+        tiff.extend_from_slice(b"BEN_0042.NEF\0");
+        let sub = tiff.len();
+        tiff.extend_from_slice(&directory(&[
+            (0x0111, 4, 1, raw as u32), (0x0117, 4, 1, 16),
+            (0x010F, 2, 14, make as u32), (0x0132, 2, 20, date as u32), (0xC68B, 2, 13, name as u32),
+        ]));
+        let first = tiff.len();
+        tiff.extend_from_slice(&directory(&[
+            (0x0111, 4, 1, px as u32), (0x0117, 4, 1, 16), (0x014A, 13, 1, sub as u32),
+        ]));
+        tiff[4..8].copy_from_slice(&(first as u32).to_le_bytes());
+
+        let (out, _) = strip_tiff(&tiff).expect("a well formed tiff");
+        for leak in [&b"RawCam Body"[..], b"2026:10:18", b"BEN_0042"] {
+            assert!(!contains(&out, leak), "survived: {:?}", String::from_utf8_lossy(leak));
+        }
+        assert_eq!(&out[px..px + 16], &tiff[px..px + 16], "the main picture moved");
+        assert_eq!(&out[raw..raw + 16], &tiff[raw..raw + 16], "the raw pixels moved");
+        assert_eq!(tags_at(&out, first), vec![0x0111, 0x0117, 0x014A], "the parent lost its SubIFDs entry");
+        assert_eq!(tags_at(&out, sub), vec![0x0111, 0x0117], "the sub-directory kept a tag");
+    }
+
+    /// SubIFDs may list several directories, as an array of offsets stored
+    /// out of line. Every one of them is walked.
+    #[test]
+    fn every_sub_directory_in_a_subifds_array_is_stripped() {
+        let mut tiff = b"II\x2A\x00\0\0\0\0".to_vec();
+        let mut subs = Vec::new();
+        let mut pixels = Vec::new();
+        for n in 0..2u8 {
+            let px = tiff.len();
+            tiff.extend_from_slice(&[0xC0 | n; 16]);
+            pixels.push(px);
+            let artist = tiff.len();
+            tiff.extend_from_slice(format!("Preview Author {n}\0").as_bytes());
+            let at = tiff.len();
+            tiff.extend_from_slice(&directory(&[(0x0111, 4, 1, px as u32), (0x0117, 4, 1, 16),
+                                                (0x013B, 2, 17, artist as u32)]));
+            subs.push(at as u32);
+        }
+        let list = tiff.len();
+        for at in &subs {
+            tiff.extend_from_slice(&at.to_le_bytes());
+        }
+        let px = tiff.len();
+        tiff.extend_from_slice(&[0xA1; 16]);
+        let first = tiff.len();
+        tiff.extend_from_slice(&directory(&[(0x0111, 4, 1, px as u32), (0x0117, 4, 1, 16),
+                                            (0x014A, 4, 2, list as u32)]));
+        tiff[4..8].copy_from_slice(&(first as u32).to_le_bytes());
+
+        let (out, _) = strip_tiff(&tiff).expect("a well formed tiff");
+        assert!(!contains(&out, b"Preview Author"), "a sub-directory kept its artist");
+        for at in pixels {
+            assert_eq!(&out[at..at + 16], &tiff[at..at + 16], "a preview's pixels moved");
+        }
+        assert_eq!(&out[list..list + 8], &tiff[list..list + 8], "the SubIFDs offsets were destroyed");
+    }
+
+    /// A removed tag whose declared size runs on into a sub-directory's raw
+    /// pixels must not zero them. Only the page chain's pixels were protected.
+    #[test]
+    fn an_overrun_does_not_zero_a_sub_directorys_pixels() {
+        let mut tiff = b"II\x2A\x00\0\0\0\0".to_vec();
+        let px = tiff.len();
+        tiff.extend_from_slice(&[0xA1; 16]);
+        let make = tiff.len();
+        tiff.extend_from_slice(b"Overrun Co\0");
+        let raw = tiff.len();
+        tiff.extend_from_slice(&[0xB2; 16]);
+        let sub = tiff.len();
+        tiff.extend_from_slice(&directory(&[(0x0111, 4, 1, raw as u32), (0x0117, 4, 1, 16)]));
+        let first = tiff.len();
+        tiff.extend_from_slice(&directory(&[
+            (0x0111, 4, 1, px as u32), (0x0117, 4, 1, 16),
+            (0x010F, 2, 11 + 16, make as u32), // claims to run through the raw pixels
+            (0x014A, 13, 1, sub as u32),
+        ]));
+        tiff[4..8].copy_from_slice(&(first as u32).to_le_bytes());
+
+        let (out, _) = strip_tiff(&tiff).expect("a well formed tiff");
+        assert!(!contains(&out, b"Overrun Co"));
+        assert_eq!(&out[raw..raw + 16], &tiff[raw..raw + 16], "the raw pixels were zeroed");
+    }
+
+    /// A sub-directory that lists its own parent must not walk forever.
+    #[test]
+    fn a_sub_directory_listing_its_parent_does_not_loop() {
+        let mut tiff = b"II\x2A\x00\0\0\0\0".to_vec();
+        let px = tiff.len();
+        tiff.extend_from_slice(&[0xA1; 16]);
+        let sub = tiff.len();
+        let first = sub + 2 + 3 * 12 + 4;
+        tiff.extend_from_slice(&directory(&[(0x0111, 4, 1, px as u32), (0x0117, 4, 1, 16),
+                                            (0x014A, 13, 1, first as u32)]));
+        tiff.extend_from_slice(&directory(&[(0x0111, 4, 1, px as u32), (0x0117, 4, 1, 16),
+                                            (0x014A, 13, 1, sub as u32)]));
+        tiff[4..8].copy_from_slice(&(first as u32).to_le_bytes());
+        let _ = strip_tiff(&tiff);
     }
 
     /// A scanned document has dozens of pages. The walk stopped after eight
