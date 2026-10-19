@@ -31,7 +31,14 @@ fn type_size(kind: u16) -> usize {
 /// way up the picture goes, the other how to read its colour. So is a DNG's
 /// UniqueCameraModel, which the format requires for choosing the colour profile
 /// a raw file is developed with.
-const REMOVE: [u16; 32] = [
+///
+/// A GeoTIFF's georeferencing goes too. Its tie points, pixel scale or
+/// transformation put the picture at coordinates on the Earth, and its keys
+/// name the projection and often the site, so a survey or a property map
+/// stripped of the rest would still say where it was made. So do the other
+/// carriers of the same facts: RPC coefficients, whose offsets are the scene
+/// centre in degrees, the older Intergraph matrix, and GDAL's metadata XML.
+const REMOVE: [u16; 42] = [
     0x010D, // DocumentName
     0x010E, // ImageDescription
     0x010F, // Make
@@ -64,6 +71,16 @@ const REMOVE: [u16; 32] = [
     0xC65D, // RawDataUniqueID (DNG)
     0xC68B, // OriginalRawFileName (DNG)
     0xC68C, // OriginalRawFileData, the whole original raw file (DNG)
+    0x830E, // ModelPixelScale (GeoTIFF)
+    0x8482, // ModelTiepoint (GeoTIFF)
+    0x85D8, // ModelTransformation (GeoTIFF)
+    0x87AF, // GeoKeyDirectory (GeoTIFF)
+    0x87B0, // GeoDoubleParams (GeoTIFF)
+    0x87B1, // GeoAsciiParams (GeoTIFF)
+    0x8480, // IntergraphMatrix, the older form of ModelTransformation
+    0xA480, // GDAL_METADATA, which can name the projection and the site
+    0xC69C, // RPCCoefficient, a geolocation model whose offsets are the scene centre
+    0xC71B, // PreviewDateTime (DNG)
 ];
 
 /// Directories walked, pages and their Exif, GPS and interoperability
@@ -636,6 +653,66 @@ mod tests {
             None => {}
             Some((out, _)) => assert!(!contains(&out, b"Ben Meadows"), "the page after it kept its artist"),
         }
+    }
+
+    /// A GeoTIFF places its picture on the Earth: tie points with a pixel
+    /// scale, or a transformation matrix, give coordinates, and the GeoKey
+    /// directory and its parameters name the projection, the datum and often
+    /// the site. A drone survey or a property map is a location, and Strip
+    /// left every one of these in place.
+    #[test]
+    fn geotiff_georeferencing_is_removed() {
+        let doubles = |v: &[f64]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        // Written as undefined bytes so that each count is a byte count, as
+        // the builder declares it; the strip goes by tag, whatever the type.
+        let tiepoint = doubles(&[0.0, 0.0, 0.0, -111.987654, 33.456789, 0.0]);
+        let transform = doubles(&[0.5, 0.0, 0.0, -111.987654, 0.0, -0.5, 0.0, 33.456789,
+                                  0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
+        let page = vec![
+            (0x830E, 7, doubles(&[0.25, 0.25, 0.0])),            // ModelPixelScale
+            (0x8482, 7, tiepoint.clone()),                       // ModelTiepoint
+            (0x85D8, 7, transform.clone()),                      // ModelTransformation
+            (0x87AF, 7, [1u16, 1, 0, 2, 1024, 0, 1, 1, 3072, 0, 1, 32612]
+                .iter().flat_map(|k| k.to_le_bytes()).collect()), // GeoKeyDirectory
+            (0x87B0, 7, doubles(&[6378137.0, 298.257223563])),    // GeoDoubleParams
+            (0x87B1, 2, b"WGS 84 / UTM zone 12N|Heber parcel 2411|\0".to_vec()), // GeoAsciiParams
+        ];
+        let (tiff, pixels) = tiff_pages(&[page]);
+        let (out, destroyed) = strip_tiff(&tiff).expect("a well formed tiff");
+        let place = (-111.987654f64).to_le_bytes();
+        for leak in [&place[..], &tiepoint[24..40], b"Heber parcel", b"UTM zone 12N",
+                     &6378137.0f64.to_le_bytes()[..], &32612u16.to_le_bytes()[..]] {
+            assert!(!contains(&out, leak), "survived: {leak:?}");
+        }
+        assert!(destroyed > 0);
+        assert_eq!(&out[pixels[0].clone()], &tiff[pixels[0].clone()], "the pixels moved");
+        let reader = Reader { bytes: &out, big_endian: false };
+        let first = reader.u32(4).unwrap() as usize;
+        let tags: Vec<u16> = reader.entries(first).iter().map(|e| e.1).collect();
+        assert_eq!(tags, vec![0x0111, 0x0117], "a georeferencing entry stayed in the directory");
+    }
+
+    /// Georeferencing also travels outside the six GeoTIFF tags: a satellite
+    /// or drone scene can be placed only by its RPC coefficients, whose offsets
+    /// are the scene centre in degrees; old Intergraph files carry the same
+    /// matrix as ModelTransformation; and GDAL writes the projection into its
+    /// metadata XML. A DNG dates its preview separately from the photograph.
+    #[test]
+    fn other_georeferencing_and_the_preview_date_are_removed() {
+        let doubles = |v: &[f64]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let page = vec![
+            (0x8480, 7, doubles(&[0.5, 0.0, 0.0, -111.123456])),            // IntergraphMatrix
+            (0xA480, 2, b"<GDALMetadata><Item name=\"SRS\">UTM zone 12N, site Heber</Item></GDALMetadata>\0".to_vec()),
+            (0xC69C, 7, doubles(&[1.0, 2.0, 34.432109, -110.598765])),       // RPCCoefficient
+            (0xC71B, 2, b"2026:10:18 21:04:00\0".to_vec()),                  // PreviewDateTime (DNG)
+        ];
+        let (tiff, pixels) = tiff_pages(&[page]);
+        let (out, _) = strip_tiff(&tiff).expect("a well formed tiff");
+        for leak in [&(-111.123456f64).to_le_bytes()[..], b"site Heber", &34.432109f64.to_le_bytes()[..],
+                     b"2026:10:18 21:04"] {
+            assert!(!contains(&out, leak), "survived: {leak:?}");
+        }
+        assert_eq!(&out[pixels[0].clone()], &tiff[pixels[0].clone()], "the pixels moved");
     }
 
     /// A directory written out: entry count, entries, then no next directory.
