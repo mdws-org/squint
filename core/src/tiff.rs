@@ -111,6 +111,12 @@ const PIXEL_RANGES: [(u16, u16); 3] = [
 /// The colour profile, which is data this must protect rather than remove.
 const ICC: u16 = 0x8773;
 
+/// XResolution and YResolution: printing density, which no pixel depends on.
+/// Samsung's NX cameras from 2014 on point their previews' resolution into
+/// IFD0's text or the maker note, so a removed value is wiped through them
+/// rather than left in place or the file refused.
+const RESOLUTION: [u16; 2] = [0x011A, 0x011B];
+
 /// Compression values whose strips or tiles are JPEG streams: old-style JPEG,
 /// JPEG, and the lossy JPEG a DNG may use.
 const JPEG_COMPRESSION: [u64; 3] = [6, 7, 34892];
@@ -282,19 +288,28 @@ fn overlaps(ranges: &[(usize, usize)], start: usize, end: usize) -> bool {
     i < ranges.len() && ranges[i].0 < end
 }
 
-/// Where a removed entry's data lies, as the declared range to wipe; `Some(None)`
-/// when the value sits in the entry itself.
+/// What a page keeps, as two sets of sorted, disjoint ranges: everything
+/// that must not be zeroed by an overrun, and the part of it a removed value
+/// may never be wiped through, which is all of it but the resolutions.
+struct Kept {
+    all: Vec<(usize, usize)>,
+    strict: Vec<(usize, usize)>,
+}
+
+/// Where a removed entry's data lies, as `(start, value end, declared end)`;
+/// `Some(None)` when the value sits in the entry itself.
 ///
 /// `None` when the value cannot be wiped, so the file is refused rather than
 /// reported clean with the value still in it: its declared length runs past
 /// the end of the file, or part of it lies in the pixels, the colour profile
-/// or data a kept entry points at, none of which may change.
+/// or data a kept entry other than a resolution points at, none of which may
+/// change.
 ///
 /// Text ends at its first terminator. Writers' counts often claim bytes past
 /// it, and on real files those run into the pixels; they are not the value,
 /// so they are left alone and the rest is wiped. Any other value is its whole
 /// declared length.
-fn removable(reader: &Reader, keep: &[(usize, usize)], entry: usize, kind: u16, count: u32) -> Option<Option<(usize, usize)>> {
+fn removable(reader: &Reader, kept: &Kept, entry: usize, kind: u16, count: u32) -> Option<Option<(usize, usize, usize)>> {
     let size = type_size(kind).checked_mul(count as usize)?;
     if size <= 4 {
         return Some(None);
@@ -306,10 +321,10 @@ fn removable(reader: &Reader, keep: &[(usize, usize)], entry: usize, kind: u16, 
         2 => data.iter().position(|&b| b == 0).map_or(end, |n| at + n),
         _ => end,
     };
-    if value_end > at && overlaps(keep, at, value_end) {
+    if value_end > at && overlaps(&kept.strict, at, value_end) {
         return None;
     }
-    Some(Some((at, end)))
+    Some(Some((at, value_end, end)))
 }
 
 /// Every region the picture occupies, gathered before anything is written.
@@ -323,8 +338,11 @@ fn removable(reader: &Reader, keep: &[(usize, usize)], entry: usize, kind: u16, 
 /// this walk has no protection, so stripping it could zero its pixels. Also
 /// `None` when a JPEG among the pixels carries EXIF, XMP or IPTC, which would
 /// stay in a file reported clean.
-fn protected(reader: &Reader, first: usize) -> Option<Vec<(usize, usize)>> {
+fn protected(reader: &Reader, first: usize) -> Option<Kept> {
     let mut out = Vec::new();
+    // The resolutions, kept apart: an overrun must not zero them, but a
+    // removed value lying under one is wiped through it.
+    let mut resolutions = Vec::new();
     // Each directory with whether it is a page. A page's kept entries point
     // at data the file still needs; an Exif, GPS or interoperability directory
     // is removed whole, so nothing in it is kept. One directory reached in
@@ -388,7 +406,11 @@ fn protected(reader: &Reader, first: usize) -> Option<Vec<(usize, usize)>> {
             let kept = is_page && !REMOVE.contains(tag) && !SUB_IFDS.contains(tag);
             if *tag == ICC || kept {
                 if let Some((at, size)) = reader.data_at(*entry, *kind, *count) {
-                    out.push((at, at + size));
+                    if is_page && RESOLUTION.contains(tag) {
+                        resolutions.push((at, at + size));
+                    } else {
+                        out.push((at, at + size));
+                    }
                 }
             }
             if SUB_IFDS.contains(tag) {
@@ -421,7 +443,8 @@ fn protected(reader: &Reader, first: usize) -> Option<Vec<(usize, usize)>> {
     if extents.windows(2).any(|w| w[1].0 < w[0].1) {
         return None;
     }
-    Some(merged(out))
+    let all = merged(out.iter().chain(resolutions.iter()).copied().collect());
+    Some(Kept { all, strict: merged(out) })
 }
 
 /// Ranges sorted by start with overlapping and touching ones joined, so that
@@ -449,7 +472,8 @@ pub fn strip_tiff(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
     }
     let reader = Reader { bytes, big_endian: bytes[0] == b'M' };
     let first = reader.u32(4)? as usize;
-    let keep_clear = protected(&reader, first)?;
+    let keep = protected(&reader, first)?;
+    let keep_clear = &keep.all;
 
     let mut out = bytes.to_vec();
     let mut destroyed = Destroyed::default();
@@ -479,7 +503,7 @@ pub fn strip_tiff(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
         let next = reader.u32(directory + 2 + entries.len() * 12)?;
         // A directory lying over the pixels or kept data would have them
         // rewritten as if they were entries. Such a file is malformed.
-        if overlaps(&keep_clear, directory, directory + 2 + entries.len() * 12 + 4) {
+        if overlaps(keep_clear, directory, directory + 2 + entries.len() * 12 + 4) {
             return None;
         }
 
@@ -506,20 +530,24 @@ pub fn strip_tiff(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
                     let end = sub + 2 + sub_entries.len() * 12 + 4;
                     // The directory holds short values in its own entries, so
                     // one lying in kept data would keep them.
-                    if overlaps(&keep_clear, sub, end) {
+                    if overlaps(&keep.strict, sub, end) {
                         return None;
                     }
                     for (sub_entry, _, sub_kind, sub_count) in sub_entries {
-                        if let Some((at, end)) = removable(&reader, &keep_clear, sub_entry, sub_kind, sub_count)? {
-                            destroyed.wipe_outside(&mut out, &keep_clear, at, end);
+                        if let Some((at, value_end, end)) = removable(&reader, &keep, sub_entry, sub_kind, sub_count)? {
+                            destroyed.wipe_outside(&mut out, &keep.strict, at, value_end);
+                            destroyed.wipe_outside(&mut out, keep_clear, value_end, end);
                         }
                     }
                     if end <= out.len() {
-                        destroyed.wipe_outside(&mut out, &keep_clear, sub, end);
+                        destroyed.wipe_outside(&mut out, &keep.strict, sub, end);
                     }
                 }
-            } else if let Some((at, end)) = removable(&reader, &keep_clear, *entry, *kind, *count)? {
-                destroyed.wipe_outside(&mut out, &keep_clear, at, end);
+            } else if let Some((at, value_end, end)) = removable(&reader, &keep, *entry, *kind, *count)? {
+                // The value goes even through a resolution; what a count
+                // claims past it is only wiped where nothing is kept.
+                destroyed.wipe_outside(&mut out, &keep.strict, at, value_end);
+                destroyed.wipe_outside(&mut out, keep_clear, value_end, end);
             }
         }
 
@@ -1363,6 +1391,73 @@ mod tests {
         let entry = 24 + 2 + 2 * 12; // the third entry of the directory after the pixels
         tiff[entry + 8..entry + 12].copy_from_slice(&make_at.to_le_bytes());
         assert!(strip_tiff(&tiff).is_none(), "the maker's name past the declared end stayed");
+    }
+
+    /// Samsung's NX cameras from 2014 on point their previews' XResolution
+    /// and YResolution into IFD0's text: here a resolution starts inside the
+    /// maker's name. The resolution is not a picture, and the name has to
+    /// go, so it is wiped through the resolution rather than refused or left.
+    #[test]
+    fn a_removed_value_under_a_resolution_is_wiped_through() {
+        const MAKE: &[u8] = b"SAMSUNG\0\0\0\0\0\0\0\0\0";
+        let pixels_at = 8 + MAKE.len();
+        let tiff = tiff_from(
+            &[MAKE, &[0xAA; 16]],
+            &[
+                (0x010F, 2, MAKE.len() as u32, 8),
+                (0x0111, 4, 1, pixels_at as u32),
+                (0x0117, 4, 1, 16),
+                (0x011A, 5, 1, 12), // XResolution, from inside the maker's name
+            ],
+        );
+        let (out, _) = strip_tiff(&tiff).expect("a Samsung layout strips");
+        assert!(!contains(&out, b"SAM") && !contains(&out, b"UNG"), "part of the maker's name stayed");
+        assert_eq!(&out[pixels_at..pixels_at + 16], &[0xAA; 16], "the pixels were touched");
+    }
+
+    /// The same inside a maker note, where the NX3000 and NX mini point them.
+    #[test]
+    fn a_maker_note_under_a_resolution_is_wiped_through() {
+        let mut note = b"Samsung SN 0123456789 lens 16-50".to_vec();
+        note.extend_from_slice(&[0x5A; 16]);
+        let note_at = 8;
+        let pixels_at = note_at + note.len();
+        let exif_at = pixels_at + 16;
+        let exif = directory(&[(0x927C, 7, note.len() as u32, note_at as u32)]);
+        let tiff = tiff_from(
+            &[&note, &[0xAA; 16], &exif],
+            &[
+                (0x0111, 4, 1, pixels_at as u32),
+                (0x0117, 4, 1, 16),
+                (0x011A, 5, 1, note_at as u32 + 8), // XResolution, inside the maker note
+                (0x8769, 4, 1, exif_at as u32),
+            ],
+        );
+        let (out, _) = strip_tiff(&tiff).expect("a Samsung layout strips");
+        assert_eq!(&out[note_at..note_at + note.len()], &vec![0; note.len()][..], "part of the maker note stayed");
+        assert_eq!(&out[pixels_at..pixels_at + 16], &[0xAA; 16], "the pixels were touched");
+    }
+
+    /// Only the value's own bytes go through a resolution. A count running on
+    /// past the text's end into a real resolution leaves the resolution alone.
+    #[test]
+    fn an_overrun_into_a_resolution_does_not_zero_it() {
+        const MAKE: &[u8] = b"Acme\0\0\0\0";
+        let resolution = [72u32.to_le_bytes(), 1u32.to_le_bytes()].concat();
+        let resolution_at = 8 + MAKE.len();
+        let pixels_at = resolution_at + 8;
+        let tiff = tiff_from(
+            &[MAKE, &resolution, &[0xAA; 16]],
+            &[
+                (0x010F, 2, MAKE.len() as u32 + 8, 8), // runs over the resolution
+                (0x0111, 4, 1, pixels_at as u32),
+                (0x0117, 4, 1, 16),
+                (0x011A, 5, 1, resolution_at as u32),
+            ],
+        );
+        let (out, _) = strip_tiff(&tiff).expect("a well formed tiff");
+        assert!(!contains(&out, b"Acme"), "the maker survived");
+        assert_eq!(&out[resolution_at..resolution_at + 8], &resolution[..], "the resolution was zeroed");
     }
 
     /// A JPEG from its segments: SOI, each `(marker, payload)`, then a scan
