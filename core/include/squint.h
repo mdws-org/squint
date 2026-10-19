@@ -26,6 +26,7 @@
 #define SQUINT_ERR_STRIP_GREW     14
 #define SQUINT_ERR_SIGNED         15
 #define SQUINT_ERR_ATTACHMENTS    16
+#define SQUINT_ERR_PREVIEW        17
 
 #define SQUINT_MODE_FAST    0
 #define SQUINT_MODE_QUALITY 1
