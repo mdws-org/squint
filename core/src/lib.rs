@@ -108,6 +108,11 @@ pub enum Error {
     /// inside an attachment would still be there, so it carries its own code
     /// and is shown as a failure.
     AttachmentsUnread { attachments: usize },
+    /// A JPEG among a TIFF's pixels, usually the embedded preview a raw file
+    /// carries, holds metadata of its own. Removing it means rewriting that
+    /// JPEG, which Strip does not do yet, so the file is refused rather than
+    /// reported clean with it inside.
+    PreviewMetadata,
     /// Something below panicked. Reported rather than allowed to unwind into C,
     /// where it would abort the process and take every other job with it.
     Panicked,
@@ -160,6 +165,10 @@ impl std::fmt::Display for Error {
                 f,
                 "nothing else to remove, but this PDF carries {attachments} attached file{}, which Strip does not read; the file was not changed",
                 if *attachments == 1 { "" } else { "s" }
+            ),
+            Error::PreviewMetadata => write!(
+                f,
+                "this file's embedded preview carries location or camera data that Strip cannot remove yet; the file was not changed"
             ),
             Error::Panicked => write!(f, "the engine failed unexpectedly; the file was not changed"),
         }
@@ -816,8 +825,10 @@ pub fn optimize_as(
                     Error::Decode(format!("this {container} is not laid out as expected"))
                 })?
             } else {
-                tiff::strip_tiff(bytes)
-                    .ok_or_else(|| Error::Decode("this TIFF is not laid out as expected".into()))?
+                tiff::strip_tiff_checked(bytes).map_err(|refused| match refused {
+                    tiff::Refused::Preview => Error::PreviewMetadata,
+                    tiff::Refused::Layout => Error::Decode("this TIFF is not laid out as expected".into()),
+                })?
             };
             // Destroying metadata that an earlier Strip already destroyed
             // rewrites the same bytes, so a second Strip is caught here.
@@ -1299,6 +1310,33 @@ mod tests {
             Err(Error::ReadOnlyFormat { format: "TIFF" }) => {}
             Err(e) => panic!("expected ReadOnlyFormat TIFF, got {e:?}"),
             Ok(_) => panic!("expected ReadOnlyFormat TIFF, got a result"),
+        }
+    }
+
+    /// A raw file whose embedded preview carries its own EXIF, as an iPhone
+    /// ProRAW file's does with the GPS position in it, is refused in Strip
+    /// with its own message rather than as a TIFF laid out wrongly.
+    #[test]
+    fn a_tiff_whose_preview_carries_exif_is_refused_with_its_own_error() {
+        let preview: &[u8] = &[
+            0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x08, b'E', b'x', b'i', b'f', 0, 0, 0xFF, 0xDA, 0x00, 0x02, 0x11, 0xFF, 0xD9,
+        ];
+        let mut tiff = vec![b'I', b'I', 42, 0, 0, 0, 0, 0];
+        tiff.extend_from_slice(preview);
+        let directory = tiff.len() as u32;
+        tiff[4..8].copy_from_slice(&directory.to_le_bytes());
+        tiff.extend_from_slice(&2u16.to_le_bytes());
+        for (tag, kind, count, value) in [(0x0201u16, 4u16, 1u32, 8u32), (0x0202, 4, 1, preview.len() as u32)] {
+            tiff.extend_from_slice(&tag.to_le_bytes());
+            tiff.extend_from_slice(&kind.to_le_bytes());
+            tiff.extend_from_slice(&count.to_le_bytes());
+            tiff.extend_from_slice(&value.to_le_bytes());
+        }
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        match optimize(&tiff, Mode::Strip, 0.0, 0.0, None, 0, None) {
+            Err(Error::PreviewMetadata) => {}
+            Err(e) => panic!("expected PreviewMetadata, got {e:?}"),
+            Ok(_) => panic!("expected PreviewMetadata, got a result"),
         }
     }
 
