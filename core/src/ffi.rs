@@ -40,6 +40,8 @@ pub const SQUINT_ERR_UNKNOWN_MODE: c_int = 13;
 /// original was kept with its metadata. Distinct from `SQUINT_ERR_NO_SMALLER`,
 /// which the app reports as "nothing to remove" in Strip mode.
 pub const SQUINT_ERR_STRIP_GREW: c_int = 14;
+/// The PDF is digitally signed; any rewrite would break the signature.
+pub const SQUINT_ERR_SIGNED: c_int = 15;
 
 /// The result of one optimization.
 ///
@@ -92,6 +94,7 @@ fn code_for(e: &Error) -> c_int {
         Error::TooLarge { .. } => SQUINT_ERR_TOO_LARGE,
         Error::ColoursUnreachable { .. } => SQUINT_ERR_COLOURS,
         Error::ReadOnlyFormat { .. } => SQUINT_ERR_READ_ONLY,
+        Error::Signed => SQUINT_ERR_SIGNED,
         Error::Panicked => SQUINT_ERR_PANIC,
     }
 }
@@ -375,6 +378,7 @@ pub extern "C" fn squint_error_message(code: c_int) -> *const c_char {
         SQUINT_ERR_UNKNOWN_FORMAT => b"the output format asked for is not one squint writes; the file was not changed\0",
         SQUINT_ERR_UNKNOWN_MODE => b"the mode asked for is not one squint has; the file was not changed\0",
         SQUINT_ERR_STRIP_GREW => b"metadata was found, but removing it would make the file larger; the original was kept with its metadata\0",
+        SQUINT_ERR_SIGNED => b"this PDF is digitally signed, and any change would break the signature; the file was not changed\0",
         _ => b"unknown error\0",
     };
     s.as_ptr() as *const c_char

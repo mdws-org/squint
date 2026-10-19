@@ -247,6 +247,29 @@ fn image_candidates(doc: &Document) -> Vec<ObjectId> {
     pictures
 }
 
+/// Whether the document carries a digital signature: a signature dictionary
+/// (/Type /Sig, or /DocTimeStamp for a time stamp) holding the byte range it
+/// covers. A signature field nobody has signed has no such dictionary.
+fn is_signed(doc: &Document) -> bool {
+    fn signature(dict: &lopdf::Dictionary) -> bool {
+        let kind = dict.get(b"Type").and_then(Object::as_name).ok();
+        dict.get(b"ByteRange").map(|r| r.as_array().is_ok()).unwrap_or(false)
+            && (matches!(kind, Some(b"Sig" | b"DocTimeStamp")) || dict.has(b"Contents"))
+    }
+    fn walk(object: &Object, depth: usize) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        match object {
+            Object::Dictionary(d) => signature(d) || d.iter().any(|(_, v)| walk(v, depth + 1)),
+            Object::Stream(s) => signature(&s.dict),
+            Object::Array(items) => items.iter().any(|v| walk(v, depth + 1)),
+            _ => false,
+        }
+    }
+    doc.objects.values().any(|o| walk(o, 0))
+}
+
 /// Re-encode the pictures inside a PDF, and remove what the document discloses.
 ///
 /// `max_dpi` caps resolution, judged against the widest page. `mode` decides
@@ -262,6 +285,14 @@ pub fn rewrite(
 ) -> Result<Rewritten, Error> {
     let mut doc = Document::load_mem(bytes)
         .map_err(|e| Error::Decode(format!("this PDF could not be read: {e}")))?;
+
+    // Any rewrite invalidates a digital signature, Strip included, and the
+    // signature itself names the signer, the place and the time. Writing the
+    // file anyway would hand back a document that claims a signature it no
+    // longer carries.
+    if is_signed(&doc) {
+        return Err(Error::Signed);
+    }
 
     let metadata_removed =
         strip_document_metadata(&mut doc) + strip_image_metadata(&mut doc, mode == Mode::Strip)?;
@@ -989,6 +1020,74 @@ mod tests {
         doc.save_to(&mut bytes).unwrap();
         let out = rewrite(&bytes, Mode::Strip, 0.0, 0.0, 0, None).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(first_image_content(&out.data), SCAN_ONLY, "the EXIF survived");
+    }
+
+    /// A one-page PDF with an AcroForm signature field. `signature` is the
+    /// field's value, or `None` for a field nobody has signed yet.
+    fn pdf_with_signature_field(signature: Option<lopdf::Dictionary>) -> Vec<u8> {
+        let mut doc = Document::with_version("1.7");
+        let (_, page) = one_page(&mut doc, dictionary! {}, dictionary! { "MediaBox" => rect(612, 792) });
+        let mut field = dictionary! {
+            "FT" => name("Sig"), "T" => Object::string_literal("Signature1"),
+            "Type" => name("Annot"), "Subtype" => name("Widget"), "Rect" => rect(0, 0),
+            "P" => Object::Reference(page),
+        };
+        if let Some(sig) = signature {
+            field.set("V", Object::Reference(doc.add_object(sig)));
+        }
+        let field = doc.add_object(field);
+        let root = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+        let catalog = doc.get_object_mut(root).unwrap().as_dict_mut().unwrap();
+        catalog.set("AcroForm", dictionary! { "Fields" => vec![Object::Reference(field)], "SigFlags" => 3 });
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn signed_by(who: &str) -> lopdf::Dictionary {
+        dictionary! {
+            "Type" => name("Sig"), "Filter" => name("Adobe.PPKLite"),
+            "SubFilter" => name("adbe.pkcs7.detached"),
+            "Name" => Object::string_literal(who), "Location" => Object::string_literal("Phoenix, AZ"),
+            "Reason" => Object::string_literal("I approve this document"),
+            "M" => Object::string_literal("D:20261018120000-07'00'"),
+            "ByteRange" => vec![0.into(), 840.into(), 960.into(), 240.into()],
+            "Contents" => Object::String(vec![0x30, 0x82, 0x01, 0x00], lopdf::StringFormat::Hexadecimal),
+        }
+    }
+
+    /// A signature names its signer, where and when it was made, and why.
+    /// Rewriting the document breaks the signature anyway, so any change,
+    /// Strip or a shrink, would leave a document that claims a signature it no
+    /// longer carries. A signed PDF is refused with a reason instead.
+    #[test]
+    fn a_signed_pdf_is_refused_with_a_reason_in_every_mode() {
+        let bytes = pdf_with_signature_field(Some(signed_by("Ben Meadows")));
+        for mode in [Mode::Strip, Mode::Fast, Mode::Quality] {
+            match rewrite(&bytes, mode, 80.0, 75.0, 8, Some(DEFAULT_MAX_DPI)) {
+                Ok(_) => panic!("a signed PDF was rewritten in {mode:?}"),
+                Err(e) => assert!(matches!(e, Error::Signed), "{mode:?} refused for another reason: {e}"),
+            }
+        }
+    }
+
+    /// A form with a signature field that nobody has signed carries no
+    /// signature to break, so it is not refused.
+    #[test]
+    fn an_unsigned_signature_field_is_not_refused() {
+        let bytes = pdf_with_signature_field(None);
+        rewrite(&bytes, Mode::Strip, 0.0, 0.0, 0, None).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// A timestamp-only document signature (/DocTimeStamp) is a signature too.
+    #[test]
+    fn a_document_timestamp_counts_as_a_signature() {
+        let mut stamp = signed_by("TSA");
+        stamp.set("Type", name("DocTimeStamp"));
+        stamp.set("SubFilter", name("ETSI.RFC3161"));
+        let bytes = pdf_with_signature_field(Some(stamp));
+        assert!(matches!(rewrite(&bytes, Mode::Strip, 0.0, 0.0, 0, None), Err(Error::Signed)),
+                "a time-stamped PDF was rewritten");
     }
 
     /// A picture Strip cannot walk keeps whatever it carries, so the document
