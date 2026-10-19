@@ -100,6 +100,11 @@ pub enum Error {
     ColoursUnreachable { floor: u8 },
     /// The format can have its metadata removed but cannot be re-encoded.
     ReadOnlyFormat { format: &'static str },
+    /// Strip found nothing else to remove from a PDF, but the PDF carries
+    /// attached files, which no mode reads. Not `NothingToRemove`: a location
+    /// inside an attachment would still be there, so it carries its own code
+    /// and is shown as a failure.
+    AttachmentsUnread { attachments: usize },
     /// Something below panicked. Reported rather than allowed to unwind into C,
     /// where it would abort the process and take every other job with it.
     Panicked,
@@ -143,6 +148,11 @@ impl std::fmt::Display for Error {
             Error::ReadOnlyFormat { format } => write!(
                 f,
                 "{format} can have its location and camera data removed, but squint cannot re-encode it yet; the file was not changed"
+            ),
+            Error::AttachmentsUnread { attachments } => write!(
+                f,
+                "nothing else to remove, but this PDF carries {attachments} attached file{}, which Strip does not read; the file was not changed",
+                if *attachments == 1 { "" } else { "s" }
             ),
             Error::Panicked => write!(f, "the engine failed unexpectedly; the file was not changed"),
         }
@@ -717,6 +727,11 @@ pub fn optimize_as(
         if pdf::is_pdf(bytes) {
             let r = pdf::rewrite(bytes, Mode::Strip, 0.0, 0.0, 0, None)?;
             if r.metadata_removed == 0 {
+                // A location inside an attached file would still be there, so
+                // "nothing to remove" would be the wrong claim.
+                if r.attachments > 0 {
+                    return Err(Error::AttachmentsUnread { attachments: r.attachments });
+                }
                 return Err(Error::NothingToRemove);
             }
             // A rewritten document is not always smaller: one its writer had

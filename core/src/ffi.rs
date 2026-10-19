@@ -40,6 +40,9 @@ pub const SQUINT_ERR_UNKNOWN_MODE: c_int = 13;
 /// original was kept with its metadata. Distinct from `SQUINT_ERR_NO_SMALLER`,
 /// which the app reports as "nothing to remove" in Strip mode.
 pub const SQUINT_ERR_STRIP_GREW: c_int = 14;
+/// Strip found nothing else to remove, but the PDF carries attached files,
+/// which no mode reads. 15 is SQUINT_ERR_SIGNED.
+pub const SQUINT_ERR_ATTACHMENTS: c_int = 16;
 
 /// The result of one optimization.
 ///
@@ -96,6 +99,7 @@ fn code_for(e: &Error) -> c_int {
         Error::TooLarge { .. } => SQUINT_ERR_TOO_LARGE,
         Error::ColoursUnreachable { .. } => SQUINT_ERR_COLOURS,
         Error::ReadOnlyFormat { .. } => SQUINT_ERR_READ_ONLY,
+        Error::AttachmentsUnread { .. } => SQUINT_ERR_ATTACHMENTS,
         Error::Panicked => SQUINT_ERR_PANIC,
     }
 }
@@ -417,6 +421,7 @@ pub extern "C" fn squint_error_message(code: c_int) -> *const c_char {
         SQUINT_ERR_UNKNOWN_FORMAT => b"the output format asked for is not one squint writes; the file was not changed\0",
         SQUINT_ERR_UNKNOWN_MODE => b"the mode asked for is not one squint has; the file was not changed\0",
         SQUINT_ERR_STRIP_GREW => b"metadata was found, but removing it would make the file larger; the original was kept with its metadata\0",
+        SQUINT_ERR_ATTACHMENTS => b"nothing else to remove, but this PDF carries attached files, which Strip does not read; the file was not changed\0",
         _ => b"unknown error\0",
     };
     s.as_ptr() as *const c_char
