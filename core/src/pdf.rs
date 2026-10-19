@@ -55,6 +55,20 @@ pub struct Rewritten {
     pub images_seen: usize,
     /// Entries removed from the document's own metadata.
     pub metadata_removed: usize,
+    /// Files attached to the document. No mode reads or changes them, so the
+    /// caller can say so rather than present the document as clean.
+    pub attachments: usize,
+}
+
+/// Files the document carries as embedded file streams: the attachments in
+/// its EmbeddedFiles name tree, a file attachment annotation's file, and any
+/// associated file.
+fn attachment_count(doc: &Document) -> usize {
+    doc.objects
+        .values()
+        .filter_map(|o| o.as_stream().ok())
+        .filter(|s| s.dict.get(b"Type").and_then(Object::as_name).ok() == Some(&b"EmbeddedFile"[..]))
+        .count()
 }
 
 /// Whether these bytes are a PDF.
@@ -274,6 +288,7 @@ pub fn rewrite(
         // save, so a removed reference would leave its target (an annotation's
         // author, an editor's private data) in the file.
         doc.prune_objects();
+        let attachments = attachment_count(&doc);
         let mut out = Vec::new();
         doc.save_modern(&mut out)
             .map_err(|e| Error::Encode(format!("this PDF could not be written: {e}")))?;
@@ -282,6 +297,7 @@ pub fn rewrite(
             images_rewritten: 0,
             images_seen: 0,
             metadata_removed,
+            attachments,
         });
     }
 
@@ -361,7 +377,7 @@ pub fn rewrite(
     doc.save_modern(&mut out)
         .map_err(|e| Error::Encode(format!("this PDF could not be written: {e}")))?;
 
-    Ok(Rewritten { data: out, images_rewritten, images_seen, metadata_removed })
+    Ok(Rewritten { data: out, images_rewritten, images_seen, metadata_removed, attachments: attachment_count(&doc) })
 }
 
 /// Draw a picture smaller, through the same filter every other cap here uses.
@@ -989,6 +1005,53 @@ mod tests {
         doc.save_to(&mut bytes).unwrap();
         let out = rewrite(&bytes, Mode::Strip, 0.0, 0.0, 0, None).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(first_image_content(&out.data), SCAN_ONLY, "the EXIF survived");
+    }
+
+    /// A PDF with one attached file and an author.
+    fn pdf_with_attachment() -> Vec<u8> {
+        let mut doc = Document::with_version("1.7");
+        one_page(&mut doc, dictionary! {}, dictionary! { "MediaBox" => rect(612, 792) });
+        let file = doc.add_object(Object::Stream(lopdf::Stream::new(
+            dictionary! { "Type" => name("EmbeddedFile") },
+            b"attached notes, taken at 33.4484N 112.0740W".to_vec(),
+        )));
+        let spec = doc.add_object(dictionary! {
+            "Type" => name("Filespec"), "F" => Object::string_literal("notes.txt"),
+            "EF" => dictionary! { "F" => Object::Reference(file) },
+        });
+        let root = doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+        let catalog = doc.get_object_mut(root).unwrap().as_dict_mut().unwrap();
+        catalog.set("Names", dictionary! { "EmbeddedFiles" => dictionary! {
+            "Names" => vec![Object::string_literal("notes.txt"), Object::Reference(spec)] } });
+        doc.trailer.set("Info", dictionary! { "Author" => Object::string_literal("Ben Meadows") });
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn attachment_content(bytes: &[u8]) -> Option<Vec<u8>> {
+        let doc = Document::load_mem(bytes).unwrap();
+        doc.objects.values().filter_map(|o| o.as_stream().ok()).find_map(|s| {
+            let kind = s.dict.get(b"Type").and_then(Object::as_name).ok();
+            (kind == Some(&b"EmbeddedFile"[..])).then(|| s.decompressed_content().unwrap_or_else(|_| s.content.clone()))
+        })
+    }
+
+    /// A PDF can carry files of its own: an invoice's XML, a spreadsheet, a
+    /// photograph with its own location. No mode reads or changes them, and
+    /// Strip said nothing about them, so a document with an attachment came
+    /// back looking clean. They are kept as they are, and counted.
+    #[test]
+    fn files_attached_to_a_pdf_are_kept_and_counted() {
+        let bytes = pdf_with_attachment();
+        for mode in [Mode::Strip, Mode::Fast] {
+            let out = rewrite(&bytes, mode, 80.0, 75.0, 8, None).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(out.attachments, 1, "{mode:?} did not count the attached file");
+            assert_eq!(attachment_content(&out.data).as_deref(),
+                       Some(&b"attached notes, taken at 33.4484N 112.0740W"[..]), "{mode:?} changed the attachment");
+        }
+        let plain = pdf_with_image(name("DCTDecode"), jpeg_with_exif());
+        assert_eq!(rewrite(&plain, Mode::Strip, 0.0, 0.0, 0, None).unwrap().attachments, 0);
     }
 
     /// A picture Strip cannot walk keeps whatever it carries, so the document

@@ -52,6 +52,9 @@ enum Engine {
         /// JPEG made from a HEIC, or an AVIF made from anything. Such a result
         /// must never land on the source.
         let converted: Bool
+        /// Files attached inside a PDF. The engine reads none of them, so a
+        /// Strip cannot vouch for what they carry.
+        let attachments: Int
 
         var ratio: Double { Double(data.count) / Double(originalBytes) }
 
@@ -112,7 +115,8 @@ enum Engine {
             hdr: Hdr(rawValue: result.hdr) ?? .absent,
             quantized: result.quantized != 0,
             originalBytes: result.original_len,
-            converted: result.converted != 0
+            converted: result.converted != 0,
+            attachments: Int(result.attachments)
         )
     }
 }

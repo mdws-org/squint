@@ -664,6 +664,9 @@ pub struct Optimized {
     pub quantized: bool,
     pub original_bytes: usize,
     pub converted_from: Option<&'static str>,
+    /// Files attached inside a PDF, kept as they were: no mode reads them.
+    /// Zero for every other format.
+    pub attachments: usize,
 }
 
 /// Optimize an encoded image, dispatching on its format.
@@ -735,6 +738,7 @@ pub fn optimize_as(
                 quantized: false,
                 original_bytes: bytes.len(),
                 converted_from: None,
+                attachments: r.attachments,
             });
         }
 
@@ -757,6 +761,7 @@ pub fn optimize_as(
                 quantized: false,
                 original_bytes: bytes.len(),
                 converted_from: None,
+                attachments: 0,
             });
         }
 
@@ -778,6 +783,7 @@ pub fn optimize_as(
                 quantized: false,
                 original_bytes: bytes.len(),
                 converted_from: None,
+                attachments: 0,
             });
         }
 
@@ -805,6 +811,7 @@ pub fn optimize_as(
                 quantized: false,
                 original_bytes: bytes.len(),
                 converted_from: None,
+                attachments: 0,
             });
         }
 
@@ -838,6 +845,7 @@ pub fn optimize_as(
             quantized: false,
             original_bytes: bytes.len(),
             converted_from: None,
+            attachments: 0,
         });
     }
 
@@ -903,6 +911,7 @@ pub fn optimize_as(
             quantized: false,
             original_bytes: bytes.len(),
             converted_from: None,
+            attachments: r.attachments,
         });
     }
 
@@ -932,6 +941,7 @@ pub fn optimize_as(
             quantized: r.quantized,
             original_bytes: bytes.len(),
             converted_from: None,
+            attachments: 0,
         });
     }
 
@@ -1032,6 +1042,7 @@ pub fn optimize_as(
         quantized: false,
         original_bytes: bytes.len(),
         converted_from,
+        attachments: 0,
     })
 }
 
@@ -1108,6 +1119,7 @@ fn hdr_in_place(
         quantized: false,
         original_bytes: source.bytes.len(),
         converted_from: None,
+        attachments: 0,
     })
 }
 

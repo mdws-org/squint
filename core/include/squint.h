@@ -58,6 +58,10 @@ typedef struct {
     // JPEG made from a HEIC, WebP or SVG, or an AVIF made from anything. Such a
     // result must be written beside the original, never over it.
     int converted;
+    // Files attached inside a PDF. No mode reads or changes them, so they come
+    // through as they arrived; the app says so rather than calling the
+    // document clean. Zero for every other format and on failure.
+    int attachments;
 } SquintResult;
 
 // The input format is detected from the bytes. HEIC is decoded for fast and
