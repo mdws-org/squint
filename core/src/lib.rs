@@ -100,6 +100,9 @@ pub enum Error {
     ColoursUnreachable { floor: u8 },
     /// The format can have its metadata removed but cannot be re-encoded.
     ReadOnlyFormat { format: &'static str },
+    /// A PDF carries a digital signature. Any rewrite, Strip included, would
+    /// break it, so the file is refused rather than returned unsigned.
+    Signed,
     /// Strip found nothing else to remove from a PDF, but the PDF carries
     /// attached files, which no mode reads. Not `NothingToRemove`: a location
     /// inside an attachment would still be there, so it carries its own code
@@ -148,6 +151,10 @@ impl std::fmt::Display for Error {
             Error::ReadOnlyFormat { format } => write!(
                 f,
                 "{format} can have its location and camera data removed, but squint cannot re-encode it yet; the file was not changed"
+            ),
+            Error::Signed => write!(
+                f,
+                "this PDF is digitally signed, and any change would break the signature; the file was not changed"
             ),
             Error::AttachmentsUnread { attachments } => write!(
                 f,
@@ -1835,6 +1842,9 @@ mod tests {
             let msg_opt_ptr = ffi::squint_error_message(ffi::SQUINT_ERR_NO_SMALLER);
             let msg_opt = CStr::from_ptr(msg_opt_ptr).to_str().unwrap();
             assert_eq!(msg_opt, "already optimal; a smaller file is not possible");
+
+            let msg_signed = CStr::from_ptr(ffi::squint_error_message(ffi::SQUINT_ERR_SIGNED)).to_str().unwrap();
+            assert_eq!(msg_signed, Error::Signed.to_string());
         }
 
         let bad_input = b"not an image";
