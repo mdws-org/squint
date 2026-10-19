@@ -111,6 +111,64 @@ const PIXEL_RANGES: [(u16, u16); 3] = [
 /// The colour profile, which is data this must protect rather than remove.
 const ICC: u16 = 0x8773;
 
+/// Compression values whose strips or tiles are JPEG streams: old-style JPEG,
+/// JPEG, and the lossy JPEG a DNG may use.
+const JPEG_COMPRESSION: [u64; 3] = [6, 7, 34892];
+
+/// The tables a JPEG-compressed page's strips share, written as a JPEG
+/// stream of their own.
+const JPEG_TABLES: u16 = 0x015B;
+
+/// Whether the JPEG stream at `start..end` carries EXIF, XMP or IPTC in its
+/// own segments. Those are pixels to this format, so they cannot be removed,
+/// and a preview carrying them would leave them in a file reported clean.
+/// Only the segments before the first scan are read; a stream that cannot be
+/// read that far is not claimed to carry anything.
+fn jpeg_carries_metadata(bytes: &[u8], start: usize, end: usize) -> bool {
+    let end = end.min(bytes.len());
+    if start.saturating_add(2) > end || bytes[start..start + 2] != [0xFF, 0xD8] {
+        return false;
+    }
+    let mut at = start + 2;
+    while at + 4 <= end {
+        if bytes[at] != 0xFF {
+            return false;
+        }
+        let marker = bytes[at + 1];
+        match marker {
+            0xFF => {
+                at += 1; // a fill byte before the marker
+                continue;
+            }
+            0x01 | 0xD0..=0xD7 => {
+                at += 2;
+                continue;
+            }
+            0xD9 | 0xDA => return false,
+            _ => {}
+        }
+        let length = u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]) as usize;
+        if length < 2 || at + 2 + length > end {
+            return false;
+        }
+        let payload = &bytes[at + 4..at + 2 + length];
+        let carries = match marker {
+            0xE1 => {
+                payload.starts_with(b"Exif\0")
+                    || payload.starts_with(b"http://ns.adobe.com/xap/1.0/\0")
+                    || payload.starts_with(b"http://ns.adobe.com/xmp/extension/\0")
+            }
+            0xED => payload.starts_with(b"Photoshop 3.0\0"),
+            _ => false,
+        };
+        if carries {
+            return true;
+        }
+        at += 2 + length;
+    }
+    false
+}
+
 /// Whether these bytes are a TIFF this can read.
 ///
 /// BigTIFF announces itself with 43 rather than 42 and lays its directories out
@@ -224,6 +282,36 @@ fn overlaps(ranges: &[(usize, usize)], start: usize, end: usize) -> bool {
     i < ranges.len() && ranges[i].0 < end
 }
 
+/// Where a removed entry's data lies, as the declared range to wipe; `Some(None)`
+/// when the value sits in the entry itself.
+///
+/// `None` when the value cannot be wiped, so the file is refused rather than
+/// reported clean with the value still in it: its declared length runs past
+/// the end of the file, or part of it lies in the pixels, the colour profile
+/// or data a kept entry points at, none of which may change.
+///
+/// Text ends at its first terminator. Writers' counts often claim bytes past
+/// it, and on real files those run into the pixels; they are not the value,
+/// so they are left alone and the rest is wiped. Any other value is its whole
+/// declared length.
+fn removable(reader: &Reader, keep: &[(usize, usize)], entry: usize, kind: u16, count: u32) -> Option<Option<(usize, usize)>> {
+    let size = type_size(kind).checked_mul(count as usize)?;
+    if size <= 4 {
+        return Some(None);
+    }
+    let at = reader.u32(entry + 8)? as usize;
+    let end = at.checked_add(size)?;
+    let data = reader.bytes.get(at..end)?;
+    let value_end = match kind {
+        2 => data.iter().position(|&b| b == 0).map_or(end, |n| at + n),
+        _ => end,
+    };
+    if value_end > at && overlaps(keep, at, value_end) {
+        return None;
+    }
+    Some(Some((at, end)))
+}
+
 /// Every region the picture occupies, gathered before anything is written.
 ///
 /// A tag's declared size cannot be trusted to stay inside the metadata. On a
@@ -232,7 +320,9 @@ fn overlaps(ranges: &[(usize, usize)], start: usize, end: usize) -> bool {
 /// the strength of the declaration alone destroyed the picture.
 ///
 /// `None` when the directories run past `MAX_DIRECTORIES`: a page left out of
-/// this walk has no protection, so stripping it could zero its pixels.
+/// this walk has no protection, so stripping it could zero its pixels. Also
+/// `None` when a JPEG among the pixels carries EXIF, XMP or IPTC, which would
+/// stay in a file reported clean.
 fn protected(reader: &Reader, first: usize) -> Option<Vec<(usize, usize)>> {
     let mut out = Vec::new();
     // Each directory with whether it is a page. A page's kept entries point
@@ -263,16 +353,30 @@ fn protected(reader: &Reader, first: usize) -> Option<Vec<(usize, usize)>> {
         seen.insert(at, is_page);
         let entries = reader.entries(at);
         extents.push((at, at + 2 + entries.len() * 12 + 4));
+        let find = |want: u16| entries.iter().find(|(_, tag, _, _)| *tag == want).copied();
+        let compression = find(0x0103).and_then(|(e, _, k, n)| reader.numbers(e, k, n).first().copied());
 
         for (offsets_tag, lengths_tag) in PIXEL_RANGES {
-            let find = |want: u16| entries.iter().find(|(_, tag, _, _)| *tag == want).copied();
             if let (Some((oe, _, ok, on)), Some((le, _, lk, ln))) =
                 (find(offsets_tag), find(lengths_tag))
             {
                 let offsets = reader.numbers(oe, ok, on);
                 let lengths = reader.numbers(le, lk, ln);
+                // An embedded JPEG, or strips and tiles that are each one.
+                let jpeg = offsets_tag == 0x0201 || compression.is_some_and(|c| JPEG_COMPRESSION.contains(&c));
                 for (o, l) in offsets.iter().zip(lengths.iter()) {
-                    out.push((*o as usize, (*o + *l) as usize));
+                    let (start, end) = (*o as usize, (*o + *l) as usize);
+                    if jpeg && jpeg_carries_metadata(reader.bytes, start, end) {
+                        return None;
+                    }
+                    out.push((start, end));
+                }
+            }
+        }
+        if let Some((e, _, k, n)) = find(JPEG_TABLES) {
+            if let Some((start, size)) = reader.data_at(e, k, n) {
+                if jpeg_carries_metadata(reader.bytes, start, start + size) {
+                    return None;
                 }
             }
         }
@@ -398,18 +502,24 @@ pub fn strip_tiff(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
             // does not merely hide the value from a parser.
             if SUB_IFDS.contains(tag) {
                 if let Some(sub) = reader.u32(entry + 8).map(|v| v as usize) {
-                    for (sub_entry, _, sub_kind, sub_count) in reader.entries(sub) {
-                        if let Some((at, size)) = reader.data_at(sub_entry, sub_kind, sub_count) {
-                            destroyed.wipe_outside(&mut out, &keep_clear, at, at + size);
+                    let sub_entries = reader.entries(sub);
+                    let end = sub + 2 + sub_entries.len() * 12 + 4;
+                    // The directory holds short values in its own entries, so
+                    // one lying in kept data would keep them.
+                    if overlaps(&keep_clear, sub, end) {
+                        return None;
+                    }
+                    for (sub_entry, _, sub_kind, sub_count) in sub_entries {
+                        if let Some((at, end)) = removable(&reader, &keep_clear, sub_entry, sub_kind, sub_count)? {
+                            destroyed.wipe_outside(&mut out, &keep_clear, at, end);
                         }
                     }
-                    let end = sub + 2 + reader.entries(sub).len() * 12 + 4;
                     if end <= out.len() {
                         destroyed.wipe_outside(&mut out, &keep_clear, sub, end);
                     }
                 }
-            } else if let Some((at, size)) = reader.data_at(*entry, *kind, *count) {
-                destroyed.wipe_outside(&mut out, &keep_clear, at, at + size);
+            } else if let Some((at, end)) = removable(&reader, &keep_clear, *entry, *kind, *count)? {
+                destroyed.wipe_outside(&mut out, &keep_clear, at, end);
             }
         }
 
@@ -1137,6 +1247,197 @@ mod tests {
         assert!(!contains(&out, b"Acme"), "the maker survived");
         assert_eq!(&out[offsets_at..offsets_at + 8], &offsets[..], "the strip offsets were zeroed");
         assert_eq!(&out[first..second + 16], &tiff[first..second + 16], "the pixels were touched");
+    }
+
+    /// A removed tag whose value lies inside a kept entry's data cannot be
+    /// wiped without changing the kept data. A colour map laid over the
+    /// maker's name kept the name while the entry was dropped and the file
+    /// was reported clean.
+    #[test]
+    fn a_removed_value_inside_a_kept_entrys_data_is_refused() {
+        const MAP: &[u8] = b"\x01\x02Acme Camera Co\0\x03\x04\x05\x06\x07\x08\x09";
+        let map_at = 8;
+        let pixels_at = map_at + MAP.len();
+        let tiff = tiff_from(
+            &[MAP, &[0xAA; 16]],
+            &[
+                (0x010F, 2, 15, map_at as u32 + 2), // Make, inside the colour map
+                (0x0111, 4, 1, pixels_at as u32),
+                (0x0117, 4, 1, 16),
+                (0x0140, 3, (MAP.len() / 2) as u32, map_at as u32), // ColorMap
+            ],
+        );
+        assert!(strip_tiff(&tiff).is_none(), "the maker's name stayed inside the colour map");
+    }
+
+    /// The same inside the pixels, which are never changed.
+    #[test]
+    fn a_removed_value_inside_the_pixels_is_refused() {
+        let mut pixels = [0xAA; 32];
+        pixels[4..19].copy_from_slice(b"Acme Camera Co\0");
+        let tiff = tiff_from(&[&pixels], &[(0x010F, 2, 15, 12), (0x0111, 4, 1, 8), (0x0117, 4, 1, 32)]);
+        assert!(strip_tiff(&tiff).is_none(), "the maker's name stayed inside the pixels");
+    }
+
+    /// And inside the colour profile, which is never removed.
+    #[test]
+    fn a_removed_value_inside_the_colour_profile_is_refused() {
+        let mut profile = [0xCC; 40];
+        profile[8..23].copy_from_slice(b"Acme Camera Co\0");
+        let pixels_at = 8 + profile.len();
+        let tiff = tiff_from(
+            &[&profile, &[0xAA; 16]],
+            &[
+                (0x010F, 2, 15, 16),
+                (0x0111, 4, 1, pixels_at as u32),
+                (0x0117, 4, 1, 16),
+                (0x8773, 7, profile.len() as u32, 8),
+            ],
+        );
+        assert!(strip_tiff(&tiff).is_none(), "the maker's name stayed inside the profile");
+    }
+
+    /// An Exif directory goes whole, and each of its values is wiped; one
+    /// lying inside kept data would stay, so the file is refused.
+    #[test]
+    fn an_exif_value_inside_kept_data_is_refused() {
+        let mut pixels = [0xAA; 32];
+        pixels[4..24].copy_from_slice(b"2026:10:19 09:41:00\0");
+        let exif_at = 8 + pixels.len();
+        let exif = directory(&[(0x9003, 2, 20, 12)]); // DateTimeOriginal, inside the pixels
+        let tiff = tiff_from(
+            &[&pixels, &exif],
+            &[(0x0111, 4, 1, 8), (0x0117, 4, 1, 32), (0x8769, 4, 1, exif_at as u32)],
+        );
+        assert!(strip_tiff(&tiff).is_none(), "the date stayed inside the pixels");
+    }
+
+    /// Text ends at its terminator, and the bytes a writer's count claims past
+    /// it are not the value: those are the overruns above, which strip. A
+    /// value with no other end is its whole declared length, so a binary
+    /// value reaching into the pixels would leave its tail there.
+    #[test]
+    fn a_binary_value_reaching_into_the_pixels_is_refused() {
+        const XMP: &[u8] = b"<x:xmpmeta>51.5074 N</x:xmpmeta>";
+        let pixels_at = 8 + XMP.len();
+        let tiff = tiff_from(
+            &[XMP, &[0xAA; 32]],
+            &[(0x02BC, 1, XMP.len() as u32 + 8, 8), (0x0111, 4, 1, pixels_at as u32), (0x0117, 4, 1, 32)],
+        );
+        assert!(strip_tiff(&tiff).is_none(), "the XMP's tail stayed in the pixels");
+    }
+
+    /// Text with no terminator inside its declared length has no end but that
+    /// length, so it is treated like a binary value.
+    #[test]
+    fn unterminated_text_reaching_into_the_pixels_is_refused() {
+        const MAKE: &[u8] = b"Acme Camera Co";
+        let pixels_at = 8 + MAKE.len();
+        let mut pixels = [0xAA; 32];
+        pixels[..4].copy_from_slice(b"rp.\0");
+        let tiff = tiff_from(
+            &[MAKE, &pixels],
+            &[(0x010F, 2, MAKE.len() as u32 + 3, 8), (0x0111, 4, 1, pixels_at as u32), (0x0117, 4, 1, 32)],
+        );
+        assert!(strip_tiff(&tiff).is_none(), "the end of the maker's name stayed in the pixels");
+    }
+
+    /// An Exif directory holds short values in its own entries, so a
+    /// directory lying inside kept data would keep them.
+    #[test]
+    fn an_exif_directory_inside_kept_data_is_refused() {
+        let mut pixels = vec![0xAA; 48];
+        let exif = directory(&[(0x9003, 2, 4, u32::from_le_bytes(*b"2026"))]);
+        pixels[4..4 + exif.len()].copy_from_slice(&exif);
+        let tiff = tiff_from(&[&pixels], &[(0x0111, 4, 1, 8), (0x0117, 4, 1, 48), (0x8769, 4, 1, 12)]);
+        assert!(strip_tiff(&tiff).is_none(), "the Exif directory inside the pixels was kept");
+    }
+
+    /// A value whose declared length runs past the end of the file was not
+    /// wiped at all: the entry was dropped and the maker's name stayed.
+    #[test]
+    fn a_removed_value_running_past_the_end_is_refused() {
+        let mut tiff = tiff_from(&[&[0xAA; 16]], &[(0x0111, 4, 1, 8), (0x0117, 4, 1, 16), (0x010F, 2, 64, 0)]);
+        let make_at = tiff.len() as u32;
+        tiff.extend_from_slice(b"Acme Camera Co\0");
+        let entry = 24 + 2 + 2 * 12; // the third entry of the directory after the pixels
+        tiff[entry + 8..entry + 12].copy_from_slice(&make_at.to_le_bytes());
+        assert!(strip_tiff(&tiff).is_none(), "the maker's name past the declared end stayed");
+    }
+
+    /// A JPEG from its segments: SOI, each `(marker, payload)`, then a scan
+    /// and EOI.
+    fn jpeg(segments: &[(u8, &[u8])]) -> Vec<u8> {
+        let mut out = vec![0xFF, 0xD8];
+        for (marker, payload) in segments {
+            out.extend_from_slice(&[0xFF, *marker]);
+            out.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+            out.extend_from_slice(payload);
+        }
+        out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x11, 0x22, 0x33, 0xFF, 0xD9]);
+        out
+    }
+
+    /// A one-page TIFF whose only picture is `preview`, an embedded JPEG.
+    fn tiff_with_preview(preview: &[u8]) -> Vec<u8> {
+        tiff_from(&[preview], &[(0x0201, 4, 1, 8), (0x0202, 4, 1, preview.len() as u32)])
+    }
+
+    /// An embedded preview is a JPEG in its own right and can carry its own
+    /// EXIF, which Strip cannot remove without changing the preview's bytes.
+    /// The file is refused rather than reported clean with it inside.
+    #[test]
+    fn a_preview_carrying_exif_is_refused() {
+        let preview = jpeg(&[(0xE1, b"Exif\0\0MM\0\x2A GPS 51.5074 N")]);
+        assert!(strip_tiff(&tiff_with_preview(&preview)).is_none());
+    }
+
+    #[test]
+    fn a_preview_carrying_xmp_is_refused() {
+        let preview = jpeg(&[(0xE1, b"http://ns.adobe.com/xap/1.0/\0<x:xmpmeta/>")]);
+        assert!(strip_tiff(&tiff_with_preview(&preview)).is_none());
+    }
+
+    #[test]
+    fn a_preview_carrying_iptc_is_refused() {
+        let preview = jpeg(&[(0xED, b"Photoshop 3.0\08BIM\x04\x04 By-line")]);
+        assert!(strip_tiff(&tiff_with_preview(&preview)).is_none());
+    }
+
+    /// The same EXIF in a page whose strips are JPEG-compressed.
+    #[test]
+    fn jpeg_compressed_strips_carrying_exif_are_refused() {
+        let strip = jpeg(&[(0xE1, b"Exif\0\0II\x2A\0 Acme Camera Co")]);
+        let tiff = tiff_from(&[&strip], &[(0x0103, 3, 1, 7), (0x0111, 4, 1, 8), (0x0117, 4, 1, strip.len() as u32)]);
+        assert!(strip_tiff(&tiff).is_none());
+    }
+
+    /// And in the tables a JPEG-compressed page shares between its strips.
+    #[test]
+    fn jpeg_tables_carrying_exif_are_refused() {
+        let tables = jpeg(&[(0xE1, b"Exif\0\0II\x2A\0 Acme Camera Co")]);
+        let pixels_at = 8 + tables.len();
+        let tiff = tiff_from(
+            &[&tables, &[0xAA; 16]],
+            &[
+                (0x0103, 3, 1, 7),
+                (0x0111, 4, 1, pixels_at as u32),
+                (0x0117, 4, 1, 16),
+                (0x015B, 7, tables.len() as u32, 8),
+            ],
+        );
+        assert!(strip_tiff(&tiff).is_none());
+    }
+
+    /// A preview with only the segments a decoder needs, JFIF and a colour
+    /// profile, carries nothing to remove, and neither does one whose
+    /// segments cannot be read.
+    #[test]
+    fn previews_with_nothing_to_remove_still_strip() {
+        let plain = jpeg(&[(0xE0, b"JFIF\0\x01\x02\0\0\x01\0\x01\0\0"), (0xE2, b"ICC_PROFILE\0\x01\x01 profile")]);
+        assert!(strip_tiff(&tiff_with_preview(&plain)).is_some());
+        let broken = [0xFF, 0xD8, 0xFF, 0xE1, 0xFF, 0xFF, 0x00];
+        assert!(strip_tiff(&tiff_with_preview(&broken)).is_some());
     }
 
     /// A chain longer than the walk will follow is refused, not half stripped.
