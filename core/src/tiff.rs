@@ -35,8 +35,10 @@ fn type_size(kind: u16) -> usize {
 /// A GeoTIFF's georeferencing goes too. Its tie points, pixel scale or
 /// transformation put the picture at coordinates on the Earth, and its keys
 /// name the projection and often the site, so a survey or a property map
-/// stripped of the rest would still say where it was made.
-const REMOVE: [u16; 38] = [
+/// stripped of the rest would still say where it was made. So do the other
+/// carriers of the same facts: RPC coefficients, whose offsets are the scene
+/// centre in degrees, the older Intergraph matrix, and GDAL's metadata XML.
+const REMOVE: [u16; 42] = [
     0x010D, // DocumentName
     0x010E, // ImageDescription
     0x010F, // Make
@@ -75,6 +77,10 @@ const REMOVE: [u16; 38] = [
     0x87AF, // GeoKeyDirectory (GeoTIFF)
     0x87B0, // GeoDoubleParams (GeoTIFF)
     0x87B1, // GeoAsciiParams (GeoTIFF)
+    0x8480, // IntergraphMatrix, the older form of ModelTransformation
+    0xA480, // GDAL_METADATA, which can name the projection and the site
+    0xC69C, // RPCCoefficient, a geolocation model whose offsets are the scene centre
+    0xC71B, // PreviewDateTime (DNG)
 ];
 
 /// Directories walked, pages and their Exif, GPS and interoperability
@@ -598,6 +604,29 @@ mod tests {
         let first = reader.u32(4).unwrap() as usize;
         let tags: Vec<u16> = reader.entries(first).iter().map(|e| e.1).collect();
         assert_eq!(tags, vec![0x0111, 0x0117], "a georeferencing entry stayed in the directory");
+    }
+
+    /// Georeferencing also travels outside the six GeoTIFF tags: a satellite
+    /// or drone scene can be placed only by its RPC coefficients, whose offsets
+    /// are the scene centre in degrees; old Intergraph files carry the same
+    /// matrix as ModelTransformation; and GDAL writes the projection into its
+    /// metadata XML. A DNG dates its preview separately from the photograph.
+    #[test]
+    fn other_georeferencing_and_the_preview_date_are_removed() {
+        let doubles = |v: &[f64]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let page = vec![
+            (0x8480, 7, doubles(&[0.5, 0.0, 0.0, -111.123456])),            // IntergraphMatrix
+            (0xA480, 2, b"<GDALMetadata><Item name=\"SRS\">UTM zone 12N, site Heber</Item></GDALMetadata>\0".to_vec()),
+            (0xC69C, 7, doubles(&[1.0, 2.0, 34.432109, -110.598765])),       // RPCCoefficient
+            (0xC71B, 2, b"2026:10:18 21:04:00\0".to_vec()),                  // PreviewDateTime (DNG)
+        ];
+        let (tiff, pixels) = tiff_pages(&[page]);
+        let (out, _) = strip_tiff(&tiff).expect("a well formed tiff");
+        for leak in [&(-111.123456f64).to_le_bytes()[..], b"site Heber", &34.432109f64.to_le_bytes()[..],
+                     b"2026:10:18 21:04"] {
+            assert!(!contains(&out, leak), "survived: {leak:?}");
+        }
+        assert_eq!(&out[pixels[0].clone()], &tiff[pixels[0].clone()], "the pixels moved");
     }
 
     /// A scanned document has dozens of pages. The walk stopped after eight
