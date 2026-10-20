@@ -437,7 +437,8 @@ pub fn is_camera_raw(bytes: &[u8]) -> bool {
     // directory describes: Phase One's own block, in its IIQ files and older
     // TIFFs, and the marker of Canon's EOS-1D and 1Ds TIFFs. Whole signatures,
     // since these bytes are the first pixels of many an ordinary TIFF.
-    if matches!(bytes.get(8..12), Some([b'C', b'R', 2, 0] | [0xBA, 0xB0, 0xAC, 0xBB])) || bytes.get(8..16) == Some(b"IIIICwaR") {
+    let phase_one = matches!(bytes.get(8..16), Some([b'I', b'I', b'I', b'I', _, b'w', b'a', b'R'] | [b'M', b'M', b'M', b'M', b'R', b'a', b'w', _]));
+    if phase_one || matches!(bytes.get(8..12), Some([b'C', b'R', 2, 0] | [0xBA, 0xB0, 0xAC, 0xBB])) {
         return true;
     }
     let mut queue = vec![first];
@@ -449,9 +450,10 @@ pub fn is_camera_raw(bytes: &[u8]) -> bool {
         }
         let entries = reader.entries(at);
         // A page that counts its pixel bytes and says nowhere where they lie,
-        // as Sony's SRF does, is read through its maker note alone.
+        // as Sony's SRF does, is read through its maker note alone. An old
+        // style JPEG page can locate its stream with JPEGInterchangeFormat.
         let has = |wanted: u16| entries.iter().any(|&(_, tag, _, _)| tag == wanted);
-        if has(0x0117) && !has(0x0111) && !has(0x0144) {
+        if has(0x0117) && !has(0x0111) && !has(0x0144) && !has(0x0201) {
             return true;
         }
         for &(entry, tag, kind, count) in &entries {
@@ -1452,7 +1454,8 @@ mod tests {
         assert!(!is_camera_raw(&page(32803, &[DNG_VERSION])), "a DNG read as another raw");
         assert!(is_camera_raw(&page(2, &[(0x828E, 1, 4, 0x0201_0100)])), "a CFA pattern was missed");
         assert!(!is_camera_raw(&page(2, &[(0x828E, 1, 4, 0x0201_0100), DNG_VERSION])), "a DNG read as another raw");
-        let markers: [&[u8; 8]; 3] = [b"CR\x02\x00\0\0\0\0", b"IIIICwaR", b"\xBA\xB0\xAC\xBB\0\0\0\0"];
+        let markers: [&[u8; 8]; 5] =
+            [b"CR\x02\x00\0\0\0\0", b"IIIICwaR", b"IIII\x01waR", b"MMMMRaw\0", b"\xBA\xB0\xAC\xBB\0\0\0\0"];
         for marker in markers {
             let mut raw = tiff_from(&[marker, &[0xAA; 16]], &[(0x0111, 4, 1, 16), (0x0117, 4, 1, 16)]);
             assert!(is_camera_raw(&raw), "the marker {marker:?} was missed");
@@ -1480,6 +1483,8 @@ mod tests {
         assert!(is_camera_raw(&unlocated), "pixels no tag locates were missed");
         let tiled = tiff_from(&[&[0xAA; 16]], &[(0x0106, 3, 1, 2), (0x0117, 4, 1, 16), (0x0144, 4, 1, 8)]);
         assert!(!is_camera_raw(&tiled), "tile offsets were not taken as locating the pixels");
+        let old_jpeg = tiff_from(&[&[0xAA; 16]], &[(0x0103, 3, 1, 6), (0x0106, 3, 1, 2), (0x0117, 4, 1, 16), (0x0201, 4, 1, 8)]);
+        assert!(!is_camera_raw(&old_jpeg), "an old style JPEG page was taken for pixels nothing locates");
         // A colour filter array among the sub-images.
         let mut tiff = b"II\x2A\x00\0\0\0\0".to_vec();
         tiff.extend_from_slice(&[0xAA; 16]);
