@@ -45,8 +45,8 @@ pub const SQUINT_ERR_SIGNED: c_int = 15;
 /// Strip found nothing else to remove, but the PDF carries attached files,
 /// which no mode reads. 15 is SQUINT_ERR_SIGNED.
 pub const SQUINT_ERR_ATTACHMENTS: c_int = 16;
-/// A JPEG among a TIFF's pixels, usually its embedded preview, carries
-/// metadata Strip cannot remove yet.
+/// A gain map among a TIFF's pixels, usually in its embedded preview, holds
+/// XMP with its rendering parameters and more.
 pub const SQUINT_ERR_PREVIEW: c_int = 17;
 
 /// The result of one optimization.
@@ -430,7 +430,7 @@ pub extern "C" fn squint_error_message(code: c_int) -> *const c_char {
         SQUINT_ERR_STRIP_GREW => b"metadata was found, but removing it would make the file larger; the original was kept with its metadata\0",
         SQUINT_ERR_SIGNED => b"this PDF is digitally signed, and any change would break the signature; the file was not changed\0",
         SQUINT_ERR_ATTACHMENTS => b"nothing else to remove, but this PDF carries attached files, which Strip does not read; the file was not changed\0",
-        SQUINT_ERR_PREVIEW => b"this file's embedded preview carries location or camera data that Strip cannot remove yet; the file was not changed\0",
+        SQUINT_ERR_PREVIEW => b"this file's embedded preview has a gain map whose XMP holds more than its rendering parameters; the file was not changed\0",
         _ => b"unknown error\0",
     };
     s.as_ptr() as *const c_char
