@@ -38,7 +38,7 @@ fn type_size(kind: u16) -> usize {
 /// stripped of the rest would still say where it was made. So do the other
 /// carriers of the same facts: RPC coefficients, whose offsets are the scene
 /// centre in degrees, the older Intergraph matrix, and GDAL's metadata XML.
-const REMOVE: [u16; 43] = [
+const REMOVE: [u16; 45] = [
     0x010D, // DocumentName
     0x010E, // ImageDescription
     0x010F, // Make
@@ -52,6 +52,7 @@ const REMOVE: [u16; 43] = [
     0x83BB, // IPTC
     0x8649, // Photoshop image resources, which carry IPTC
     0x9003, // DateTimeOriginal, when a writer puts it here
+    0x9004, // CreateDate, likewise
     0x9286, // UserComment, likewise
     0x927C, // MakerNote, likewise
     0x9C9B, // XPTitle
@@ -82,6 +83,7 @@ const REMOVE: [u16; 43] = [
     0xC69C, // RPCCoefficient, a geolocation model whose offsets are the scene centre
     0xC71B, // PreviewDateTime (DNG)
     0xC763, // TimeCodes (DNG), the time of day each frame was recorded
+    0x827D, // Model2, which Kodak's DCS cameras fill with a body number
 ];
 
 /// Directories walked, pages and their Exif, GPS and interoperability
@@ -91,10 +93,11 @@ const REMOVE: [u16; 43] = [
 const MAX_DIRECTORIES: usize = 4096;
 
 /// Tags whose value is the offset of another directory.
-const SUB_IFDS: [u16; 3] = [
+const SUB_IFDS: [u16; 4] = [
     0x8769, // Exif
     0x8825, // GPS
     0xA005, // Interoperability
+    0x8290, // Kodak's own directory: capture time, a GPS string, the original file name
 ];
 
 /// SubIFDs, the offsets of further image directories: a DNG's raw image and
@@ -414,6 +417,60 @@ enum Scan {
     Broken,
 }
 
+/// Whether these bytes are a camera raw other than a DNG: no DNGVersion in the
+/// first directory, and either a maker's marker after the header or a page
+/// (along the chain or among its sub-images) of colour filter array or linear
+/// raw samples, with Kodak's Model2 tag, or with pixels no tag locates. Used
+/// where the system cannot check that a stripped raw still opens.
+pub fn is_camera_raw(bytes: &[u8]) -> bool {
+    if !is_tiff(bytes) {
+        return false;
+    }
+    let reader = Reader { bytes, big_endian: bytes[0] == b'M' };
+    let Some(first) = reader.u32(4).map(|v| v as usize) else {
+        return false;
+    };
+    if reader.entries(first).iter().any(|&(_, tag, _, _)| tag == 0xC612) {
+        return false;
+    }
+    // Canon's CR2 marker with its version, and two whose sensor data no
+    // directory describes: Phase One's own block, in its IIQ files and older
+    // TIFFs, and the marker of Canon's EOS-1D and 1Ds TIFFs. Whole signatures,
+    // since these bytes are the first pixels of many an ordinary TIFF.
+    if matches!(bytes.get(8..12), Some([b'C', b'R', 2, 0] | [0xBA, 0xB0, 0xAC, 0xBB])) || bytes.get(8..16) == Some(b"IIIICwaR") {
+        return true;
+    }
+    let mut queue = vec![first];
+    let mut seen = std::collections::HashSet::new();
+    let mut budget = MAX_DIRECTORIES;
+    while let Some(at) = queue.pop() {
+        if at == 0 || seen.len() >= MAX_DIRECTORIES || !seen.insert(at) {
+            continue;
+        }
+        let entries = reader.entries(at);
+        // A page that counts its pixel bytes and says nowhere where they lie,
+        // as Sony's SRF does, is read through its maker note alone.
+        let has = |wanted: u16| entries.iter().any(|&(_, tag, _, _)| tag == wanted);
+        if has(0x0117) && !has(0x0111) && !has(0x0144) {
+            return true;
+        }
+        for &(entry, tag, kind, count) in &entries {
+            match tag {
+                0x0106 if reader.first_number(entry, kind, count).is_some_and(|p| p == 32803 || p == 34892) => return true,
+                0x828D | 0x828E => return true, // CFARepeatPatternDim, CFAPattern
+                // Kodak's DCS cameras keep their mosaic as a grey page.
+                0x827D => return true,
+                SUBIFDS => queue.extend(sub_ifds(&reader, entry, kind, count, &mut budget).unwrap_or_default()),
+                _ => {}
+            }
+        }
+        if let Some(next) = reader.u32(at + 2 + entries.len() * 12) {
+            queue.push(next as usize);
+        }
+    }
+    false
+}
+
 /// Whether these bytes are a TIFF this can read.
 ///
 /// BigTIFF announces itself with 43 rather than 42 and lays its directories out
@@ -470,6 +527,20 @@ impl<'a> Reader<'a> {
         }
         let at = self.u32(entry + 8)? as usize;
         (at.checked_add(size)? <= self.bytes.len()).then_some((at, size))
+    }
+
+    /// The first number an entry holds, read alone: a count of a million
+    /// costs one read, not a million.
+    fn first_number(&self, entry: usize, kind: u16, count: u32) -> Option<u64> {
+        if count == 0 {
+            return None;
+        }
+        let at = self.data_at(entry, kind, count).map_or(entry + 8, |(at, _)| at);
+        match type_size(kind) {
+            2 => self.u16(at).map(u64::from),
+            4 => self.u32(at).map(u64::from),
+            _ => None,
+        }
     }
 
     /// The numbers an entry holds, whether inline or elsewhere.
@@ -979,6 +1050,18 @@ fn strip_pages(reader: &Reader, first: usize, keep: &Kept) -> Option<(Vec<u8>, u
         }
     }
 
+    // Samsung appends a trailer after the TIFF itself, which no directory
+    // names: the capture time to the millisecond, the mobile country code and
+    // more. It goes whole. One that cannot be read, or that lies over
+    // anything kept or a directory, leaves the file refused.
+    if let Some(trailer) = samsung_trailer(bytes) {
+        let (start, end) = trailer?;
+        if overlaps(keep_clear, start, end) || rewrites.iter().any(|(d, _, _, e)| *d < end && start < *e) {
+            return None;
+        }
+        destroyed.wipe(&mut out, start, end);
+    }
+
     // Clean the metadata segments of the JPEGs among the pixels where they
     // lie. Nothing else inside the pixels is ever written.
     for (&at, new) in &keep.edits {
@@ -1004,8 +1087,43 @@ fn strip_pages(reader: &Reader, first: usize, keep: &Kept) -> Option<(Vec<u8>, u
     Some((out, destroyed.bytes))
 }
 
-/// Wipe a removed Exif, GPS or interoperability directory, its values, and
-/// every such directory it names in turn: a GPS directory can hang off the
+/// Where Samsung's trailer lies: blocks of named values, then a directory
+/// starting `SEFH` that gives each block's distance back from it and its
+/// length, then the directory's length and `SEFT`, which end the file. `None`
+/// when the file does not end that way; `Some(None)` when it does and the
+/// directory cannot be read.
+fn samsung_trailer(bytes: &[u8]) -> Option<Option<(usize, usize)>> {
+    let len = bytes.len();
+    if len < 8 || &bytes[len - 4..] != b"SEFT" {
+        return None;
+    }
+    let le = |at: usize| bytes.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
+    let read = || -> Option<(usize, usize)> {
+        let dir_len = le(len - 8)?;
+        let dir = (len - 8).checked_sub(dir_len)?;
+        if bytes.get(dir..dir + 4)? != b"SEFH" {
+            return None;
+        }
+        let count = le(dir + 8)?;
+        if count.checked_mul(12)?.checked_add(12)? > dir_len {
+            return None;
+        }
+        let mut start = dir;
+        for i in 0..count {
+            let entry = dir + 12 + i * 12;
+            let block = dir.checked_sub(le(entry + 4)?)?;
+            if block.checked_add(le(entry + 8)?)? > dir {
+                return None;
+            }
+            start = start.min(block);
+        }
+        (start >= 8).then_some((start, len))
+    };
+    Some(read())
+}
+
+/// Wipe a removed Exif, GPS, interoperability or Kodak directory, its values,
+/// and every such directory it names in turn: a GPS directory can hang off the
 /// Exif one rather than the page. `None` when one cannot be wiped: it starts
 /// inside the header, is cut off by the end of the file, lies in kept data,
 /// or holds a value `removable` refuses. A pointer of zero names nothing, and
@@ -1218,6 +1336,181 @@ mod tests {
         let count = u16::from_le_bytes([out[dir], out[dir + 1]]) as usize;
         assert!((0..count).all(|e| out[dir + 2 + e * 12..dir + 4 + e * 12] != 0xC763u16.to_le_bytes()), "the TimeCodes entry stayed");
         assert_eq!(&out[pixels[0].clone()], &tiff[pixels[0].clone()]);
+    }
+
+    /// Kodak's DCR and DCS TIFF files keep a directory of their own, pointed
+    /// at from the first page, holding the capture time, a GPS string and the
+    /// original file name. It goes whole, like the Exif directory.
+    #[test]
+    fn kodaks_own_directory_is_removed() {
+        let mut tiff = b"II\x2A\x00\0\0\0\0".to_vec();
+        tiff.extend_from_slice(&[0xAA; 16]); // the pixels, at 8
+        let kodak = tiff.len();
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        for field in [&0x03E8u16.to_le_bytes()[..], &2u16.to_le_bytes(), &13u32.to_le_bytes(), &((kodak + 18) as u32).to_le_bytes(), &[0; 4]] {
+            tiff.extend_from_slice(field);
+        }
+        tiff.extend_from_slice(b"D4C50031.DCR\0");
+        let dir = tiff.len();
+        tiff[4..8].copy_from_slice(&(dir as u32).to_le_bytes());
+        tiff.extend_from_slice(&3u16.to_le_bytes());
+        for (tag, kind, count, value) in [(0x0111u16, 4u16, 1u32, 8u32), (0x0117, 4, 1, 16), (0x8290, 4, 1, kodak as u32)] {
+            for field in [&tag.to_le_bytes()[..], &kind.to_le_bytes(), &count.to_le_bytes(), &value.to_le_bytes()] {
+                tiff.extend_from_slice(field);
+            }
+        }
+        tiff.extend_from_slice(&[0; 4]);
+        let (out, _) = strip_tiff(&tiff).expect("a well formed tiff");
+        assert!(!contains(&out, b"D4C50031"), "the original file name stayed");
+        assert_eq!(&out[8..24], &tiff[8..24], "the pixels moved");
+        // The body number Kodak writes as Model2 goes too.
+        let body = b"460-2950\0";
+        let tiff = tiff_from(&[body, &[0xAA; 16]], &[(0x0111, 4, 1, 17), (0x0117, 4, 1, 16), (0x827D, 2, body.len() as u32, 8)]);
+        let (out, _) = strip_tiff(&tiff).expect("a well formed tiff");
+        assert!(!contains(&out, b"460-2950"), "Model2 stayed");
+        // Some 360 degree cameras write CreateDate into the page itself.
+        let date = b"2023:07:12 10:30:41\0";
+        let tiff = tiff_from(&[date, &[0xAA; 16]], &[(0x0111, 4, 1, 28), (0x0117, 4, 1, 16), (0x9004, 2, date.len() as u32, 8)]);
+        let (out, _) = strip_tiff(&tiff).expect("a well formed tiff");
+        assert!(!contains(&out, b"2023:07:12"), "CreateDate stayed");
+    }
+
+    /// Samsung's trailer, laid out as a Galaxy S21 Ultra writes it after its
+    /// DNG: blocks named Image_UTC_Data and MCC_Data, then the directory.
+    /// `first_at`, when not zero, is where the directory says the first block
+    /// starts.
+    fn with_samsung_trailer(mut tiff: Vec<u8>, first_at: usize) -> Vec<u8> {
+        let blocks: [(u16, &[u8], &[u8]); 2] = [(0x0a01, b"Image_UTC_Data", b"1689155441511"), (0x0aa1, b"MCC_Data", b"262")];
+        let mut offsets = Vec::new();
+        for (kind, name, value) in blocks {
+            offsets.push((kind, tiff.len(), 8 + name.len() + value.len()));
+            tiff.extend_from_slice(&[0, 0]);
+            tiff.extend_from_slice(&kind.to_le_bytes());
+            tiff.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            tiff.extend_from_slice(name);
+            tiff.extend_from_slice(value);
+        }
+        let dir = tiff.len();
+        tiff.extend_from_slice(b"SEFH");
+        tiff.extend_from_slice(&107u32.to_le_bytes());
+        tiff.extend_from_slice(&(offsets.len() as u32).to_le_bytes());
+        for (i, (kind, at, size)) in offsets.into_iter().enumerate() {
+            let distance = (dir - if i == 0 && first_at > 0 { first_at } else { at }) as u32;
+            tiff.extend_from_slice(&[0, 0]);
+            tiff.extend_from_slice(&kind.to_le_bytes());
+            tiff.extend_from_slice(&distance.to_le_bytes());
+            tiff.extend_from_slice(&(size as u32).to_le_bytes());
+        }
+        let dir_len = (tiff.len() - dir) as u32;
+        tiff.extend_from_slice(&dir_len.to_le_bytes());
+        tiff.extend_from_slice(b"SEFT");
+        tiff
+    }
+
+    /// Samsung's trailer after a DNG holds the capture time and the mobile
+    /// country code, and no directory names it. It is wiped whole; one that
+    /// cannot be read, or reaches back over the pixels, is refused.
+    #[test]
+    fn samsungs_trailer_is_wiped_and_a_bad_one_refused() {
+        const MAKE: &[u8] = b"Samsung\0";
+        let tiff = tiff_from(&[MAKE, &[0xAA; 16]], &[(0x010F, 2, MAKE.len() as u32, 8), (0x0111, 4, 1, 16), (0x0117, 4, 1, 16)]);
+        let end_of_tiff = tiff.len();
+        let with = with_samsung_trailer(tiff.clone(), 0);
+        let (out, _) = strip_tiff(&with).expect("a well formed trailer");
+        assert_eq!(out.len(), with.len(), "the file changed length");
+        assert!(out[end_of_tiff..].iter().all(|&b| b == 0), "the trailer stayed");
+        assert_eq!(&out[16..32], &with[16..32], "the pixels moved");
+        // Only the trailer: still something to remove.
+        let plain = tiff_from(&[&[0xAA; 16]], &[(0x0111, 4, 1, 8), (0x0117, 4, 1, 16)]);
+        let (out, wiped) = strip_tiff(&with_samsung_trailer(plain.clone(), 0)).expect("a well formed trailer");
+        assert!(wiped > 0 && out[plain.len()..].iter().all(|&b| b == 0));
+        // A block said to start inside the pixels.
+        let over_pixels = with_samsung_trailer(tiff.clone(), 20);
+        assert!(strip_tiff(&over_pixels).is_none(), "a trailer over the pixels was wiped");
+        // A directory length that does not reach a SEFH.
+        let mut broken = with.clone();
+        let at = broken.len() - 8;
+        broken[at..at + 4].copy_from_slice(&5u32.to_le_bytes());
+        assert!(strip_tiff(&broken).is_none(), "an unreadable trailer was left");
+    }
+
+    /// A camera raw other than a DNG is told apart by a page of colour filter
+    /// array samples, at the top or among the sub-images, or by Canon's CR2
+    /// marker; a DNG, and a TIFF of ordinary pixels, are not.
+    #[test]
+    fn camera_raws_other_than_dng_are_recognised() {
+        let page = |photometric: u32, extra: &[(u16, u16, u32, u32)]| {
+            let mut entries = vec![(0x0106u16, 3u16, 1u32, photometric), (0x0111, 4, 1, 8), (0x0117, 4, 1, 16)];
+            entries.extend_from_slice(extra);
+            entries.sort_by_key(|e| e.0);
+            tiff_from(&[&[0xAA; 16]], &entries)
+        };
+        const DNG_VERSION: (u16, u16, u32, u32) = (0xC612, 1, 4, 0x0000_0401);
+        assert!(!is_camera_raw(&page(2, &[])), "ordinary pixels read as a raw");
+        assert!(is_camera_raw(&page(32803, &[])), "a colour filter array page was missed");
+        assert!(is_camera_raw(&page(34892, &[])), "a linear raw page was missed");
+        assert!(!is_camera_raw(&page(32803, &[DNG_VERSION])), "a DNG read as another raw");
+        assert!(is_camera_raw(&page(2, &[(0x828E, 1, 4, 0x0201_0100)])), "a CFA pattern was missed");
+        assert!(!is_camera_raw(&page(2, &[(0x828E, 1, 4, 0x0201_0100), DNG_VERSION])), "a DNG read as another raw");
+        let markers: [&[u8; 8]; 3] = [b"CR\x02\x00\0\0\0\0", b"IIIICwaR", b"\xBA\xB0\xAC\xBB\0\0\0\0"];
+        for marker in markers {
+            let mut raw = tiff_from(&[marker, &[0xAA; 16]], &[(0x0111, 4, 1, 16), (0x0117, 4, 1, 16)]);
+            assert!(is_camera_raw(&raw), "the marker {marker:?} was missed");
+            for at in [8, 11] {
+                raw[at] ^= 1;
+                assert!(!is_camera_raw(&raw), "{:?} read as a raw marker", &raw[8..16]);
+                raw[at] ^= 1;
+            }
+        }
+        // Pixels that start like a marker, in an ordinary TIFF.
+        let pixels = tiff_from(&[b"CRCRIIIIMMMM", &[0xAA; 4]], &[(0x0106, 3, 1, 2), (0x0111, 4, 1, 8), (0x0117, 4, 1, 16)]);
+        assert!(!is_camera_raw(&pixels), "pixels starting CR read as a raw");
+        let pixels = tiff_from(&[b"IIIIIIII", &[0xAA; 8]], &[(0x0106, 3, 1, 2), (0x0111, 4, 1, 8), (0x0117, 4, 1, 16)]);
+        assert!(!is_camera_raw(&pixels), "pixels starting IIII read as Phase One's block");
+        // Many photometric entries, each counting a million values that lie
+        // in the file, cost one read each.
+        let mut entries = vec![(0x0106u16, 3u16, 1_000_000u32, 8u32); 2000];
+        entries.extend_from_slice(&[(0x0111, 4, 1, 8), (0x0117, 4, 1, 2_000_000)]);
+        let wide = tiff_from(&[&vec![0xAA; 2_000_000]], &entries);
+        let started = std::time::Instant::now();
+        assert!(!is_camera_raw(&wide));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(is_camera_raw(&page(1, &[(0x827D, 2, 4, u32::from_le_bytes(*b"460\0"))])), "Kodak's Model2 was missed");
+        let unlocated = tiff_from(&[&[0xAA; 16]], &[(0x0106, 3, 1, 2), (0x0117, 4, 1, 16)]);
+        assert!(is_camera_raw(&unlocated), "pixels no tag locates were missed");
+        let tiled = tiff_from(&[&[0xAA; 16]], &[(0x0106, 3, 1, 2), (0x0117, 4, 1, 16), (0x0144, 4, 1, 8)]);
+        assert!(!is_camera_raw(&tiled), "tile offsets were not taken as locating the pixels");
+        // A colour filter array among the sub-images.
+        let mut tiff = b"II\x2A\x00\0\0\0\0".to_vec();
+        tiff.extend_from_slice(&[0xAA; 16]);
+        let sub = tiff.len();
+        tiff.extend_from_slice(&3u16.to_le_bytes());
+        for (tag, kind, count, value) in [(0x0106u16, 3u16, 1u32, 32803u32), (0x0111, 4, 1, 8), (0x0117, 4, 1, 16)] {
+            for field in [&tag.to_le_bytes()[..], &kind.to_le_bytes(), &count.to_le_bytes(), &value.to_le_bytes()] {
+                tiff.extend_from_slice(field);
+            }
+        }
+        tiff.extend_from_slice(&[0; 4]);
+        let dir = tiff.len();
+        tiff[4..8].copy_from_slice(&(dir as u32).to_le_bytes());
+        tiff.extend_from_slice(&3u16.to_le_bytes());
+        for (tag, kind, count, value) in [(0x0111u16, 4u16, 1u32, 8u32), (0x0117, 4, 1, 16), (0x014A, 4, 1, sub as u32)] {
+            for field in [&tag.to_le_bytes()[..], &kind.to_le_bytes(), &count.to_le_bytes(), &value.to_le_bytes()] {
+                tiff.extend_from_slice(field);
+            }
+        }
+        tiff.extend_from_slice(&[0; 4]);
+        assert!(is_camera_raw(&tiff), "a colour filter array sub-image was missed");
+        // A colour filter array on the second page of the chain.
+        let mut chain = page(2, &[]);
+        let second = chain.len();
+        let link = second - 4;
+        chain[link..second].copy_from_slice(&(second as u32).to_le_bytes());
+        chain.extend_from_slice(&1u16.to_le_bytes());
+        for field in [&0x0106u16.to_le_bytes()[..], &3u16.to_le_bytes(), &1u32.to_le_bytes(), &32803u32.to_le_bytes(), &[0; 4]] {
+            chain.extend_from_slice(field);
+        }
+        assert!(is_camera_raw(&chain), "a colour filter array on a later page was missed");
     }
 
     /// The next link of the directory at `at` in a stripped file, wherever the

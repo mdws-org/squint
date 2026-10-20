@@ -27,6 +27,7 @@
 #define SQUINT_ERR_SIGNED         15
 #define SQUINT_ERR_ATTACHMENTS    16
 #define SQUINT_ERR_PREVIEW        17
+#define SQUINT_ERR_RAW            18
 
 #define SQUINT_MODE_FAST    0
 #define SQUINT_MODE_QUALITY 1
@@ -83,6 +84,12 @@ SquintResult squint_optimize(const uint8_t *input, size_t input_len, int mode,
 SquintResult squint_optimize_as(const uint8_t *input, size_t input_len, int format,
                                 int mode, double target, float fixed_quality,
                                 int png_min_quality, int max_dimension);
+
+// Strip, naming the file's type identifier as macOS gives it for the file's
+// extension (such as "com.nikon.raw-image"), or NULL. A camera raw that macOS
+// opened before stripping and cannot open after is refused with SQUINT_ERR_RAW,
+// as is a camera raw other than a DNG that it does not open as a raw at all.
+SquintResult squint_strip_typed(const uint8_t *input, size_t input_len, const char *type_hint);
 
 void squint_result_free(SquintResult result);
 
