@@ -108,10 +108,9 @@ pub enum Error {
     /// inside an attachment would still be there, so it carries its own code
     /// and is shown as a failure.
     AttachmentsUnread { attachments: usize },
-    /// A JPEG among a TIFF's pixels, usually the embedded preview a raw file
-    /// carries, holds metadata of its own. Removing it means rewriting that
-    /// JPEG, which Strip does not do yet, so the file is refused rather than
-    /// reported clean with it inside.
+    /// A gain map among a TIFF's pixels, usually in the embedded preview a
+    /// raw file carries, holds XMP with its rendering parameters and more,
+    /// which Strip refuses in a photograph's gain map too.
     PreviewMetadata,
     /// Something below panicked. Reported rather than allowed to unwind into C,
     /// where it would abort the process and take every other job with it.
@@ -168,7 +167,7 @@ impl std::fmt::Display for Error {
             ),
             Error::PreviewMetadata => write!(
                 f,
-                "this file's embedded preview carries location or camera data that Strip cannot remove yet; the file was not changed"
+                "this file's embedded preview has a gain map whose XMP holds more than its rendering parameters; the file was not changed"
             ),
             Error::Panicked => write!(f, "the engine failed unexpectedly; the file was not changed"),
         }
@@ -1314,26 +1313,43 @@ mod tests {
     }
 
     /// A raw file whose embedded preview carries its own EXIF, as an iPhone
-    /// ProRAW file's does with the GPS position in it, is refused in Strip
-    /// with its own message rather than as a TIFF laid out wrongly.
+    /// ProRAW file's does with the GPS position in it, strips: the preview's
+    /// EXIF is rewritten in place. One whose gain map carries more than its
+    /// rendering parameters is refused with its own message rather than as a
+    /// TIFF laid out wrongly.
     #[test]
-    fn a_tiff_whose_preview_carries_exif_is_refused_with_its_own_error() {
-        let preview: &[u8] = &[
-            0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x08, b'E', b'x', b'i', b'f', 0, 0, 0xFF, 0xDA, 0x00, 0x02, 0x11, 0xFF, 0xD9,
-        ];
-        let mut tiff = vec![b'I', b'I', 42, 0, 0, 0, 0, 0];
-        tiff.extend_from_slice(preview);
-        let directory = tiff.len() as u32;
-        tiff[4..8].copy_from_slice(&directory.to_le_bytes());
-        tiff.extend_from_slice(&2u16.to_le_bytes());
-        for (tag, kind, count, value) in [(0x0201u16, 4u16, 1u32, 8u32), (0x0202, 4, 1, preview.len() as u32)] {
-            tiff.extend_from_slice(&tag.to_le_bytes());
-            tiff.extend_from_slice(&kind.to_le_bytes());
-            tiff.extend_from_slice(&count.to_le_bytes());
-            tiff.extend_from_slice(&value.to_le_bytes());
+    fn a_tiff_whose_preview_carries_exif_strips_and_an_unclean_gain_map_is_refused() {
+        let tiff_with = |preview: &[u8]| {
+            let mut tiff = vec![b'I', b'I', 42, 0, 0, 0, 0, 0];
+            tiff.extend_from_slice(preview);
+            let directory = tiff.len() as u32;
+            tiff[4..8].copy_from_slice(&directory.to_le_bytes());
+            tiff.extend_from_slice(&2u16.to_le_bytes());
+            for (tag, kind, count, value) in [(0x0201u16, 4u16, 1u32, 8u32), (0x0202, 4, 1, preview.len() as u32)] {
+                tiff.extend_from_slice(&tag.to_le_bytes());
+                tiff.extend_from_slice(&kind.to_le_bytes());
+                tiff.extend_from_slice(&count.to_le_bytes());
+                tiff.extend_from_slice(&value.to_le_bytes());
+            }
+            tiff.extend_from_slice(&0u32.to_le_bytes());
+            tiff
+        };
+        let mut exif = b"Exif\0\0MM\0\x2a\0\0\0\x08\0\x01\x01\x12\0\x03\0\0\0\x01\0\x06\0\0\0\0\0\0 GPS 51.5074 N".to_vec();
+        let mut preview = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        preview.extend_from_slice(&((exif.len() + 2) as u16).to_be_bytes());
+        preview.append(&mut exif);
+        preview.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x11, 0xFF, 0xD9]);
+        match optimize(&tiff_with(&preview), Mode::Strip, 0.0, 0.0, None, 0, None) {
+            Ok(out) => assert!(!out.data.windows(7).any(|w| w == b"51.5074"), "the preview kept its location"),
+            Err(e) => panic!("expected the preview cleaned, got {e:?}"),
         }
-        tiff.extend_from_slice(&0u32.to_le_bytes());
-        match optimize(&tiff, Mode::Strip, 0.0, 0.0, None, 0, None) {
+        let gain_map_xmp = b"http://ns.adobe.com/xap/1.0/\0<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"><rdf:Description rdf:about=\"\" xmlns:HDRGainMap=\"http://ns.apple.com/HDRGainMap/1.0/\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\"><HDRGainMap:HDRGainMapVersion>65536</HDRGainMap:HDRGainMapVersion><xmp:CreatorTool>iPhone 12 Pro</xmp:CreatorTool></rdf:Description></rdf:RDF></x:xmpmeta>";
+        let mut pair = vec![0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x02, 0x11, 0xFF, 0xD9, 0xFF, 0xD8, 0xFF, 0xE1];
+        pair.extend_from_slice(&((gain_map_xmp.len() + 2) as u16).to_be_bytes());
+        pair.extend_from_slice(gain_map_xmp);
+        pair.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x11, 0xFF, 0xD9]);
+        let preview: &[u8] = &pair;
+        match optimize(&tiff_with(preview), Mode::Strip, 0.0, 0.0, None, 0, None) {
             Err(Error::PreviewMetadata) => {}
             Err(e) => panic!("expected PreviewMetadata, got {e:?}"),
             Ok(_) => panic!("expected PreviewMetadata, got a result"),

@@ -30,8 +30,8 @@ pub struct Secondaries {
 }
 
 const MPF_TAG: &[u8] = b"MPF\0";
-const ISO_TAG: &[u8] = b"urn:iso:std:iso:ts:21496";
-const XMP_TAG: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
+pub(crate) const ISO_TAG: &[u8] = b"urn:iso:std:iso:ts:21496";
+pub(crate) const XMP_TAG: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
 
 /// Markers identifying a secondary image as a gain map rather than some other
 /// Multi Picture Format payload.
@@ -199,26 +199,43 @@ pub fn signals_hdr(jpeg: &[u8]) -> bool {
 /// to its values — so dropping them leaves a greyscale picture nothing can read.
 /// EXIF is not among them and goes the way of the primary's.
 ///
-/// XMP is kept only when it holds nothing but rendering parameters. A packet
-/// that holds rendering parameters and anything more gives `None`: removing it
-/// would leave the map unreadable while it was reported as kept, and keeping
-/// it would keep the rest. A packet that names no rendering parameters at all
-/// carries nothing a renderer needs, and goes.
+/// XMP goes as `map_xmp` says, and `None` when it says to refuse.
 pub fn descriptive_segments(map: &[u8]) -> Option<Vec<(u8, Vec<u8>)>> {
     let mut kept = Vec::new();
     for (m, _, p) in segments(map) {
         if m == 0xE1 && p.starts_with(XMP_TAG) {
-            let packet = &p[XMP_TAG.len()..];
-            if crate::heif::xmp_is_rendering_only(packet) {
-                kept.push((m, p.to_vec()));
-            } else if crate::heif::RENDERING_NAMESPACES.iter().any(|ns| contains(packet, ns.as_bytes())) {
-                return None;
+            match map_xmp(&p[XMP_TAG.len()..]) {
+                MapXmp::Keep => kept.push((m, p.to_vec())),
+                MapXmp::Drop => {}
+                MapXmp::Refuse => return None,
             }
         } else if m == 0xE2 && p.starts_with(ISO_TAG) {
             kept.push((m, p.to_vec()));
         }
     }
     Some(kept)
+}
+
+/// What becomes of a gain map's XMP packet.
+pub(crate) enum MapXmp {
+    /// It holds nothing but rendering parameters.
+    Keep,
+    /// It names no rendering parameters, so carries nothing a renderer needs.
+    Drop,
+    /// It holds rendering parameters and more: removing it would leave the
+    /// map unreadable while it was reported as kept, and keeping it would
+    /// keep the rest.
+    Refuse,
+}
+
+pub(crate) fn map_xmp(packet: &[u8]) -> MapXmp {
+    if crate::heif::xmp_is_rendering_only(packet) {
+        MapXmp::Keep
+    } else if crate::heif::RENDERING_NAMESPACES.iter().any(|ns| contains(packet, ns.as_bytes())) {
+        MapXmp::Refuse
+    } else {
+        MapXmp::Drop
+    }
 }
 
 /// Insert APP segments into a JPEG, after any JFIF and EXIF headers.
