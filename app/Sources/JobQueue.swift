@@ -1,4 +1,5 @@
 import Foundation
+import UniformTypeIdentifiers
 
 /// Runs jobs with a concurrency limit chosen from what the machine can hold.
 ///
@@ -143,13 +144,17 @@ final class JobQueue: ObservableObject {
                 if isIsobmff && preset.writesInPlace && preset.mode != .strip {
                     return .failed(besideOnly)
                 }
-                let result = try Engine.optimize(
-                    input,
-                    mode: preset.mode,
-                    format: preset.format,
-                    target: target,
-                    maxDimension: preset.maxDimension
-                )
+                // Strip is told the file's type so a camera raw can be checked
+                // to still open once stripped.
+                let result = preset.mode == .strip
+                    ? try Engine.strip(input, typeHint: UTType(filenameExtension: url.pathExtension)?.identifier)
+                    : try Engine.optimize(
+                        input,
+                        mode: preset.mode,
+                        format: preset.format,
+                        target: target,
+                        maxDimension: preset.maxDimension
+                    )
                 let destination = preset.destination(for: url, outputExtension: result.outputExtension)
                 // Compared without regard to case, because the volume very
                 // likely does not regard it either: `Photo.AVIF` converted to

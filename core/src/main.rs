@@ -3,7 +3,7 @@
 //! This drives the engine without a user interface so that quality and speed can
 //! be measured against real photographs before any application exists.
 
-use squint_core::{score, optimize, optimize_as, png, Hdr, Mode, OutputFormat, Source, JPEG_SCORE_CEILING};
+use squint_core::{score, optimize, optimize_as, png, strip_typed, Hdr, Mode, OutputFormat, Source, JPEG_SCORE_CEILING};
 use std::time::Instant;
 
 /// How the gain map fared, for the line the harness prints.
@@ -12,6 +12,20 @@ fn hdr_note(hdr: Hdr) -> &'static str {
         Hdr::Absent => "",
         Hdr::Preserved => "  hdr gain map preserved",
         Hdr::Dropped => "  HDR GAIN MAP DROPPED",
+    }
+}
+
+/// The type macOS gives the file's extension, which Strip uses to check that
+/// a camera raw still opens once stripped. None elsewhere.
+fn type_hint(path: &str) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        std::path::Path::new(path).extension().and_then(|e| e.to_str()).and_then(squint_core::imageio::type_for_extension)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        None
     }
 }
 
@@ -121,7 +135,7 @@ fn main() {
     }
     if mode == "strip" {
         let t0 = Instant::now();
-        match optimize(&bytes, Mode::Strip, 0.0, 0.0, None, probes, None) {
+        match strip_typed(&bytes, type_hint(path).as_deref()) {
             Ok(r) => {
                 println!(
                     "{}  {:>7.0} KB -> {:>7.0} KB  {:>5.1}%  metadata removed, pixels untouched{}{}  {:.3}s",

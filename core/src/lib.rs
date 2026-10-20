@@ -112,6 +112,12 @@ pub enum Error {
     /// raw file carries, holds XMP with its rendering parameters and more,
     /// which Strip refuses in a photograph's gain map too.
     PreviewMetadata,
+    /// A camera raw would no longer open once stripped: the camera keeps what
+    /// the file is read by, in its Make and Model and maker notes, beside its
+    /// own details. `checked` when macOS opened the original and not the
+    /// stripped copy; otherwise a camera raw other than a DNG that could not
+    /// be checked, because nothing here opens it as a raw.
+    RawUnopenable { checked: bool },
     /// Something below panicked. Reported rather than allowed to unwind into C,
     /// where it would abort the process and take every other job with it.
     Panicked,
@@ -168,6 +174,14 @@ impl std::fmt::Display for Error {
             Error::PreviewMetadata => write!(
                 f,
                 "this file's embedded preview has a gain map whose XMP holds more than its rendering parameters; the file was not changed"
+            ),
+            Error::RawUnopenable { checked: true } => write!(
+                f,
+                "macOS could not open this camera raw once stripped, because the details naming the camera are also how it is read; the file was not changed. A DNG copy of it strips safely"
+            ),
+            Error::RawUnopenable { checked: false } => write!(
+                f,
+                "this camera raw cannot be checked here, and stripping one usually leaves a file nothing opens; the file was not changed. A DNG copy of it strips safely"
             ),
             Error::Panicked => write!(f, "the engine failed unexpectedly; the file was not changed"),
         }
@@ -694,6 +708,192 @@ pub struct Optimized {
     pub attachments: usize,
 }
 
+/// Strip, knowing what kind of file the bytes came from. `type_hint` is the
+/// file's type identifier as macOS names it from its extension, such as
+/// `com.nikon.raw-image`.
+///
+/// A camera raw keeps what it is read by, in its Make and Model and its maker
+/// notes, beside the camera's own details, so stripping one can leave pixels
+/// that nothing will develop. On macOS the original and the stripped copy are
+/// both opened as that kind of raw, and when only the original opens the file
+/// is refused. A raw that cannot be checked that way, because macOS does not
+/// open it as a raw, there is no macOS or no type was given, is refused unless
+/// it is a DNG. Strip through `optimize` is this with no type.
+pub fn strip_typed(bytes: &[u8], type_hint: Option<&str>) -> Result<Optimized, Error> {
+    // A PDF says who wrote it, with what, and when, in its info dictionary
+    // and again in an XMP packet. Both go; the pages are untouched.
+    if pdf::is_pdf(bytes) {
+        let r = pdf::rewrite(bytes, Mode::Strip, 0.0, 0.0, 0, None)?;
+        if r.metadata_removed == 0 {
+            // A location inside an attached file would still be there, so
+            // "nothing to remove" would be the wrong claim.
+            if r.attachments > 0 {
+                return Err(Error::AttachmentsUnread { attachments: r.attachments });
+            }
+            return Err(Error::NothingToRemove);
+        }
+        // A rewritten document is not always smaller: one its writer had
+        // packed tighter than this can, or one with little to lose, comes
+        // back larger. A larger result is refused as it is for every
+        // other format, and the original stands.
+        if r.data.len() >= bytes.len() {
+            return Err(Error::StripWouldGrow {
+                best_bytes: r.data.len(),
+                original_bytes: bytes.len(),
+            });
+        }
+        return Ok(Optimized {
+            data: r.data,
+            probes: Vec::new(),
+            score: None,
+            quality: None,
+            hdr: Hdr::Absent,
+            quantized: false,
+            original_bytes: bytes.len(),
+            converted_from: None,
+            attachments: r.attachments,
+        });
+    }
+
+    // A HEIF is stripped by destroying its metadata where it lies rather
+    // than cutting it out, so the result is exactly as long as the input.
+    // Whether anything was removed is answered by how much was destroyed,
+    // not by the file having shrunk.
+    if gif::is_gif(bytes) {
+        let (stripped, wiped) = gif::strip_gif(bytes)
+            .ok_or_else(|| Error::Decode("this GIF is not laid out as expected".into()))?;
+        if wiped == 0 {
+            return Err(Error::NothingToRemove);
+        }
+        return Ok(Optimized {
+            data: stripped,
+            probes: Vec::new(),
+            score: None,
+            quality: None,
+            hdr: Hdr::Absent,
+            quantized: false,
+            original_bytes: bytes.len(),
+            converted_from: None,
+            attachments: 0,
+        });
+    }
+
+    // A WebP is stripped by rebuilding its chunk chain, so unlike a HEIF the
+    // metadata genuinely leaves and the file shrinks. Whether anything was
+    // removed is still reported the same way, as the payload bytes dropped.
+    if webp::is_webp(bytes) {
+        let (stripped, wiped) = webp::strip_webp(bytes)
+            .ok_or_else(|| Error::Decode("this WebP is not laid out as expected".into()))?;
+        if wiped == 0 {
+            return Err(Error::NothingToRemove);
+        }
+        return Ok(Optimized {
+            data: stripped,
+            probes: Vec::new(),
+            score: None,
+            quality: None,
+            hdr: Hdr::Absent,
+            quantized: false,
+            original_bytes: bytes.len(),
+            converted_from: None,
+            attachments: 0,
+        });
+    }
+
+    if heif::is_isobmff_image(bytes) || tiff::is_tiff(bytes) {
+        let (stripped, wiped) = if heif::is_isobmff_image(bytes) {
+            let container = heif::container_name(bytes);
+            heif::strip_heif(bytes).ok_or_else(|| {
+                Error::Decode(format!("this {container} is not laid out as expected"))
+            })?
+        } else {
+            tiff::strip_tiff_checked(bytes).map_err(|refused| match refused {
+                tiff::Refused::Preview => Error::PreviewMetadata,
+                tiff::Refused::Layout => Error::Decode("this TIFF is not laid out as expected".into()),
+            })?
+        };
+        // Destroying metadata that an earlier Strip already destroyed
+        // rewrites the same bytes, so a second Strip is caught here.
+        if wiped == 0 || stripped == bytes {
+            return Err(Error::NothingToRemove);
+        }
+        if tiff::is_tiff(bytes) {
+            raw_check(bytes, &stripped, type_hint)?;
+        }
+        return Ok(Optimized {
+            data: stripped,
+            probes: Vec::new(),
+            score: None,
+            quality: None,
+            hdr: Hdr::Absent,
+            quantized: false,
+            original_bytes: bytes.len(),
+            converted_from: None,
+            attachments: 0,
+        });
+    }
+
+    let (stripped, hdr) = if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        (png::strip_png(bytes), Hdr::Absent)
+    } else {
+        match strip_jpeg_file(bytes, extract_orientation(bytes))? {
+            Some((file, hdr)) => (Some(file), hdr),
+            None => (None, Hdr::Absent),
+        }
+    };
+    let stripped = stripped.ok_or_else(|| Error::Decode("not a JPEG or PNG".into()))?;
+
+    if stripped == bytes {
+        return Err(Error::NothingToRemove);
+    }
+    // Something came out but the file did not shrink: the orientation
+    // block written back can outweigh a very small amount removed.
+    if stripped.len() >= bytes.len() {
+        return Err(Error::StripWouldGrow {
+            best_bytes: stripped.len(),
+            original_bytes: bytes.len(),
+        });
+    }
+    Ok(Optimized {
+        data: stripped,
+        probes: Vec::new(),
+        score: None,
+        quality: None,
+        hdr,
+        quantized: false,
+        original_bytes: bytes.len(),
+        converted_from: None,
+        attachments: 0,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn raw_check(original: &[u8], stripped: &[u8], type_hint: Option<&str>) -> Result<(), Error> {
+    raw_check_with(original, stripped, type_hint.map(|hint| move |b: &[u8]| imageio::opens_as_raw(b, hint)))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn raw_check(original: &[u8], stripped: &[u8], _type_hint: Option<&str>) -> Result<(), Error> {
+    raw_check_with(original, stripped, None::<fn(&[u8]) -> bool>)
+}
+
+/// `opens` says whether bytes open as the raw the file is named as, where
+/// something can. When it opens the original, the stripped copy has to open
+/// too. Otherwise nothing has checked the strip, and a camera raw other than
+/// a DNG is refused.
+fn raw_check_with(original: &[u8], stripped: &[u8], opens: Option<impl Fn(&[u8]) -> bool>) -> Result<(), Error> {
+    if let Some(opens) = opens {
+        if opens(original) {
+            return if opens(stripped) { Ok(()) } else { Err(Error::RawUnopenable { checked: true }) };
+        }
+    }
+    if tiff::is_camera_raw(original) {
+        Err(Error::RawUnopenable { checked: false })
+    } else {
+        Ok(())
+    }
+}
+
 /// Optimize an encoded image, dispatching on its format.
 ///
 /// This is the single entry point. The command line harness and the C API both
@@ -737,148 +937,7 @@ pub fn optimize_as(
     max_dimension: Option<u32>,
 ) -> Result<Optimized, Error> {
     if mode == Mode::Strip {
-        // A PDF says who wrote it, with what, and when, in its info dictionary
-        // and again in an XMP packet. Both go; the pages are untouched.
-        if pdf::is_pdf(bytes) {
-            let r = pdf::rewrite(bytes, Mode::Strip, 0.0, 0.0, 0, None)?;
-            if r.metadata_removed == 0 {
-                // A location inside an attached file would still be there, so
-                // "nothing to remove" would be the wrong claim.
-                if r.attachments > 0 {
-                    return Err(Error::AttachmentsUnread { attachments: r.attachments });
-                }
-                return Err(Error::NothingToRemove);
-            }
-            // A rewritten document is not always smaller: one its writer had
-            // packed tighter than this can, or one with little to lose, comes
-            // back larger. A larger result is refused as it is for every
-            // other format, and the original stands.
-            if r.data.len() >= bytes.len() {
-                return Err(Error::StripWouldGrow {
-                    best_bytes: r.data.len(),
-                    original_bytes: bytes.len(),
-                });
-            }
-            return Ok(Optimized {
-                data: r.data,
-                probes: Vec::new(),
-                score: None,
-                quality: None,
-                hdr: Hdr::Absent,
-                quantized: false,
-                original_bytes: bytes.len(),
-                converted_from: None,
-                attachments: r.attachments,
-            });
-        }
-
-        // A HEIF is stripped by destroying its metadata where it lies rather
-        // than cutting it out, so the result is exactly as long as the input.
-        // Whether anything was removed is answered by how much was destroyed,
-        // not by the file having shrunk.
-        if gif::is_gif(bytes) {
-            let (stripped, wiped) = gif::strip_gif(bytes)
-                .ok_or_else(|| Error::Decode("this GIF is not laid out as expected".into()))?;
-            if wiped == 0 {
-                return Err(Error::NothingToRemove);
-            }
-            return Ok(Optimized {
-                data: stripped,
-                probes: Vec::new(),
-                score: None,
-                quality: None,
-                hdr: Hdr::Absent,
-                quantized: false,
-                original_bytes: bytes.len(),
-                converted_from: None,
-                attachments: 0,
-            });
-        }
-
-        // A WebP is stripped by rebuilding its chunk chain, so unlike a HEIF the
-        // metadata genuinely leaves and the file shrinks. Whether anything was
-        // removed is still reported the same way, as the payload bytes dropped.
-        if webp::is_webp(bytes) {
-            let (stripped, wiped) = webp::strip_webp(bytes)
-                .ok_or_else(|| Error::Decode("this WebP is not laid out as expected".into()))?;
-            if wiped == 0 {
-                return Err(Error::NothingToRemove);
-            }
-            return Ok(Optimized {
-                data: stripped,
-                probes: Vec::new(),
-                score: None,
-                quality: None,
-                hdr: Hdr::Absent,
-                quantized: false,
-                original_bytes: bytes.len(),
-                converted_from: None,
-                attachments: 0,
-            });
-        }
-
-        if heif::is_isobmff_image(bytes) || tiff::is_tiff(bytes) {
-            let (stripped, wiped) = if heif::is_isobmff_image(bytes) {
-                let container = heif::container_name(bytes);
-                heif::strip_heif(bytes).ok_or_else(|| {
-                    Error::Decode(format!("this {container} is not laid out as expected"))
-                })?
-            } else {
-                tiff::strip_tiff_checked(bytes).map_err(|refused| match refused {
-                    tiff::Refused::Preview => Error::PreviewMetadata,
-                    tiff::Refused::Layout => Error::Decode("this TIFF is not laid out as expected".into()),
-                })?
-            };
-            // Destroying metadata that an earlier Strip already destroyed
-            // rewrites the same bytes, so a second Strip is caught here.
-            if wiped == 0 || stripped == bytes {
-                return Err(Error::NothingToRemove);
-            }
-            return Ok(Optimized {
-                data: stripped,
-                probes: Vec::new(),
-                score: None,
-                quality: None,
-                hdr: Hdr::Absent,
-                quantized: false,
-                original_bytes: bytes.len(),
-                converted_from: None,
-                attachments: 0,
-            });
-        }
-
-        let (stripped, hdr) = if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
-            (png::strip_png(bytes), Hdr::Absent)
-        } else {
-            match strip_jpeg_file(bytes, extract_orientation(bytes))? {
-                Some((file, hdr)) => (Some(file), hdr),
-                None => (None, Hdr::Absent),
-            }
-        };
-        let stripped = stripped.ok_or_else(|| Error::Decode("not a JPEG or PNG".into()))?;
-
-        if stripped == bytes {
-            return Err(Error::NothingToRemove);
-        }
-        // Something came out but the file did not shrink: the orientation
-        // block written back can outweigh a very small amount removed.
-        if stripped.len() >= bytes.len() {
-            return Err(Error::StripWouldGrow {
-                best_bytes: stripped.len(),
-                original_bytes: bytes.len(),
-            });
-        }
-        return Ok(Optimized {
-            data: stripped,
-            probes: Vec::new(),
-            score: None,
-            quality: None,
-            hdr,
-            quantized: false,
-            original_bytes: bytes.len(),
-            converted_from: None,
-            attachments: 0,
-        });
+        return strip_typed(bytes, None);
     }
 
     // An SVG is not refused here. It rasterizes in `Source::open` and comes
@@ -1158,6 +1217,92 @@ fn hdr_in_place(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A one-page little-endian TIFF of 16 pixel bytes with a camera maker
+    /// to strip, Photometric `photometric`, and `extra` entries.
+    fn raw_like(photometric: u32, extra: &[(u16, u16, u32, u32)]) -> Vec<u8> {
+        const MAKE: &[u8] = b"Acme Camera Co\0";
+        let mut out = b"II\x2A\x00\0\0\0\0".to_vec();
+        out.extend_from_slice(MAKE);
+        let pixels = out.len() as u32;
+        out.extend_from_slice(&[0xAA; 16]);
+        let mut entries = vec![
+            (0x0106u16, 3u16, 1u32, photometric),
+            (0x010F, 2, MAKE.len() as u32, 8),
+            (0x0111, 4, 1, pixels),
+            (0x0117, 4, 1, 16),
+        ];
+        entries.extend_from_slice(extra);
+        entries.sort_by_key(|e| e.0);
+        let dir = out.len() as u32;
+        out[4..8].copy_from_slice(&dir.to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for (tag, kind, count, value) in entries {
+            for field in [&tag.to_le_bytes()[..], &kind.to_le_bytes(), &count.to_le_bytes(), &value.to_le_bytes()] {
+                out.extend_from_slice(field);
+            }
+        }
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out
+    }
+
+    /// A raw the system opened is refused only when the stripped copy does
+    /// not open; one it could not open is judged as if nothing could check
+    /// it, and refused when it is a camera raw other than a DNG.
+    #[test]
+    fn a_raw_is_refused_when_its_strip_broke_it_or_could_not_be_checked() {
+        let raw = raw_like(32803, &[]);
+        let dng = raw_like(32803, &[(0xC612, 1, 4, 0x0000_0401)]);
+        let plain = raw_like(2, &[]);
+        let stripped = b"stripped".as_slice();
+        let both = |_: &[u8]| true;
+        let neither = |_: &[u8]| false;
+        let only_stripped = |b: &[u8]| b == stripped;
+        for original in [&raw, &dng, &plain] {
+            let only_original = |b: &[u8]| b == original.as_slice();
+            assert!(raw_check_with(original, stripped, Some(both)).is_ok());
+            assert!(matches!(
+                raw_check_with(original, stripped, Some(only_original)),
+                Err(Error::RawUnopenable { checked: true })
+            ));
+        }
+        type Opens<'a> = Option<&'a dyn Fn(&[u8]) -> bool>;
+        let unopened: [Opens; 3] = [Some(&neither), Some(&only_stripped), None];
+        for opens in unopened {
+            assert!(matches!(raw_check_with(&raw, stripped, opens), Err(Error::RawUnopenable { checked: false })));
+            assert!(raw_check_with(&dng, stripped, opens).is_ok());
+            assert!(raw_check_with(&plain, stripped, opens).is_ok());
+        }
+    }
+
+    /// A camera raw that nothing here opens as a raw is refused untouched,
+    /// and a DNG is stripped. A synthetic raw is not one macOS develops, so
+    /// this holds there too.
+    #[test]
+    fn an_unchecked_camera_raw_is_refused_and_a_dng_is_stripped() {
+        let raw = raw_like(32803, &[]);
+        let dng = raw_like(32803, &[(0xC612, 1, 4, 0x0000_0401)]);
+        let plain = raw_like(2, &[]);
+        for hint in [None, Some("com.nikon.raw-image")] {
+            assert!(matches!(strip_typed(&raw, hint), Err(Error::RawUnopenable { checked: false })), "{hint:?}");
+            let out = strip_typed(&dng, hint).expect("a DNG strips");
+            assert!(!out.data.windows(4).any(|w| w == b"Acme"), "the maker stayed with {hint:?}");
+            assert!(strip_typed(&plain, hint).is_ok(), "a TIFF of ordinary pixels was refused with {hint:?}");
+        }
+    }
+
+    /// macOS is asked by type, and a file it does not develop is not taken
+    /// for one it does.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_macos_a_raw_is_asked_about_by_its_type() {
+        let raw = raw_like(32803, &[]);
+        assert!(!imageio::opens_as_raw(&raw, "com.nikon.raw-image"));
+        assert!(!imageio::opens_as_raw(b"not an image", "com.nikon.raw-image"));
+        assert_eq!(imageio::type_for_extension("nef").as_deref(), Some("com.nikon.raw-image"));
+        assert_eq!(imageio::type_for_extension("zzqqx"), None);
+        assert_eq!(imageio::type_for_extension("a\0b"), None);
+    }
 
     #[test]
     fn turning_by_an_orientation_and_its_inverse_is_no_turn() {

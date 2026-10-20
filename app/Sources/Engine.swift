@@ -88,13 +88,31 @@ enum Engine {
         pngMinQuality: Int32 = 70,
         maxDimension: Int32? = nil
     ) throws -> Result {
-        var result = input.withUnsafeBytes { raw -> SquintResult in
+        let result = input.withUnsafeBytes { raw -> SquintResult in
             let base = raw.bindMemory(to: UInt8.self).baseAddress
             return squint_optimize_as(
                 base, input.count, format.rawValue, mode.rawValue, target, fixedQuality,
                 pngMinQuality, maxDimension ?? 0
             )
         }
+        return try take(result)
+    }
+
+    /// Strip, naming the file's type as macOS gives it for the extension, so a
+    /// camera raw that would no longer open once stripped is refused.
+    static func strip(_ input: Data, typeHint: String?) throws -> Result {
+        let result = input.withUnsafeBytes { raw -> SquintResult in
+            let base = raw.bindMemory(to: UInt8.self).baseAddress
+            if let typeHint {
+                return typeHint.withCString { squint_strip_typed(base, input.count, $0) }
+            }
+            return squint_strip_typed(base, input.count, nil)
+        }
+        return try take(result)
+    }
+
+    /// The engine's result as Swift values, handing its buffer back.
+    private static func take(_ result: SquintResult) throws -> Result {
         defer { squint_result_free(result) }
 
         guard result.error == SQUINT_OK, let bytes = result.data else {

@@ -107,6 +107,18 @@ extern "C" {
         cStr: *const i8,
         encoding: u32,
     ) -> CFStringRef;
+    fn CFStringGetCString(theString: CFStringRef, buffer: *mut i8, bufferSize: isize, encoding: u32) -> bool;
+}
+
+#[link(name = "CoreServices", kind = "framework")]
+extern "C" {
+    static kUTTagClassFilenameExtension: CFStringRef;
+
+    fn UTTypeCreatePreferredIdentifierForTag(
+        tagClass: CFStringRef,
+        tag: CFStringRef,
+        conformingToUTI: CFStringRef,
+    ) -> CFStringRef;
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -144,6 +156,7 @@ extern "C" {
     static kCGImageAuxiliaryDataTypeHDRGainMap: CFStringRef;
     static kCGImageAuxiliaryDataTypeISOGainMap: CFStringRef;
     static kCGImageDestinationLossyCompressionQuality: CFStringRef;
+    static kCGImageSourceTypeIdentifierHint: CFStringRef;
 
     fn CGImageDestinationCreateWithData(
         data: CFMutableDataRef,
@@ -165,6 +178,7 @@ extern "C" {
 
     fn CGImageSourceCreateWithData(data: CFDataRef, options: CFDictionaryRef) -> CGImageSourceRef;
     fn CGImageSourceGetCount(isrc: CGImageSourceRef) -> usize;
+    fn CGImageSourceGetType(isrc: CGImageSourceRef) -> CFStringRef;
     fn CGImageSourceGetPrimaryImageIndex(isrc: CGImageSourceRef) -> usize;
     fn CGImageSourceGetStatus(isrc: CGImageSourceRef) -> i32;
     fn CGImageSourceGetStatusAtIndex(isrc: CGImageSourceRef, index: usize) -> i32;
@@ -208,6 +222,78 @@ impl<T> Drop for Cf<T> {
                 CFRelease(self.0 as CFTypeRef);
             }
         }
+    }
+}
+
+/// A CFString made from `s`, or None when `s` holds a NUL.
+fn cf_string(s: &str) -> Option<Cf<c_void>> {
+    let s = std::ffi::CString::new(s).ok()?;
+    unsafe { Cf::wrap(CFStringCreateWithCString(ptr::null(), s.as_ptr(), K_CF_STRING_ENCODING_UTF8)) }
+}
+
+/// The text of a CFString, when it is UTF-8 and short.
+fn rust_string(s: CFStringRef) -> Option<String> {
+    if s.is_null() {
+        return None;
+    }
+    let mut buffer = [0i8; 256];
+    unsafe {
+        if !CFStringGetCString(s, buffer.as_mut_ptr(), buffer.len() as isize, K_CF_STRING_ENCODING_UTF8) {
+            return None;
+        }
+        std::ffi::CStr::from_ptr(buffer.as_ptr()).to_str().ok().map(str::to_owned)
+    }
+}
+
+/// The type identifier macOS gives a file name extension, such as
+/// `com.nikon.raw-image` for `nef`. None for an extension it does not know,
+/// for which it makes up a `dyn.` identifier.
+pub fn type_for_extension(extension: &str) -> Option<String> {
+    let tag = cf_string(extension)?;
+    let id = unsafe {
+        Cf::wrap(UTTypeCreatePreferredIdentifierForTag(kUTTagClassFilenameExtension, tag.as_ptr(), ptr::null()))?
+    };
+    rust_string(id.as_ptr()).filter(|id| !id.starts_with("dyn."))
+}
+
+/// Whether macOS reads these bytes as the camera raw `type_hint` names and
+/// develops a picture from them. Told nothing, it takes many raws for plain
+/// TIFFs and opens only their small preview, which says nothing about whether
+/// the raw itself still develops; told the type, it opens a raw it recognises
+/// as that raw, and one it no longer recognises as a TIFF.
+pub fn opens_as_raw(bytes: &[u8], type_hint: &str) -> bool {
+    let Some(hint) = cf_string(type_hint) else {
+        return false;
+    };
+    unsafe {
+        let Some(data) = Cf::wrap(CFDataCreate(ptr::null(), bytes.as_ptr(), bytes.len() as isize)) else {
+            return false;
+        };
+        let keys = [kCGImageSourceTypeIdentifierHint as *const c_void];
+        let values = [hint.as_ptr() as *const c_void];
+        let Some(options) = Cf::wrap(CFDictionaryCreate(
+            ptr::null(),
+            keys.as_ptr(),
+            values.as_ptr(),
+            1,
+            &kCFTypeDictionaryKeyCallBacks as *const _ as *const c_void,
+            &kCFTypeDictionaryValueCallBacks as *const _ as *const c_void,
+        )) else {
+            return false;
+        };
+        let Some(src) = Cf::wrap(CGImageSourceCreateWithData(data.as_ptr() as CFDataRef, options.as_ptr() as CFDictionaryRef))
+        else {
+            return false;
+        };
+        let src = src.as_ptr() as CGImageSourceRef;
+        // Owned by the source (Get rule); not released.
+        match rust_string(CGImageSourceGetType(src)) {
+            Some(kind) if kind != "public.tiff" => {}
+            _ => return false,
+        }
+        let primary = CGImageSourceGetPrimaryImageIndex(src);
+        Cf::wrap(CGImageSourceCreateImageAtIndex(src, primary, ptr::null()))
+            .is_some_and(|image| CGImageGetWidth(image.as_ptr() as CGImageRef) > 0)
     }
 }
 
