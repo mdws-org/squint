@@ -8,8 +8,8 @@ options:
 # Shared by both editions, so a release bumps the version once.
 settings:
   base:
-    MARKETING_VERSION: "0.9.6"
-    CURRENT_PROJECT_VERSION: "23"
+    MARKETING_VERSION: "0.9.7"
+    CURRENT_PROJECT_VERSION: "24"
     SWIFT_VERSION: "5.0"
     SWIFT_OBJC_BRIDGING_HEADER: Sources/Squint-Bridging-Header.h
     HEADER_SEARCH_PATHS: $(SRCROOT)/../core/include
