@@ -130,16 +130,20 @@ pub unsafe extern "C" fn squint_optimize(
     png_min_quality: c_int,
     max_dimension: c_int,
 ) -> SquintResult {
-    squint_optimize_as(
-        input,
-        input_len,
-        SQUINT_FORMAT_JPEG,
-        mode,
-        target,
-        fixed_quality,
-        png_min_quality,
-        max_dimension,
-    )
+    // SAFETY: `squint_optimize_as` asks only that `input` point to `input_len`
+    // readable bytes, which is this function's own contract with its caller.
+    unsafe {
+        squint_optimize_as(
+            input,
+            input_len,
+            SQUINT_FORMAT_JPEG,
+            mode,
+            target,
+            fixed_quality,
+            png_min_quality,
+            max_dimension,
+        )
+    }
 }
 
 /// Optimize, writing the format the caller names.
@@ -159,7 +163,6 @@ pub unsafe extern "C" fn squint_optimize(
 /// # Safety
 /// `input` must point to `input_len` readable bytes.
 #[no_mangle]
-#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn squint_optimize_as(
     input: *const u8,
     input_len: usize,
@@ -179,7 +182,10 @@ pub unsafe extern "C" fn squint_optimize_as(
         SQUINT_FORMAT_WEBP_LOSSLESS => OutputFormat::WebpLossless,
         _ => return SquintResult::failure(SQUINT_ERR_UNKNOWN_FORMAT, input_len, None),
     };
-    let bytes = std::slice::from_raw_parts(input, input_len);
+    // SAFETY: `input` was checked non-null above, a `u8` pointer has no
+    // alignment to meet, and the caller guarantees `input_len` readable bytes
+    // behind it for the length of this call.
+    let bytes = unsafe { std::slice::from_raw_parts(input, input_len) };
     // Every mode is named here and any other value is refused. Collapsing the
     // unrecognised case into fast is what once silently turned strip into a
     // re-encode: the caller asked for the pixels to be left alone and got
@@ -204,11 +210,11 @@ pub unsafe extern "C" fn squint_optimize_as(
     .unwrap_or(Err(Error::Panicked));
 
     match outcome {
-        Ok(mut out) => {
-            out.data.shrink_to_fit();
+        Ok(out) => {
+            // A boxed slice has no spare capacity, so `len` alone is enough to
+            // rebuild it in `squint_result_free`.
             let len = out.data.len();
-            let ptr = out.data.as_mut_ptr();
-            std::mem::forget(out.data);
+            let ptr = Box::into_raw(out.data.into_boxed_slice()).cast::<u8>();
             SquintResult {
                 data: ptr,
                 len,
@@ -238,11 +244,44 @@ pub unsafe extern "C" fn squint_optimize_as(
 #[no_mangle]
 pub unsafe extern "C" fn squint_result_free(result: SquintResult) {
     if !result.data.is_null() && result.len > 0 {
-        drop(Vec::from_raw_parts(result.data, result.len, result.len));
+        let data = std::ptr::slice_from_raw_parts_mut(result.data, result.len);
+        // SAFETY: a non-null `data` was made by `Box::into_raw` on a boxed
+        // slice of exactly `len` bytes in `squint_optimize_as`, and the caller
+        // guarantees this result came from this library and is freed once.
+        drop(unsafe { Box::from_raw(data) });
     }
     if !result.error_message.is_null() {
-        drop(std::ffi::CString::from_raw(result.error_message));
+        // SAFETY: a non-null `error_message` was made by `CString::into_raw` in
+        // `SquintResult::failure`, and the caller guarantees it is freed once.
+        drop(unsafe { std::ffi::CString::from_raw(result.error_message) });
     }
+}
+
+/// A static, human-readable description of an error code. Never null, never freed.
+#[no_mangle]
+pub extern "C" fn squint_error_message(code: c_int) -> *const c_char {
+    let s: &'static [u8] = match code {
+        SQUINT_OK => b"ok\0",
+        SQUINT_ERR_DECODE => b"the image could not be decoded; the file was not changed\0",
+        SQUINT_ERR_ENCODE => b"the image could not be encoded; the file was not changed\0",
+        SQUINT_ERR_METRIC => b"the perceptual metric failed; the file was not changed\0",
+        SQUINT_ERR_TOO_SMALL => b"too small to judge perceptually. Use fast mode; the file was not changed\0",
+        SQUINT_ERR_UNREACHABLE => b"the quality target cannot be reached for this image; the file was not changed\0",
+        SQUINT_ERR_NO_SMALLER => b"already optimal; a smaller file is not possible\0",
+        SQUINT_ERR_NULL_INPUT => b"no input was provided\0",
+        SQUINT_ERR_TOO_LARGE => b"this image is too large to open safely; the file was not changed\0",
+        SQUINT_ERR_PANIC => b"the engine failed unexpectedly; the file was not changed\0",
+        SQUINT_ERR_COLOURS => b"this image's colours cannot be reduced that far; the file was not changed\0",
+        SQUINT_ERR_READ_ONLY => b"this format can have its location data removed but cannot be shrunk yet; the file was not changed\0",
+        SQUINT_ERR_UNKNOWN_FORMAT => b"the output format asked for is not one squint writes; the file was not changed\0",
+        SQUINT_ERR_UNKNOWN_MODE => b"the mode asked for is not one squint has; the file was not changed\0",
+        SQUINT_ERR_STRIP_GREW => b"metadata was found, but removing it would make the file larger; the original was kept with its metadata\0",
+        SQUINT_ERR_SIGNED => b"this PDF is digitally signed, and any change would break the signature; the file was not changed\0",
+        SQUINT_ERR_ATTACHMENTS => b"nothing else to remove, but this PDF carries attached files, which Strip does not read; the file was not changed\0",
+        SQUINT_ERR_PREVIEW => b"this file's embedded preview has a gain map whose XMP holds more than its rendering parameters; the file was not changed\0",
+        _ => b"unknown error\0",
+    };
+    s.as_ptr() as *const c_char
 }
 
 #[cfg(test)]
@@ -264,8 +303,33 @@ mod tests {
         out.into_inner()
     }
 
-    unsafe fn call(bytes: &[u8], format: c_int, mode: c_int) -> SquintResult {
-        squint_optimize_as(bytes.as_ptr(), bytes.len(), format, mode, 80.0, 75.0, -1, 0)
+    fn call(bytes: &[u8], format: c_int, mode: c_int) -> SquintResult {
+        // SAFETY: the pointer and length come from one live slice.
+        unsafe { squint_optimize_as(bytes.as_ptr(), bytes.len(), format, mode, 80.0, 75.0, -1, 0) }
+    }
+
+    fn free(r: SquintResult) {
+        // SAFETY: every result in these tests comes from this library and is
+        // passed here once, after its last read.
+        unsafe { squint_result_free(r) }
+    }
+
+    fn message(r: &SquintResult) -> String {
+        if r.error_message.is_null() {
+            return String::new();
+        }
+        // SAFETY: a non-null `error_message` is a NUL-terminated string from
+        // `CString::into_raw`, alive until `r` is freed, which `r`'s borrow
+        // here prevents.
+        unsafe { std::ffi::CStr::from_ptr(r.error_message) }.to_string_lossy().into_owned()
+    }
+
+    fn output(r: &SquintResult) -> &[u8] {
+        assert!(!r.data.is_null());
+        // SAFETY: a non-null `data` points to `len` initialized bytes owned by
+        // `r`, and the returned slice borrows `r`, so it cannot outlive the
+        // free that takes `r` by value.
+        unsafe { std::slice::from_raw_parts(r.data, r.len) }
     }
 
     #[test]
@@ -273,11 +337,11 @@ mod tests {
         let png = noisy_png(16);
         // 99 is nobody's format. Reading it as JPEG would hand the caller a
         // JPEG it did not ask for and let it be written over the source.
-        let r = unsafe { call(&png, 99, SQUINT_MODE_FAST) };
+        let r = call(&png, 99, SQUINT_MODE_FAST);
         assert_eq!(r.error, SQUINT_ERR_UNKNOWN_FORMAT);
         assert!(r.data.is_null());
         assert_eq!(r.original_len, png.len());
-        unsafe { squint_result_free(r) };
+        free(r);
     }
 
     #[test]
@@ -285,10 +349,10 @@ mod tests {
         let png = noisy_png(16);
         // Read as fast, this would re-encode a file whose caller may have
         // asked for its pixels to be left alone.
-        let r = unsafe { call(&png, SQUINT_FORMAT_JPEG, 7) };
+        let r = call(&png, SQUINT_FORMAT_JPEG, 7);
         assert_eq!(r.error, SQUINT_ERR_UNKNOWN_MODE);
         assert!(r.data.is_null());
-        unsafe { squint_result_free(r) };
+        free(r);
     }
 
     /// A PDF with a long producer entry, so that a Strip of it shrinks, and
@@ -322,10 +386,10 @@ mod tests {
     #[test]
     fn a_strip_reports_the_files_attached_to_a_pdf() {
         let pdf = pdf_with_an_attachment();
-        let r = unsafe { call(&pdf, SQUINT_FORMAT_JPEG, SQUINT_MODE_STRIP) };
-        assert_eq!(r.error, SQUINT_OK, "{:?}", unsafe { std::ffi::CStr::from_ptr(r.error_message) });
+        let r = call(&pdf, SQUINT_FORMAT_JPEG, SQUINT_MODE_STRIP);
+        assert_eq!(r.error, SQUINT_OK, "{}", message(&r));
         assert_eq!(r.attachments, 1);
-        unsafe { squint_result_free(r) };
+        free(r);
     }
 
     /// Three hand-written objects with no room to spare: removing the one
@@ -355,9 +419,10 @@ mod tests {
     #[test]
     fn a_strip_that_would_grow_is_not_reported_as_nothing_to_remove() {
         let pdf = tiny_pdf_with_producer();
+        // SAFETY: the pointer and length come from one live vector.
         let r = unsafe { squint_optimize(pdf.as_ptr(), pdf.len(), SQUINT_MODE_STRIP, 80.0, 75.0, -1, 0) };
         let code = r.error;
-        unsafe { squint_result_free(r) };
+        free(r);
         assert_ne!(code, SQUINT_OK, "the test premise is a Strip that grows");
         assert_ne!(code, SQUINT_ERR_NO_SMALLER, "a grown Strip was reported as nothing to remove");
     }
@@ -365,73 +430,41 @@ mod tests {
     #[test]
     fn the_plain_entry_point_still_means_the_input_format() {
         let png = noisy_png(64);
+        // SAFETY: the pointer and length come from one live vector.
         let r = unsafe {
             squint_optimize(png.as_ptr(), png.len(), SQUINT_MODE_FAST, 80.0, 75.0, -1, 0)
         };
         // Noise may already be as small as a PNG gets, which is an outcome and
         // not a routing fault. What must hold is that nothing was converted.
         if r.error == SQUINT_OK {
-            let out = unsafe { std::slice::from_raw_parts(r.data, r.len) };
+            let out = output(&r);
             assert!(out.starts_with(&[0x89, b'P', b'N', b'G']), "a PNG stays a PNG");
             assert_eq!(r.converted, 0);
         } else {
             assert_eq!(r.error, SQUINT_ERR_NO_SMALLER);
         }
-        unsafe { squint_result_free(r) };
+        free(r);
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn asking_for_avif_reports_a_conversion() {
         let png = noisy_png(128);
-        let r = unsafe { call(&png, SQUINT_FORMAT_AVIF, SQUINT_MODE_FAST) };
-        assert_eq!(r.error, SQUINT_OK, "{}", unsafe {
-            if r.error_message.is_null() {
-                String::new()
-            } else {
-                std::ffi::CStr::from_ptr(r.error_message).to_string_lossy().into_owned()
-            }
-        });
-        let out = unsafe { std::slice::from_raw_parts(r.data, r.len) };
+        let r = call(&png, SQUINT_FORMAT_AVIF, SQUINT_MODE_FAST);
+        assert_eq!(r.error, SQUINT_OK, "{}", message(&r));
+        let out = output(&r);
         assert_eq!(&out[4..8], b"ftyp", "the bytes are an ISOBMFF container");
         assert_eq!(r.converted, 1, "an AVIF made from a PNG is a different kind of file");
         assert!(r.len < png.len());
-        unsafe { squint_result_free(r) };
+        free(r);
     }
 
     #[test]
     fn a_pdf_asked_for_as_avif_is_refused_not_converted() {
         let pdf = b"%PDF-1.4\n1 0 obj << /Type /Catalog >> endobj\ntrailer << /Root 1 0 R >>\n%%EOF\n";
-        let r = unsafe { call(pdf, SQUINT_FORMAT_AVIF, SQUINT_MODE_FAST) };
+        let r = call(pdf, SQUINT_FORMAT_AVIF, SQUINT_MODE_FAST);
         assert_eq!(r.error, SQUINT_ERR_READ_ONLY);
         assert!(r.data.is_null());
-        unsafe { squint_result_free(r) };
+        free(r);
     }
-}
-
-/// A static, human-readable description of an error code. Never null, never freed.
-#[no_mangle]
-pub extern "C" fn squint_error_message(code: c_int) -> *const c_char {
-    let s: &'static [u8] = match code {
-        SQUINT_OK => b"ok\0",
-        SQUINT_ERR_DECODE => b"the image could not be decoded; the file was not changed\0",
-        SQUINT_ERR_ENCODE => b"the image could not be encoded; the file was not changed\0",
-        SQUINT_ERR_METRIC => b"the perceptual metric failed; the file was not changed\0",
-        SQUINT_ERR_TOO_SMALL => b"too small to judge perceptually. Use fast mode; the file was not changed\0",
-        SQUINT_ERR_UNREACHABLE => b"the quality target cannot be reached for this image; the file was not changed\0",
-        SQUINT_ERR_NO_SMALLER => b"already optimal; a smaller file is not possible\0",
-        SQUINT_ERR_NULL_INPUT => b"no input was provided\0",
-        SQUINT_ERR_TOO_LARGE => b"this image is too large to open safely; the file was not changed\0",
-        SQUINT_ERR_PANIC => b"the engine failed unexpectedly; the file was not changed\0",
-        SQUINT_ERR_COLOURS => b"this image's colours cannot be reduced that far; the file was not changed\0",
-        SQUINT_ERR_READ_ONLY => b"this format can have its location data removed but cannot be shrunk yet; the file was not changed\0",
-        SQUINT_ERR_UNKNOWN_FORMAT => b"the output format asked for is not one squint writes; the file was not changed\0",
-        SQUINT_ERR_UNKNOWN_MODE => b"the mode asked for is not one squint has; the file was not changed\0",
-        SQUINT_ERR_STRIP_GREW => b"metadata was found, but removing it would make the file larger; the original was kept with its metadata\0",
-        SQUINT_ERR_SIGNED => b"this PDF is digitally signed, and any change would break the signature; the file was not changed\0",
-        SQUINT_ERR_ATTACHMENTS => b"nothing else to remove, but this PDF carries attached files, which Strip does not read; the file was not changed\0",
-        SQUINT_ERR_PREVIEW => b"this file's embedded preview has a gain map whose XMP holds more than its rendering parameters; the file was not changed\0",
-        _ => b"unknown error\0",
-    };
-    s.as_ptr() as *const c_char
 }

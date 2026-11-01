@@ -321,7 +321,7 @@ fn main() {
             }
         }
         "score" => {
-            let s = score(&image, &image).unwrap();
+            let s = score(&image, &image).unwrap_or_else(|e| { eprintln!("score failed: {e}"); std::process::exit(1) });
             println!("self-score {s:.4} (sanity check, expect 100)");
         }
         _ => usage(),

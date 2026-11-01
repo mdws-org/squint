@@ -202,7 +202,7 @@ pub(crate) fn capped(img: image::DynamicImage, max_dimension: Option<u32>) -> im
 
 impl Image {
     pub fn from_rgb8(bytes: &[u8], width: usize, height: usize) -> Self {
-        let pixels = bytes.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+        let pixels = bytes.as_chunks::<3>().0.to_vec();
         Image { pixels, width, height }
     }
 
@@ -268,7 +268,7 @@ pub fn oriented<P: Copy + Default>(
         return (pixels.to_vec(), width, height);
     }
     let (w, h) = (width, height);
-    let transposed = matches!(orientation, 5 | 6 | 7 | 8);
+    let transposed = matches!(orientation, 5..=8);
     let (nw, nh) = if transposed { (h, w) } else { (w, h) };
     let mut out = vec![P::default(); w * h];
 
@@ -567,7 +567,7 @@ pub fn search_as(
 
         if s >= target {
             // Satisfies. Keep it if it is the smallest satisfying result so far.
-            let better = best.as_ref().map_or(true, |(b, _)| probe.bytes < b.bytes);
+            let better = best.as_ref().is_none_or(|(b, _)| probe.bytes < b.bytes);
             if better {
                 best = Some((probe, data));
             }
@@ -625,10 +625,10 @@ fn interpolate(probes: &[Probe], target: f64) -> Option<f32> {
     let mut below = None::<&Probe>;
     let mut above = None::<&Probe>;
     for p in probes {
-        if p.score < target && below.map_or(true, |b| p.score > b.score) {
+        if p.score < target && below.is_none_or(|b| p.score > b.score) {
             below = Some(p);
         }
-        if p.score >= target && above.map_or(true, |a| p.score < a.score) {
+        if p.score >= target && above.is_none_or(|a| p.score < a.score) {
             above = Some(p);
         }
     }
@@ -725,7 +725,7 @@ pub fn optimize(
 /// it has ever asked for. Naming another format is a conversion the caller has
 /// decided on, so the result goes beside the original like any other conversion
 /// and nothing is replaced.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "mirrors the C entry point squint_optimize_as, one argument per caller setting")]
 pub fn optimize_as(
     bytes: &[u8],
     format: OutputFormat,
@@ -1016,7 +1016,7 @@ pub fn optimize_as(
     if format == OutputFormat::Jpeg
         && max_dimension.is_none()
         && converted_from.is_none()
-        && gainmap::extract(bytes).map_or(false, |found| found.has_gain_map)
+        && gainmap::extract(bytes).is_some_and(|found| found.has_gain_map)
     {
         let hdr = HdrSource { bytes, orientation };
         return hdr_in_place(&hdr, &image, icc.as_deref(), mode, target, fixed_quality, max_probes, size_to_beat);
@@ -1106,7 +1106,7 @@ struct HdrSource<'a> {
 /// the picture without the map, which does not change it, and the map is
 /// attached once to the encode that was chosen.
 #[cfg(target_os = "macos")]
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "the search settings optimize_as received, passed through unchanged")]
 fn hdr_in_place(
     source: &HdrSource,
     upright: &Image,
@@ -1888,20 +1888,19 @@ mod tests {
     fn ffi_error_reporting_provides_specific_message_and_static_fallbacks() {
         use std::ffi::CStr;
 
-        unsafe {
-            let msg_ptr = ffi::squint_error_message(ffi::SQUINT_ERR_DECODE);
-            let msg = CStr::from_ptr(msg_ptr).to_str().unwrap();
-            assert_eq!(msg, "the image could not be decoded; the file was not changed");
-
-            let msg_opt_ptr = ffi::squint_error_message(ffi::SQUINT_ERR_NO_SMALLER);
-            let msg_opt = CStr::from_ptr(msg_opt_ptr).to_str().unwrap();
-            assert_eq!(msg_opt, "already optimal; a smaller file is not possible");
-
-            let msg_signed = CStr::from_ptr(ffi::squint_error_message(ffi::SQUINT_ERR_SIGNED)).to_str().unwrap();
-            assert_eq!(msg_signed, Error::Signed.to_string());
-        }
+        // `squint_error_message` returns a pointer to a NUL-terminated static
+        // byte string for every code, so each `from_ptr` below reads a valid C
+        // string that lives for the whole program.
+        let message = |code| {
+            // SAFETY: see above; the pointer is never null and never dangles.
+            unsafe { CStr::from_ptr(ffi::squint_error_message(code)) }.to_str().unwrap()
+        };
+        assert_eq!(message(ffi::SQUINT_ERR_DECODE), "the image could not be decoded; the file was not changed");
+        assert_eq!(message(ffi::SQUINT_ERR_NO_SMALLER), "already optimal; a smaller file is not possible");
+        assert_eq!(message(ffi::SQUINT_ERR_SIGNED), Error::Signed.to_string());
 
         let bad_input = b"not an image";
+        // SAFETY: `bad_input` is a live array and the length passed is its own.
         let res = unsafe {
             ffi::squint_optimize(
                 bad_input.as_ptr(),
@@ -1916,13 +1915,15 @@ mod tests {
         assert_ne!(res.error, ffi::SQUINT_OK);
         assert_eq!(res.converted, 0);
         assert!(!res.error_message.is_null());
-        unsafe {
-            let cstr = CStr::from_ptr(res.error_message).to_str().unwrap();
-            assert!(
-                cstr.contains("the file was not changed"),
-                "expected failure message to state the file was not changed, got: {cstr}"
-            );
-            ffi::squint_result_free(res);
-        }
+        // SAFETY: a non-null `error_message` is a NUL-terminated string the
+        // library allocated with `CString::into_raw`, still owned by `res`,
+        // which is not freed until after the borrow below ends.
+        let cstr = unsafe { CStr::from_ptr(res.error_message) }.to_str().unwrap().to_owned();
+        assert!(
+            cstr.contains("the file was not changed"),
+            "expected failure message to state the file was not changed, got: {cstr}"
+        );
+        // SAFETY: `res` came from `squint_optimize` and is freed exactly once.
+        unsafe { ffi::squint_result_free(res) };
     }
 }

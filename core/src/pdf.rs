@@ -150,7 +150,7 @@ fn outermost_filter(stream: &lopdf::Stream) -> Option<Vec<u8>> {
 /// whose pages are all one size tends to declare it once on the root `/Pages`
 /// node and nowhere else: Ghostscript, LibreOffice and Word's export all do.
 /// Read off the leaf alone, such a document has no page size at all.
-fn media_box<'a>(doc: &'a Document, page: ObjectId) -> Option<&'a Vec<Object>> {
+fn media_box(doc: &Document, page: ObjectId) -> Option<&Vec<Object>> {
     let mut node = page;
     // A page tree is a few levels deep; the bound is against a `/Parent` cycle.
     for _ in 0..64 {
