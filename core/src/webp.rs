@@ -422,7 +422,7 @@ mod tests {
         over[4..8].copy_from_slice(&4096u32.to_le_bytes());
         assert!(strip_webp(&over).is_none(), "a size claiming bytes that are not here");
 
-        let mut under = honest.clone();
+        let mut under = honest;
         under[4..8].copy_from_slice(&4u32.to_le_bytes());
         assert!(strip_webp(&under).is_none(), "a size denying chunks that are here");
     }
@@ -535,7 +535,7 @@ mod tests {
 
         // A file this module will not read has no profile to offer either, and
         // must not hand back one read out of a chain that does not close.
-        let mut lying = tagged.clone();
+        let mut lying = tagged;
         lying[4..8].copy_from_slice(&4096u32.to_le_bytes());
         assert_eq!(icc_profile(&lying), None);
     }

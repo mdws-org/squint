@@ -387,7 +387,7 @@ mod tests {
         let primary = stub(&[]);
         let iso = [ISO_TAG, b":-1\0"].concat();
 
-        let joined = attach(&primary, &[map.clone()], Some(&iso)).unwrap();
+        let joined = attach(&primary, std::slice::from_ref(&map), Some(&iso)).unwrap();
         let back = extract(&joined).expect("a secondary should be found");
 
         assert_eq!(back.images, vec![map], "the map must come back byte for byte");
@@ -398,7 +398,7 @@ mod tests {
     #[test]
     fn records_the_map_where_it_actually_lands() {
         let map = stub(&[(0xE1, [XMP_TAG, b"hdrgainmap"].concat())]);
-        let joined = attach(&stub(&[]), &[map.clone()], None).unwrap();
+        let joined = attach(&stub(&[]), std::slice::from_ref(&map), None).unwrap();
         let images = mpf_images(&joined).unwrap();
 
         assert_eq!(images.len(), 2);
@@ -414,7 +414,7 @@ mod tests {
     #[test]
     fn a_secondary_that_is_not_a_gain_map_is_carried_but_not_called_hdr() {
         let other = stub(&[(0xE1, b"something else entirely".to_vec())]);
-        let joined = attach(&stub(&[]), &[other.clone()], None).unwrap();
+        let joined = attach(&stub(&[]), std::slice::from_ref(&other), None).unwrap();
         let back = extract(&joined).expect("the secondary is still carried");
 
         assert_eq!(back.images, vec![other]);

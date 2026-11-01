@@ -1381,7 +1381,7 @@ mod tests {
         let page = vec![
             (0x830E, 7, doubles(&[0.25, 0.25, 0.0])),            // ModelPixelScale
             (0x8482, 7, tiepoint.clone()),                       // ModelTiepoint
-            (0x85D8, 7, transform.clone()),                      // ModelTransformation
+            (0x85D8, 7, transform),                              // ModelTransformation
             (0x87AF, 7, [1u16, 1, 0, 2, 1024, 0, 1, 1, 3072, 0, 1, 32612]
                 .iter().flat_map(|k| k.to_le_bytes()).collect()), // GeoKeyDirectory
             (0x87B0, 7, doubles(&[6378137.0, 298.257223563])),    // GeoDoubleParams
@@ -2492,12 +2492,12 @@ mod tests {
         let exif = exif_payload(1, b"Acme Camera Co\0");
         let first = jpeg(&[(0xE2, b"MPF\0MM\0\x2A")]);
         let second = jpeg(&[(0xE1, &exif)]);
-        for pair in [[first.clone(), second.clone()].concat(), [first.clone(), vec![0, 0, 0xFF, 0xFF], second.clone()].concat()] {
+        for pair in [[first.clone(), second.clone()].concat(), [first, vec![0, 0, 0xFF, 0xFF], second.clone()].concat()] {
             let (cleaned, _) = stripped_preview(&pair);
             let second_at = pair.len() - second.len();
             assert!(payload_of(&cleaned[second_at..], 0xE1).iter().all(|&b| b == 0), "the second image's EXIF was not blanked");
         }
-        let stream = [jpeg(&[]), second.clone()].concat();
+        let stream = [jpeg(&[]), second].concat();
         let tiff = tiff_from(
             &[&stream],
             &[(0x0103, 3, 1, 7), (0x0111, 4, 1, 8), (0x0117, 4, 1, 7), (0x0201, 4, 1, 8), (0x0202, 4, 1, stream.len() as u32)],
@@ -2518,7 +2518,7 @@ mod tests {
         let first = with(with(0).len() as u32 - 10);
         let other_xmp: &[u8] = b"http://ns.adobe.com/xap/1.0/\0<x:xmpmeta><xmp:CreatorTool>iPhone 12 Pro</xmp:CreatorTool></x:xmpmeta>";
         let map = jpeg(&[(0xE1, other_xmp), (0xE1, b"Acme maker data"), (0xE2, iso_map)]);
-        let pair = [first.clone(), map.clone()].concat();
+        let pair = [first.clone(), map].concat();
         let (cleaned, _) = stripped_preview(&pair);
         assert!(!contains(&cleaned, b"iPhone 12 Pro"), "the gain map kept its other XMP");
         assert!(!contains(&cleaned, b"Acme maker"), "the gain map kept its other APP1");
@@ -2643,8 +2643,8 @@ mod tests {
         let index = with(first_len as u32 - 10);
         let first = jpeg(&[(0xE2, &index)]);
         let map = jpeg(&[(0xE2, b"MPF\0MM\0\x2A\0\0\0\x08 Acme"), (0xE1, IPHONE_GAIN_MAP_XMP)]);
-        let (cleaned, _) = stripped_preview(&[first.clone(), map.clone()].concat());
-        let mut expected = index.clone();
+        let (cleaned, _) = stripped_preview(&[first.clone(), map].concat());
+        let mut expected = index;
         expected[12..14].copy_from_slice(&[0, 3]);
         expected[12 + 2 + 36..12 + 2 + 48].fill(0);
         let tail_at = expected.len() - 19;
@@ -2716,7 +2716,7 @@ mod tests {
         let mut first_entry = with(0);
         let entry0 = 6 + 4 + 50 + 8;
         first_entry[entry0..entry0 + 4].copy_from_slice(&(len - 9).to_be_bytes());
-        let pointed = [first_entry, vec![0x42], second.clone()].concat();
+        let pointed = [first_entry, vec![0x42], second].concat();
         assert_eq!(strip_tiff_checked(&tiff_with_preview(&pointed)), Err(Refused::Layout), "an image the first entry names kept its EXIF");
     }
 

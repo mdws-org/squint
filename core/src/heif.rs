@@ -121,7 +121,7 @@ fn compatible_brands(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
     // false size cannot reach beyond the header it belongs to.
     const MAX_BRANDS: usize = 32;
     let end = declared.min(start.saturating_add(MAX_BRANDS * 4));
-    bytes[start..end].chunks_exact(4)
+    bytes[start..end].as_chunks::<4>().0.iter().map(|brand| brand.as_slice())
 }
 
 /// One box: where it starts, how long it is, and how much of that is header.
@@ -176,7 +176,7 @@ fn boxes(bytes: &[u8], range: std::ops::Range<usize>) -> Vec<(&[u8], Box)> {
 ///
 /// `meta` is a full box, so its children start four bytes into its body, past
 /// the version and flags.
-fn find<'a>(bytes: &'a [u8], kind: &[u8]) -> Option<Box> {
+fn find(bytes: &[u8], kind: &[u8]) -> Option<Box> {
     let top = boxes(bytes, 0..bytes.len());
     if let Some((_, b)) = top.iter().find(|(k, _)| *k == kind) {
         return Some(Box { at: b.at, size: b.size, header: b.header });
@@ -1119,13 +1119,13 @@ pub(crate) mod tests {
     fn reports_nothing_wiped_when_there_is_no_metadata() {
         let (heif, exif) = heif_with_exif();
         // Rename the item type so nothing matches what this removes.
-        let mut without = heif.clone();
+        let mut without = heif;
         let at = find_bytes(&without, b"Exif").expect("the declaration");
         without[at..at + 4].copy_from_slice(b"hvc1");
 
         let (out, wiped) = strip_heif(&without).expect("still a heif");
         assert_eq!(wiped, 0, "nothing should have been removed");
-        assert!(contains(&out[exif.clone()], b"GPS"), "and nothing should have been touched");
+        assert!(contains(&out[exif], b"GPS"), "and nothing should have been touched");
     }
 
     #[test]
@@ -1159,10 +1159,9 @@ pub(crate) mod tests {
         // where a following box would sit. Believing the claim reads that
         // FourCC as a compatible brand and renames the picture.
         let mut lying = ftyp(b"heic", &[b"mif1"]);
-        let header = lying.len();
         lying.extend_from_slice(&vec![0u8; 400]);
         lying.extend_from_slice(b"avif");
-        lying.extend_from_slice(&vec![0u8; 64]);
+        lying.extend_from_slice(&[0u8; 64]);
         let total = lying.len() as u32;
         lying[0..4].copy_from_slice(&total.to_be_bytes());
 
@@ -1524,7 +1523,7 @@ pub(crate) mod tests {
         let source = exif_block(Some(values));
         assert_eq!(apple_headroom(&source), Some(values));
 
-        let mut original = source.clone();
+        let mut original = source;
         original.resize(2596, 0x55);
         let written = exif_replacement(&original);
         assert_eq!(written.len(), original.len(), "the item keeps its length");

@@ -27,7 +27,9 @@ impl RgbaImage {
         let (width, height) = (img.width() as usize, img.height() as usize);
         let pixels = img
             .into_raw()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| rgb::RGBA8::new(c[0], c[1], c[2], c[3]))
             .collect();
         Ok(RgbaImage { pixels, width, height })

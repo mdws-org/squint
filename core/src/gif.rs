@@ -190,7 +190,7 @@ mod tests {
             None => 0x00,
         });
         if let Some(power) = lct_size_power {
-            g.extend(std::iter::repeat(0x11).take(3 * (1usize << (power + 1))));
+            g.extend(std::iter::repeat_n(0x11, 3 * (1usize << (power + 1))));
         }
         g.push(0x02);
         g.extend_from_slice(&[0x03, 0x44, 0x00, 0x3B, 0x00]);
@@ -220,7 +220,7 @@ mod tests {
         // aiming at the right byte when the fixture changes.
         let separator = honest.iter().position(|&b| b == 0x2C).expect("an image block");
         let packed_at = separator + 9;
-        let mut lying = honest.clone();
+        let mut lying = honest;
         assert_eq!(lying[packed_at] & 0x80, 0x80, "the test is aimed at the packed byte");
         lying[packed_at] = 0x80 | 0x02;
         assert!(strip_gif(&lying).is_none());

@@ -13,10 +13,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - name: tools compile
         run: python3 -m py_compile tools/corpus-seeds.py tools/corpus-gen.py tools/corpus-run.py tools/jpeg-segments.py
       - name: check
         run: cargo check --locked --all-targets
+        working-directory: core
+      # The lints are the [lints] table in core/Cargo.toml; any warning fails the job.
+      - name: clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
         working-directory: core
       - name: test
         run: cargo test --locked
