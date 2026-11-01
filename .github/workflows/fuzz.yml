@@ -30,6 +30,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
+      # Caches the compiled dependencies in core/fuzz/target and the
+      # cargo-fuzz binary in ~/.cargo/bin, one cache per fuzz target. The key
+      # includes the rustc version, so a new nightly starts a fresh cache.
+      # The engine is recompiled from the checked-out source on every run,
+      # since the checkout is newer than anything restored. Nothing is saved
+      # when a run fails, and the corpus and crash artifacts are not cached.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: core/fuzz -> target
+          key: ${{ matrix.target }}
       - name: install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       - name: seconds for this run

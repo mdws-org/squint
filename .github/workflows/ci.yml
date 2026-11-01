@@ -15,6 +15,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # Caches compiled dependencies; squint-core is rebuilt every run.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: core -> target
       - name: tools compile
         run: python3 -m py_compile tools/corpus-seeds.py tools/corpus-gen.py tools/corpus-run.py tools/jpeg-segments.py
       - name: check
@@ -45,6 +49,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: core -> target
       - name: test
         run: cargo test --locked
         working-directory: core
