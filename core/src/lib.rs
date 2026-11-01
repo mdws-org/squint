@@ -1080,7 +1080,7 @@ pub fn optimize_as(
 
 /// The EXIF orientation that undoes another. Orientations 6 and 8 are quarter
 /// turns in opposite directions; every other one undoes itself.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code, reason = "only the macOS Image I/O path calls it"))]
 fn inverse_orientation(orientation: u16) -> u16 {
     match orientation {
         6 => 8,
