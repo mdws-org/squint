@@ -31,7 +31,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       # Caches the compiled dependencies in core/fuzz/target and the
-      # cargo-fuzz binary in ~/.cargo/bin, one cache per target. The key
+      # cargo-fuzz binary in ~/.cargo/bin, one cache per fuzz target. The key
       # includes the rustc version, so a new nightly starts a fresh cache.
       # The engine is recompiled from the checked-out source on every run,
       # since the checkout is newer than anything restored. Nothing is saved
