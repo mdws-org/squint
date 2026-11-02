@@ -28,8 +28,10 @@ jobs:
       matrix:
         target: [strip, heif, webp, tiff, gif, pdf, png, open]
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: nightly
       # Caches the compiled dependencies in core/fuzz/target and the
       # cargo-fuzz binary in ~/.cargo/bin, one cache per fuzz target. The key
       # includes the rustc version, so a new nightly starts a fresh cache.
@@ -51,7 +53,7 @@ jobs:
         working-directory: core
       - name: keep the crashing input
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-artifacts-${{ matrix.target }}
           path: core/fuzz/artifacts/
