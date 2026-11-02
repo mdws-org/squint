@@ -356,7 +356,7 @@ mod tests {
     fn a_colour_profile_split_across_sub_blocks_is_kept_whole() {
         let profile = icc_profile(300);
         let icc = app_extension_blocks(b"ICCRGBG1012", &[&profile[..255], &profile[255..]]);
-        let source = gif_with(&[icc.clone()], Some(0));
+        let source = gif_with(std::slice::from_ref(&icc), Some(0));
         let (out, _) = strip_gif(&source).expect("a well formed profile strips");
         assert!(out.windows(icc.len()).any(|w| w == icc.as_slice()), "the colour profile changed");
     }
