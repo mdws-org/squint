@@ -12,7 +12,9 @@ pub fn is_gif(bytes: &[u8]) -> bool {
 /// Strip non-essential extension blocks from a GIF stream.
 ///
 /// Returns `Some((output_bytes, bytes_removed))` on success, or `None` if the
-/// stream is malformed or does not reach the trailer cleanly.
+/// stream is malformed, does not reach the trailer cleanly, carries a colour
+/// profile extension holding anything but one whole profile, or carries two
+/// loop counts in one extension.
 pub fn strip_gif(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
     if !is_gif(bytes) {
         return None;
@@ -76,6 +78,9 @@ pub fn strip_gif(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
             // with the name would let a file carry anything it likes through a
             // stripper by prefixing it with a name the stripper keeps.
             let mut application = None;
+            // The data sub-blocks after the name, which is where an
+            // application keeps what it keeps.
+            let mut data: Vec<&[u8]> = Vec::new();
             let mut terminated = false;
 
             while pos < bytes.len() {
@@ -93,6 +98,8 @@ pub fn strip_gif(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
                         application = Some(&bytes[pos..pos + 11]);
                     }
                     first_sub_block = false;
+                } else {
+                    data.push(&bytes[pos..pos + sub_len]);
                 }
                 pos += sub_len;
             }
@@ -109,10 +116,37 @@ pub fn strip_gif(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
             //
             // Everything else goes without being named, which is how a comment,
             // XMP, and whatever a future encoder invents all leave.
-            let keep = matches!(label, 0xF9 | 0x01)
-                || matches!(application, Some(b"NETSCAPE2.0") | Some(b"ICCRGBG1012"));
-            if keep {
-                out.extend_from_slice(&bytes[ext_start..pos]);
+            //
+            // The two kept applications are kept by what their data is, not by
+            // their name alone, since sub-blocks after the data a name promises
+            // would otherwise carry anything through.
+            match application {
+                Some(b"NETSCAPE2.0") => {
+                    // Only the loop count is written back, in its one form:
+                    // sub-block id 1 and a sixteen-bit count. The buffering
+                    // hint (id 2) and anything else alongside it go. Two loop
+                    // counts leave which one a viewer obeys to the viewer.
+                    let mut counts = data.iter().filter(|d| d.len() == 3 && d[0] == 0x01);
+                    match (counts.next(), counts.next()) {
+                        (Some(count), None) => {
+                            out.extend_from_slice(b"\x21\xFF\x0BNETSCAPE2.0\x03");
+                            out.extend_from_slice(count);
+                            out.push(0x00);
+                        }
+                        (None, _) => {}
+                        (Some(_), Some(_)) => return None,
+                    }
+                }
+                // The profile is never dropped, so data that is not exactly one
+                // profile is a refusal rather than a strip.
+                Some(b"ICCRGBG1012") => {
+                    if !is_one_icc_profile(&data.concat()) {
+                        return None;
+                    }
+                    out.extend_from_slice(&bytes[ext_start..pos]);
+                }
+                _ if matches!(label, 0xF9 | 0x01) => out.extend_from_slice(&bytes[ext_start..pos]),
+                _ => {}
             }
         } else if block_type == 0x2C {
             // Image separator 0x2C, 9-byte descriptor, optional local colour table,
@@ -167,6 +201,15 @@ pub fn strip_gif(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
 
     let bytes_removed = bytes.len() - out.len();
     Some((out, bytes_removed))
+}
+
+/// Whether `data` is one ICC profile and nothing else: at least the 128-byte
+/// header, the `acsp` signature where the header carries it, and a declared
+/// size equal to the bytes present.
+fn is_one_icc_profile(data: &[u8]) -> bool {
+    data.len() >= 128
+        && &data[36..40] == b"acsp"
+        && u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize == data.len()
 }
 
 #[cfg(test)]
@@ -245,7 +288,7 @@ mod tests {
             &[
                 comment,
                 app_extension(b"NETSCAPE2.0", &[0x01, 0x00, 0x00]),
-                app_extension(b"ICCRGBG1012", b"profile bytes"),
+                app_extension(b"ICCRGBG1012", &icc_profile(128)),
             ],
             Some(0),
         );
@@ -267,6 +310,55 @@ mod tests {
         let source = gif_with(&[spoof], Some(0));
         let (out, _) = strip_gif(&source).expect("walks cleanly");
         assert!(!out.windows(3).any(|w| w == b"gps"), "a spoofed name kept its payload");
+    }
+
+    /// A colour profile header that declares its own length: the size field,
+    /// then `acsp` where every ICC profile carries it.
+    fn icc_profile(len: usize) -> Vec<u8> {
+        let mut p = vec![0u8; len];
+        p[0..4].copy_from_slice(&(len as u32).to_be_bytes());
+        p[36..40].copy_from_slice(b"acsp");
+        p
+    }
+
+    /// An application extension with its data split across sub-blocks.
+    fn app_extension_blocks(id: &[u8], blocks: &[&[u8]]) -> Vec<u8> {
+        let mut e = vec![0x21, 0xFF, id.len() as u8];
+        e.extend_from_slice(id);
+        for b in blocks {
+            e.push(b.len() as u8);
+            e.extend_from_slice(b);
+        }
+        e.push(0x00);
+        e
+    }
+
+    #[test]
+    fn a_payload_after_a_kept_application_extensions_data_does_not_survive() {
+        // The name in the first sub-block decides what is kept, so the
+        // sub-blocks after the data it names are the place to hide anything.
+        let loop_count = app_extension_blocks(b"NETSCAPE2.0", &[&[0x01, 0x00, 0x00], b"gps 51.5,-0.12"]);
+        let source = gif_with(&[loop_count], Some(0));
+        if let Some((out, _)) = strip_gif(&source) {
+            assert!(!out.windows(3).any(|w| w == b"gps"), "a payload after the loop count survived");
+            assert!(out.windows(11).any(|w| w == b"NETSCAPE2.0"), "the loop count was dropped");
+        }
+
+        let profile = icc_profile(128);
+        let icc = app_extension_blocks(b"ICCRGBG1012", &[&profile, b"gps 51.5,-0.12"]);
+        let source = gif_with(&[icc], Some(0));
+        if let Some((out, _)) = strip_gif(&source) {
+            assert!(!out.windows(3).any(|w| w == b"gps"), "a payload after the colour profile survived");
+        }
+    }
+
+    #[test]
+    fn a_colour_profile_split_across_sub_blocks_is_kept_whole() {
+        let profile = icc_profile(300);
+        let icc = app_extension_blocks(b"ICCRGBG1012", &[&profile[..255], &profile[255..]]);
+        let source = gif_with(std::slice::from_ref(&icc), Some(0));
+        let (out, _) = strip_gif(&source).expect("a well formed profile strips");
+        assert!(out.windows(icc.len()).any(|w| w == icc.as_slice()), "the colour profile changed");
     }
 
     fn build_test_gif() -> Vec<u8> {

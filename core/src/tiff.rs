@@ -539,6 +539,10 @@ struct Kept {
     edits: std::collections::BTreeMap<usize, Vec<u8>>,
     /// Pages whose next link names no page and is written back as zero.
     cut: std::collections::HashSet<usize>,
+    /// Directories an Exif, GPS or interoperability directory's next link
+    /// names, walked and stripped as pages: the metadata directory is wiped,
+    /// link and all, and nothing else need reach them.
+    onward: Vec<usize>,
 }
 
 /// Where a removed entry's data lies, as `(start, value end, declared end)`;
@@ -680,6 +684,12 @@ fn protected(reader: &Reader, first: usize) -> Result<Kept, Refused> {
     let mut cut = std::collections::HashSet::new();
     // The metadata directories that cut links pointed at.
     let mut cut_to = std::collections::HashSet::new();
+    // Next links of metadata directories, followed last of all. One naming
+    // another metadata directory names something wiped anyway; any other is
+    // walked as a page, which a camera's thumbnail directory is, and its tags
+    // go with the rest.
+    let mut metadata_links = Vec::new();
+    let mut onward = Vec::new();
 
     loop {
         let (at, is_page) = match queue.pop() {
@@ -694,7 +704,18 @@ fn protected(reader: &Reader, first: usize) -> Result<Kept, Refused> {
                     }
                     continue;
                 }
-                None => break,
+                None => match metadata_links.pop() {
+                    Some(link) => {
+                        if seen.get(&link) != Some(&false) {
+                            onward.push(link);
+                            if queued.insert((link, true)) {
+                                queue.push((link, true));
+                            }
+                        }
+                        continue;
+                    }
+                    None => break,
+                },
             },
         };
         if at == 0 {
@@ -797,18 +818,20 @@ fn protected(reader: &Reader, first: usize) -> Result<Kept, Refused> {
             }
         }
 
-        // Only pages form a chain. An Exif directory's next link, which some
-        // cameras point at the thumbnail page, is not followed.
-        if is_page {
-            if let Some(next) = reader.u32(at + 2 + entries.len() * 12).filter(|&next| next != 0) {
+        // Pages form the chain. An Exif directory's next link, which some
+        // cameras point at the thumbnail page, is followed after it.
+        if let Some(next) = reader.u32(at + 2 + entries.len() * 12).filter(|&next| next != 0) {
+            if is_page {
                 chained.push((at, next as usize));
+            } else if (next as usize) < reader.bytes.len() {
+                // A link past the end names nothing the file holds.
+                metadata_links.push(next as usize);
             }
         }
     }
     // A metadata directory a cut link pointed at may itself hold pixels, the
-    // page the file also calls metadata, or link on to a page nothing else
-    // reaches, which would then never be stripped. Either way the file is
-    // refused.
+    // page the file also calls metadata, or link on to a directory that was
+    // not walked as a page. Either way the file is refused.
     for &directory in &cut_to {
         let entries = reader.entries(directory);
         let holds_pixels = entries.iter().any(|(_, tag, _, _)| PIXEL_RANGES.iter().any(|&(offsets, _)| offsets == *tag));
@@ -834,7 +857,7 @@ fn protected(reader: &Reader, first: usize) -> Result<Kept, Refused> {
     }
     out.extend(streams);
     let all = merged(out.iter().chain(&resolutions).copied().collect());
-    Ok(Kept { all, strict: merged(out), edits, cut })
+    Ok(Kept { all, strict: merged(out), edits, cut, onward })
 }
 
 /// The bytes Strip promises never to change in a file it strips: the header,
@@ -910,10 +933,15 @@ fn strip_pages(reader: &Reader, first: usize, keep: &Kept) -> Option<(Vec<u8>, u
     // Exif, GPS and interoperability directories already wiped.
     let mut wiped = std::collections::HashSet::new();
     // Pages still to strip: the chain from the header, less the links
-    // `protected` cut, and every directory a page lists in SubIFDs. Each
-    // offset is queued once.
+    // `protected` cut, every directory a page lists in SubIFDs, and every
+    // page a metadata directory's next link names. Each offset is queued once.
     let mut queue = vec![first];
     let mut queued = std::collections::HashSet::from([first]);
+    for &page in &keep.onward {
+        if queued.insert(page) {
+            queue.push(page);
+        }
+    }
     let mut budget = MAX_DIRECTORIES;
     // Each page's directory as it is to be written back: where it lies, the
     // entries it keeps, its link to the next page, and where it used to end.
@@ -1255,8 +1283,8 @@ mod tests {
         assert!(!contains(&out, b"2026:10:19"), "the capture date stayed");
         assert_eq!(next_link(&out, dir), 0, "the link to the Exif directory stayed");
         assert_eq!(&out[8..24], &tiff[8..24], "the pixels moved");
-        // That Exif directory linking on to a page nothing else reaches: cut,
-        // the page would never be stripped, so the file is refused.
+        // That Exif directory linking on to a page nothing else reaches: the
+        // page is walked from the link and stripped with the rest.
         let mut onward = tiff.clone();
         let page = onward.len();
         onward.extend_from_slice(&3u16.to_le_bytes());
@@ -1267,7 +1295,10 @@ mod tests {
         }
         onward.extend_from_slice(&[0; 4]);
         onward[exif + 2 + 12..exif + 2 + 16].copy_from_slice(&(page as u32).to_le_bytes());
-        assert_eq!(strip_tiff_checked(&onward), Err(Refused::Layout), "a page behind the Exif directory went unstripped");
+        let (out, _) = strip_tiff(&onward).expect("the page behind the Exif directory strips");
+        assert_eq!(tags_at(&out, page), [0x0111, 0x0117], "the page behind the Exif directory kept its artist");
+        assert!(!contains(&out, b"Ben\0"), "the artist's name stayed");
+        assert_eq!(&out[8..24], &tiff[8..24], "the pixels moved");
     }
 
     /// An Exif directory that a page's next link points at and that names
@@ -1726,6 +1757,34 @@ mod tests {
         tiff[4..8].copy_from_slice(&(first as u32).to_le_bytes());
         let (out, _) = strip_tiff(&tiff).expect("an ordinary camera layout was refused");
         assert!(!contains(&out, b"2026:10:18 23:00"));
+    }
+
+    /// A directory that only the Exif directory's next link reaches is still
+    /// a directory of the file, with tags of its own: here a camera.
+    #[test]
+    fn a_directory_reached_only_from_an_exif_directorys_next_link_is_stripped() {
+        let mut tiff = b"II\x2A\x00\0\0\0\0".to_vec();
+        let (px, thumb_px) = (tiff.len(), tiff.len() + 16);
+        tiff.extend_from_slice(&[0xA1; 32]);
+        let date = tiff.len();
+        tiff.extend_from_slice(b"2026:10:18 23:00:00\0");
+        let make = tiff.len();
+        tiff.extend_from_slice(b"HiddenCam Mark II\0");
+        let ifd1 = tiff.len();
+        tiff.extend_from_slice(&directory(&[(0x010F, 2, 18, make as u32), (0x0111, 4, 1, thumb_px as u32), (0x0117, 4, 1, 16)]));
+        let exif = tiff.len();
+        let mut exif_dir = directory(&[(0x9003, 2, 20, date as u32)]);
+        let n = exif_dir.len();
+        exif_dir[n - 4..].copy_from_slice(&(ifd1 as u32).to_le_bytes());
+        tiff.extend_from_slice(&exif_dir);
+        let first = tiff.len();
+        tiff.extend_from_slice(&directory(&[(0x0111, 4, 1, px as u32), (0x0117, 4, 1, 16), (0x8769, 4, 1, exif as u32)]));
+        tiff[4..8].copy_from_slice(&(first as u32).to_le_bytes());
+        if let Some((out, _)) = strip_tiff(&tiff) {
+            assert!(!contains(&out, b"HiddenCam"), "the unlinked directory's camera stayed");
+            assert!(!contains(&out, b"2026:10:18 23:00"));
+            assert_eq!(&out[px..px + 32], &tiff[px..px + 32], "the pixels moved");
+        }
     }
 
     /// The SubIFDs values one walk reads are bounded in total, not only per

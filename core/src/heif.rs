@@ -172,21 +172,31 @@ fn boxes(bytes: &[u8], range: std::ops::Range<usize>) -> Vec<(&[u8], Box)> {
     out
 }
 
-/// Find a box by kind at the top level, then inside `meta`.
+/// Find a box by kind inside the file-level `meta`, where HEIF puts the item
+/// index (`iinf`, `iloc`).
+///
+/// `None` unless the file has one such box in one place. A second copy at the
+/// top level, a second `meta`, or a second copy inside `meta` is an index a
+/// reader may take instead of the one read here, so metadata it locates
+/// could survive a strip that read the other.
 ///
 /// `meta` is a full box, so its children start four bytes into its body, past
 /// the version and flags.
 fn find(bytes: &[u8], kind: &[u8]) -> Option<Box> {
     let top = boxes(bytes, 0..bytes.len());
-    if let Some((_, b)) = top.iter().find(|(k, _)| *k == kind) {
-        return Some(Box { at: b.at, size: b.size, header: b.header });
+    if top.iter().any(|(k, _)| *k == kind) {
+        return None;
     }
-    let (_, meta) = top.into_iter().find(|(k, _)| *k == b"meta")?;
+    let mut metas = top.into_iter().filter(|(k, _)| *k == b"meta");
+    let (Some((_, meta)), None) = (metas.next(), metas.next()) else {
+        return None;
+    };
     let children = meta.at + meta.header + 4..meta.at + meta.size;
-    boxes(bytes, children)
-        .into_iter()
-        .find(|(k, _)| *k == kind)
-        .map(|(_, b)| b)
+    let mut found = boxes(bytes, children).into_iter().filter(|(k, _)| *k == kind);
+    match (found.next(), found.next()) {
+        (Some((_, b)), None) => Some(b),
+        _ => None,
+    }
 }
 
 /// One entry of `iinf`: the item's identifier, its type, and for a `mime`
@@ -394,7 +404,9 @@ pub fn is_complete(bytes: &[u8]) -> bool {
 ///
 /// A metadata item this cannot locate in place, or whose bytes overlap the
 /// declarations or another item, is a refusal: reporting success while the
-/// metadata survives is worse than not stripping.
+/// metadata survives is worse than not stripping. So is an index that could
+/// be read two ways: an item located twice, or an `iinf` or `iloc` that is
+/// not the only one inside the only file-level `meta`.
 pub fn strip_heif(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
     if !is_isobmff_image(bytes) {
         return None;
@@ -403,6 +415,12 @@ pub fn strip_heif(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
     let iloc = find(bytes, b"iloc")?;
     let items = item_types(bytes, &iinf);
     let places = item_extents(bytes, &iloc)?;
+    // An item is located once. Located twice, one entry is the one read here
+    // and the other may be the one a reader takes.
+    let mut located = std::collections::HashSet::new();
+    if !places.iter().all(|p| located.insert(p.id)) {
+        return None;
+    }
     let is_metadata = |id: u32| {
         items
             .iter()
@@ -1572,6 +1590,59 @@ pub(crate) mod tests {
         heif[second_entry + 4..second_entry + 6].copy_from_slice(&1u16.to_be_bytes());
         assert!(strip_heif(&heif).is_none(), "an EXIF item not in this file was reported as removed");
         assert!(contains(&heif[exif], b"GPS"));
+    }
+
+    /// One box as `(kind, start, end)`.
+    type Child = ([u8; 4], usize, usize);
+
+    /// The top-level `meta` box of a fixture and its body's children.
+    fn meta_children(heif: &[u8]) -> (std::ops::Range<usize>, Vec<Child>) {
+        let (_, meta) = boxes(heif, 0..heif.len()).into_iter().find(|(k, _)| *k == b"meta").expect("meta");
+        let children = boxes(heif, meta.at + meta.header + 4..meta.at + meta.size)
+            .into_iter()
+            .map(|(k, b)| ([k[0], k[1], k[2], k[3]], b.at, b.at + b.size))
+            .collect();
+        (meta.at..meta.at + meta.size, children)
+    }
+
+    #[test]
+    fn a_decoy_index_outside_meta_does_not_hide_the_exif() {
+        let (heif, _) = heif_with_exif();
+        let (_, children) = meta_children(&heif);
+        let child = |kind: &[u8; 4]| children.iter().find(|c| &c.0 == kind).map(|c| heif[c.1..c.2].to_vec()).expect("child");
+        // A top-level copy of the index in which the EXIF item is declared a
+        // picture: read first, it says there is no metadata to remove.
+        let mut decoy_iinf = child(b"iinf");
+        let exif_type = find_bytes(&decoy_iinf, b"Exif").expect("the EXIF item");
+        decoy_iinf[exif_type..exif_type + 4].copy_from_slice(b"hvc1");
+        let mut decoyed = heif.clone();
+        decoyed.extend_from_slice(&decoy_iinf);
+        decoyed.extend_from_slice(&child(b"iloc"));
+        if let Some((out, _)) = strip_heif(&decoyed) {
+            assert!(!contains(&out, b"GPS 51.5 N"), "a top-level decoy index kept the location");
+        }
+
+        // Two file-level `meta` boxes: which one a reader takes is its own
+        // choice, so neither is trusted.
+        let (meta, _) = meta_children(&heif);
+        let mut twice = heif.clone();
+        twice.extend_from_slice(&heif[meta]);
+        assert!(strip_heif(&twice).is_none(), "a second meta box was not refused");
+    }
+
+    #[test]
+    fn an_item_located_twice_is_refused() {
+        // The picture's entry renumbered as the EXIF item: the first entry
+        // for that item then names the picture, and the EXIF goes unread.
+        let (mut heif, _) = heif_with_exif();
+        let (_, children) = meta_children(&heif);
+        let iloc = children.iter().find(|c| &c.0 == b"iloc").expect("iloc");
+        let first_entry = iloc.1 + 8 + 4 + 2 + 2;
+        assert_eq!(&heif[first_entry..first_entry + 2], &1u16.to_be_bytes(), "the test is aimed at the first item id");
+        heif[first_entry..first_entry + 2].copy_from_slice(&2u16.to_be_bytes());
+        if let Some((out, _)) = strip_heif(&heif) {
+            assert!(!contains(&out, b"GPS 51.5 N"), "a repeated item id kept the location");
+        }
     }
 
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
