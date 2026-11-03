@@ -14,7 +14,7 @@ oxipng = { version = "10", default-features = false, features = ["parallel", "zo
 rgb = "0.8"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 resvg = "0.48"
-lopdf = { version = "0.45", default-features = false }
+lopdf = { version = "0.46", default-features = false }
 
 [features]
 default = ["lossy-png"]
