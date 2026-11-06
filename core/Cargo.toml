@@ -13,7 +13,7 @@ imagequant = { version = "4.4", optional = true }
 oxipng = { version = "10", default-features = false, features = ["parallel", "zopfli"] }
 rgb = "0.8"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
-resvg = "0.48"
+resvg = "0.49"
 lopdf = { version = "0.47", default-features = false }
 
 [features]
