@@ -48,8 +48,15 @@ jobs:
         id: budget
         run: |
           if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then echo "seconds=900" >> "$GITHUB_OUTPUT"; else echo "seconds=60" >> "$GITHUB_OUTPUT"; fi
+      # A target with a directory under fuzz/seeds starts from those files as
+      # well. libFuzzer writes new inputs only to the first directory, so the
+      # committed seeds are read and never changed.
       - name: fuzz ${{ matrix.target }}
-        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=${{ steps.budget.outputs.seconds }} -max_len=262144 -timeout=20
+        run: |
+          corpus=(fuzz/corpus/${{ matrix.target }})
+          mkdir -p "${corpus[0]}"
+          if [ -d fuzz/seeds/${{ matrix.target }} ]; then corpus+=(fuzz/seeds/${{ matrix.target }}); fi
+          cargo fuzz run ${{ matrix.target }} "${corpus[@]}" -- -max_total_time=${{ steps.budget.outputs.seconds }} -max_len=262144 -timeout=20
         working-directory: core
       - name: keep the crashing input
         if: failure()
