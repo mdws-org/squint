@@ -70,6 +70,9 @@ pub struct SquintResult {
     /// Files attached inside a PDF, kept as they were because no mode reads
     /// them. Zero for every other format and on failure.
     pub attachments: c_int,
+    /// JavaScript actions removed from a PDF. Zero for every other format and
+    /// on failure.
+    pub scripts: c_int,
 }
 
 impl SquintResult {
@@ -88,6 +91,7 @@ impl SquintResult {
             error_message,
             converted: 0,
             attachments: 0,
+            scripts: 0,
         }
     }
 }
@@ -230,6 +234,7 @@ pub unsafe extern "C" fn squint_optimize_as(
                 error_message: std::ptr::null_mut(),
                 converted: if out.converted_from.is_some() { 1 } else { 0 },
                 attachments: c_int::try_from(out.attachments).unwrap_or(c_int::MAX),
+                scripts: c_int::try_from(out.scripts).unwrap_or(c_int::MAX),
             }
         }
         Err(e) => SquintResult::failure(code_for(&e), input_len, Some(&e.to_string())),
@@ -366,6 +371,12 @@ mod tests {
             "<</Type/Filespec/F(a.txt)/EF<</F 5 0 R>>>>".to_string(),
             "<</Type/EmbeddedFile/Length 5>>stream\nhello\nendstream".to_string(),
         ];
+        assembled(&objects)
+    }
+
+    /// A PDF holding `objects` as objects 1, 2 and on, with the first as the
+    /// catalog and the third as the info dictionary.
+    fn assembled(objects: &[String]) -> Vec<u8> {
         let mut out = String::from("%PDF-1.7\n");
         let mut offsets = Vec::new();
         for (i, body) in objects.iter().enumerate() {
@@ -389,6 +400,21 @@ mod tests {
         let r = call(&pdf, SQUINT_FORMAT_JPEG, SQUINT_MODE_STRIP);
         assert_eq!(r.error, SQUINT_OK, "{}", message(&r));
         assert_eq!(r.attachments, 1);
+        free(r);
+    }
+
+    /// The count of scripts removed reaches the app with the result, so the row
+    /// can say they went.
+    #[test]
+    fn a_strip_reports_the_scripts_it_removed_from_a_pdf() {
+        let objects = [
+            "<</Type/Catalog/Pages 2 0 R/OpenAction<</S/JavaScript/JS(app.alert\\(1\\))>>>>".to_string(),
+            "<</Type/Pages/Kids[]/Count 0>>".to_string(),
+            format!("<</Producer({})>>", "x".repeat(4000)),
+        ];
+        let r = call(&assembled(&objects), SQUINT_FORMAT_JPEG, SQUINT_MODE_STRIP);
+        assert_eq!(r.error, SQUINT_OK, "{}", message(&r));
+        assert_eq!(r.scripts, 1);
         free(r);
     }
 

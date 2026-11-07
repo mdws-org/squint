@@ -58,6 +58,10 @@ pub struct Rewritten {
     /// Files attached to the document. No mode reads or changes them, so the
     /// caller can say so rather than present the document as clean.
     pub attachments: usize,
+    /// JavaScript actions removed. Also counted in `metadata_removed`, so a
+    /// document whose only removable content is a script is not reported as
+    /// having nothing to remove.
+    pub scripts: usize,
 }
 
 /// Files attached to the document, as a reader finds them: every filespec
@@ -446,7 +450,9 @@ pub fn rewrite(
     drop_usage_rights(&mut doc);
     let orphaned = drop_orphaned_signatures(&mut doc, &reached, &rights);
 
+    let scripts = remove_scripts(&mut doc);
     let metadata_removed = orphaned
+        + scripts
         + strip_document_metadata(&mut doc)
         + strip_image_metadata(&mut doc, mode == Mode::Strip)?;
 
@@ -468,6 +474,7 @@ pub fn rewrite(
             images_seen: 0,
             metadata_removed,
             attachments,
+            scripts,
         });
     }
 
@@ -547,7 +554,7 @@ pub fn rewrite(
     doc.save_modern(&mut out)
         .map_err(|e| Error::Encode(format!("this PDF could not be written: {e}")))?;
 
-    Ok(Rewritten { data: out, images_rewritten, images_seen, metadata_removed, attachments: attachment_count(&doc) })
+    Ok(Rewritten { data: out, images_rewritten, images_seen, metadata_removed, attachments: attachment_count(&doc), scripts })
 }
 
 /// Draw a picture smaller, through the same filter every other cap here uses.
@@ -676,12 +683,172 @@ fn strip_document_metadata(doc: &mut Document) -> usize {
     removed
 }
 
+/// Whether a dictionary is a JavaScript action: one whose /S is /JavaScript,
+/// or any that carries a /JS script, which a rendition action can as well.
+fn is_script_action(dict: &lopdf::Dictionary) -> bool {
+    dict.has(b"JS") || dict.get(b"S").and_then(Object::as_name).map(|n| n == b"JavaScript").unwrap_or(false)
+}
+
+/// Whether a value is a JavaScript action, written inline or as a reference
+/// to one of `scripts`.
+fn is_script(value: &Object, scripts: &BTreeSet<ObjectId>) -> bool {
+    match value {
+        Object::Reference(id) => scripts.contains(id),
+        Object::Dictionary(d) => is_script_action(d),
+        _ => false,
+    }
+}
+
+/// Remove every JavaScript action from the document, and return how many.
+///
+/// A script is a payload of its own in a file being shared, and the scripts a
+/// document carries commonly write the author or the tool into it. They are
+/// reached four ways: the catalog's /Names /JavaScript tree, run when the
+/// document opens; /OpenAction; an /AA dictionary of trigger actions on the
+/// catalog, a page, an annotation or a field; and an /A or /Next action on a
+/// link or an outline item. Every entry whose value is a JavaScript action is
+/// removed wherever it sits, the /JavaScript tree goes whole, an /AA left
+/// with nothing in it goes, and the action objects, their script streams and
+/// the tree's nodes are deleted, because the save writes every object whether
+/// anything refers to it or not.
+fn remove_scripts(doc: &mut Document) -> usize {
+    let mut scripts: BTreeSet<ObjectId> = BTreeSet::new();
+    let mut doomed: BTreeSet<ObjectId> = BTreeSet::new();
+    for (id, object) in &doc.objects {
+        let dict = match object {
+            Object::Dictionary(d) => d,
+            Object::Stream(s) => &s.dict,
+            _ => continue,
+        };
+        if is_script_action(dict) {
+            scripts.insert(*id);
+            if let Ok(Object::Reference(body)) = dict.get(b"JS") {
+                doomed.insert(*body);
+            }
+        }
+    }
+    doomed.extend(remove_javascript_tree(doc));
+
+    let mut inline = 0;
+    let mut emptied: BTreeSet<ObjectId> = BTreeSet::new();
+    for (id, object) in doc.objects.iter_mut() {
+        if scripts.contains(id) {
+            continue;
+        }
+        inline += scrub_scripts(object, &scripts);
+        if matches!(object, Object::Dictionary(d) if d.is_empty()) {
+            emptied.insert(*id);
+        }
+    }
+    // An /AA held as an object of its own and emptied above.
+    for object in doc.objects.values_mut() {
+        let dict = match object {
+            Object::Dictionary(d) => d,
+            Object::Stream(s) => &mut s.dict,
+            _ => continue,
+        };
+        if matches!(dict.get(b"AA"), Ok(Object::Reference(aa)) if emptied.contains(aa)) {
+            dict.remove(b"AA");
+        }
+    }
+    for id in scripts.iter().chain(&doomed) {
+        doc.objects.remove(id);
+    }
+    scripts.len() + inline
+}
+
+/// Take the /JavaScript tree off the catalog's /Names, returning the ids of
+/// its nodes. Every value in the tree is a script, so nothing in it is kept.
+fn remove_javascript_tree(doc: &mut Document) -> BTreeSet<ObjectId> {
+    let Ok(root) = doc.trailer.get(b"Root").and_then(Object::as_reference) else { return BTreeSet::new() };
+    let names = match doc.get_object(root).and_then(Object::as_dict).and_then(|c| c.get(b"Names")) {
+        Ok(Object::Reference(id)) => Some(*id),
+        _ => None,
+    };
+    let tree = match names {
+        Some(id) => doc.get_object_mut(id).and_then(Object::as_dict_mut).ok().and_then(|n| n.remove(b"JavaScript")),
+        None => doc
+            .get_object_mut(root)
+            .and_then(Object::as_dict_mut)
+            .and_then(|c| c.get_mut(b"Names"))
+            .and_then(Object::as_dict_mut)
+            .ok()
+            .and_then(|n| n.remove(b"JavaScript")),
+    };
+    let mut nodes = BTreeSet::new();
+    let mut stack: Vec<Object> = tree.into_iter().collect();
+    while let Some(node) = stack.pop() {
+        let dict = match node {
+            Object::Reference(id) => {
+                if !nodes.insert(id) {
+                    continue;
+                }
+                match doc.get_object(id).and_then(Object::as_dict) {
+                    Ok(d) => d.clone(),
+                    Err(_) => continue,
+                }
+            }
+            Object::Dictionary(d) => d,
+            _ => continue,
+        };
+        if let Ok(Object::Array(kids)) = dict.get(b"Kids") {
+            stack.extend(kids.iter().cloned());
+        }
+    }
+    nodes
+}
+
+/// Remove script actions from one object and everything written inside it,
+/// returning how many of them were written inline. One referred to by id is
+/// counted where it is deleted.
+fn scrub_scripts(object: &mut Object, scripts: &BTreeSet<ObjectId>) -> usize {
+    match object {
+        Object::Dictionary(d) => scrub_script_entries(d, scripts),
+        Object::Stream(s) => scrub_script_entries(&mut s.dict, scripts),
+        Object::Array(items) => {
+            let inline = items.iter().filter(|o| matches!(o, Object::Dictionary(d) if is_script_action(d))).count();
+            items.retain(|o| !is_script(o, scripts));
+            inline + items.iter_mut().map(|o| scrub_scripts(o, scripts)).sum::<usize>()
+        }
+        _ => 0,
+    }
+}
+
+fn scrub_script_entries(dict: &mut lopdf::Dictionary, scripts: &BTreeSet<ObjectId>) -> usize {
+    let found: Vec<(Vec<u8>, bool)> = dict
+        .iter()
+        .filter(|(_, v)| is_script(v, scripts))
+        .map(|(k, v)| (k.clone(), matches!(v, Object::Dictionary(_))))
+        .collect();
+    let mut inline = 0;
+    for (key, written_inline) in found {
+        dict.remove(&key);
+        inline += usize::from(written_inline);
+    }
+    for (_, value) in dict.iter_mut() {
+        inline += scrub_scripts(value, scripts);
+    }
+    if matches!(dict.get(b"AA"), Ok(Object::Dictionary(aa)) if aa.is_empty()) {
+        dict.remove(b"AA");
+    }
+    if matches!(dict.get(b"Next"), Ok(Object::Array(next)) if next.is_empty()) {
+        dict.remove(b"Next");
+    }
+    inline
+}
+
 /// Who wrote each comment and when, and an application's private editing
 /// data. An annotation's /T names its author and /M and /CreationDate date it;
 /// its /Contents is the comment itself and stays. /PieceInfo, on a page or the
 /// catalog, is where Illustrator, Acrobat and others keep their own data, and
 /// /LastModified dates the page. A page may hold its annotations in an array
 /// of its own, through a reference to one, or as dictionaries in the array.
+///
+/// An annotation can also be reached without being in any /Annots: as a form
+/// field's widget, through the AcroForm's /Fields and each field's /Kids; as
+/// the comment another replies to, through /IRT; and as a comment's pop-up,
+/// through /Popup. Those are scrubbed too, and whatever is reached through
+/// /Fields or /Kids keeps its /T, which there is a field's name.
 fn strip_annotations_and_piece_info(doc: &mut Document) -> usize {
     let mut removed = 0;
     let mut annotations: BTreeSet<ObjectId> = BTreeSet::new();
@@ -708,12 +875,72 @@ fn strip_annotations_and_piece_info(doc: &mut Document) -> usize {
             removed += scrub_annotation_array(items, &mut annotations);
         }
     }
+    let fields = reached_annotations(doc, &mut annotations);
     for id in annotations {
         if let Ok(annot) = doc.get_dictionary_mut(id) {
-            removed += scrub_annotation(annot);
+            removed += if fields.contains(&id) { scrub_dates(annot) } else { scrub_annotation(annot) };
         }
     }
     removed
+}
+
+/// Add to `annotations` every annotation and field reached from it through
+/// /IRT and /Popup, and from the AcroForm's /Fields through /Kids. Returns
+/// the ones reached as fields.
+fn reached_annotations(doc: &Document, annotations: &mut BTreeSet<ObjectId>) -> BTreeSet<ObjectId> {
+    let reference = |o: &Object| o.as_reference().ok();
+    let resolved = |o: &Object| -> Option<lopdf::Dictionary> {
+        match o {
+            Object::Reference(id) => doc.get_object(*id).and_then(Object::as_dict).ok().cloned(),
+            Object::Dictionary(d) => Some(d.clone()),
+            _ => None,
+        }
+    };
+    let array = |o: &Object| -> Vec<Object> {
+        match o {
+            Object::Reference(id) => doc.get_object(*id).and_then(Object::as_array).cloned().unwrap_or_default(),
+            Object::Array(items) => items.clone(),
+            _ => Vec::new(),
+        }
+    };
+    let roots = doc
+        .catalog()
+        .ok()
+        .and_then(|c| c.get(b"AcroForm").ok())
+        .and_then(resolved)
+        .and_then(|form| form.get(b"Fields").ok().map(array))
+        .unwrap_or_default();
+
+    let mut fields = BTreeSet::new();
+    let mut stack: Vec<(ObjectId, bool)> = annotations.iter().map(|id| (*id, false)).collect();
+    stack.extend(roots.iter().filter_map(reference).map(|id| (id, true)));
+    let mut seen: BTreeSet<(ObjectId, bool)> = BTreeSet::new();
+    while let Some((id, as_field)) = stack.pop() {
+        if !seen.insert((id, as_field)) {
+            continue;
+        }
+        annotations.insert(id);
+        if as_field {
+            fields.insert(id);
+        }
+        let Ok(dict) = doc.get_dictionary(id) else { continue };
+        for key in [&b"IRT"[..], b"Popup"] {
+            if let Some(next) = dict.get(key).ok().and_then(reference) {
+                stack.push((next, false));
+            }
+        }
+        if as_field {
+            if let Ok(kids) = dict.get(b"Kids") {
+                stack.extend(array(kids).iter().filter_map(reference).map(|kid| (kid, true)));
+            }
+        }
+    }
+    fields
+}
+
+/// Remove an annotation's or a field's dates and nothing else.
+fn scrub_dates(annot: &mut lopdf::Dictionary) -> usize {
+    [&b"M"[..], b"CreationDate"].iter().map(|key| usize::from(annot.remove(key).is_some())).sum()
 }
 
 /// Scrub the annotations held in an /Annots array itself, and collect the ones
@@ -738,10 +965,7 @@ fn scrub_annotation_array(items: &mut [Object], referred: &mut BTreeSet<ObjectId
 fn scrub_annotation(annot: &mut lopdf::Dictionary) -> usize {
     let is_field = annot.has(b"FT")
         || annot.get(b"Subtype").and_then(|s| s.as_name()).map(|n| n == b"Widget").unwrap_or(false);
-    let mut removed = 0;
-    for key in [&b"M"[..], b"CreationDate"] {
-        removed += usize::from(annot.remove(key).is_some());
-    }
+    let mut removed = scrub_dates(annot);
     if !is_field {
         removed += usize::from(annot.remove(b"T").is_some());
     }
@@ -1075,6 +1299,107 @@ mod tests {
         let inline = Object::Dictionary(note(Object::string_literal("Ben Meadows")));
         one_page(&mut doc, dictionary! { "Annots" => Object::Array(vec![inline]) }, dictionary! { "MediaBox" => rect(612, 792) });
         assert!(!mentions(&strip_and_reload(&mut doc), b"Ben Meadows"), "an inline annotation kept its author");
+    }
+
+    fn script(source: Object) -> lopdf::Dictionary {
+        dictionary! { "S" => name("JavaScript"), "JS" => source }
+    }
+
+    /// Whether any dictionary in a document still has `key`.
+    fn any_has(doc: &Document, key: &[u8]) -> bool {
+        fn holds(o: &Object, key: &[u8]) -> bool {
+            match o {
+                Object::Array(items) => items.iter().any(|i| holds(i, key)),
+                Object::Dictionary(d) => d.has(key) || d.iter().any(|(_, v)| holds(v, key)),
+                Object::Stream(s) => s.dict.has(key) || s.dict.iter().any(|(_, v)| holds(v, key)),
+                _ => false,
+            }
+        }
+        doc.objects.values().any(|o| holds(o, key)) || doc.trailer.iter().any(|(_, v)| holds(v, key))
+    }
+
+    /// A document carrying a script in each of the places a reader runs one
+    /// from: the /JavaScript name tree, /OpenAction, the catalog's and a
+    /// page's /AA, and a link's /A with another behind it in /Next. Five
+    /// scripts, two of them inline.
+    fn scripted() -> Document {
+        let mut doc = Document::with_version("1.5");
+        let body = doc.add_object(Object::Stream(lopdf::Stream::new(dictionary! {}, b"/* closed by Ben Meadows */".to_vec())));
+        let on_close = doc.add_object(script(Object::Reference(body)));
+        let named = doc.add_object(script(Object::string_literal("this.info.author = 'Ben Meadows';")));
+        let tree = doc.add_object(dictionary! { "Names" => Object::Array(vec![Object::string_literal("init"), Object::Reference(named)]) });
+        let then = doc.add_object(script(Object::string_literal("app.beep(0);")));
+        let link = doc.add_object(dictionary! {
+            "Type" => name("Annot"), "Subtype" => name("Link"), "Rect" => rect(10, 10),
+            "A" => dictionary! { "S" => name("URI"), "URI" => Object::string_literal("https://example.com/"),
+                "Next" => Object::Array(vec![Object::Reference(then)]) },
+        });
+        one_page(
+            &mut doc,
+            dictionary! { "Annots" => Object::Array(vec![Object::Reference(link)]),
+                "AA" => dictionary! { "O" => script(Object::string_literal("console.println('page');")) } },
+            dictionary! { "MediaBox" => rect(612, 792) },
+        );
+        let root = doc.trailer.get(b"Root").and_then(Object::as_reference).unwrap();
+        let catalog = doc.get_dictionary_mut(root).unwrap();
+        catalog.set("Names", dictionary! { "JavaScript" => Object::Reference(tree) });
+        catalog.set("OpenAction", script(Object::string_literal("app.alert('opened');")));
+        catalog.set("AA", dictionary! { "WC" => Object::Reference(on_close) });
+        doc
+    }
+
+    #[test]
+    fn every_script_goes_and_the_count_says_how_many() {
+        let mut bytes = Vec::new();
+        scripted().save_to(&mut bytes).unwrap();
+        for mode in [Mode::Strip, Mode::Fast] {
+            let out = rewrite(&bytes, mode, 80.0, 75.0, 1, None).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(out.scripts, 5, "{mode:?} counted the wrong number of scripts");
+            let after = Document::load_mem(&out.data).unwrap();
+            for key in [&b"JS"[..], b"JavaScript", b"OpenAction", b"AA", b"Next"] {
+                assert!(!any_has(&after, key), "{mode:?} left a /{}", String::from_utf8_lossy(key));
+            }
+            assert!(!mentions(&after, b"Ben Meadows"), "{mode:?} left a script's text in the file");
+            assert!(!mentions(&after, b"JavaScript"), "{mode:?} left an action naming JavaScript");
+            assert!(mentions(&after, b"https://example.com/"), "{mode:?} removed the link the script followed");
+        }
+    }
+
+    /// A widget reached only through the form's /Fields and a field's /Kids,
+    /// and a comment reached only as the one another replies to, kept their
+    /// dates, and the comment its author: only /Annots was read.
+    #[test]
+    fn annotations_reached_through_fields_kids_and_replies_lose_authors_and_dates() {
+        const DATE: &str = "D:20260101120000Z";
+        let mut doc = Document::with_version("1.5");
+        let original = doc.add_object(dictionary! {
+            "Type" => name("Annot"), "Subtype" => name("Text"), "Rect" => rect(10, 10),
+            "T" => Object::string_literal("Ben Meadows"), "M" => Object::string_literal(DATE),
+            "CreationDate" => Object::string_literal(DATE), "Contents" => Object::string_literal("original"),
+        });
+        let reply = doc.add_object(dictionary! {
+            "Type" => name("Annot"), "Subtype" => name("Text"), "Rect" => rect(10, 10),
+            "IRT" => Object::Reference(original), "Contents" => Object::string_literal("reply"),
+        });
+        let field = doc.new_object_id();
+        let widget = doc.add_object(dictionary! {
+            "Type" => name("Annot"), "Subtype" => name("Widget"), "Rect" => rect(10, 10), "Parent" => Object::Reference(field),
+            "M" => Object::string_literal(DATE), "CreationDate" => Object::string_literal(DATE),
+        });
+        doc.objects.insert(field, Object::Dictionary(dictionary! {
+            "FT" => name("Tx"), "T" => Object::string_literal("customer_name"), "Kids" => Object::Array(vec![Object::Reference(widget)]),
+        }));
+        one_page(&mut doc, dictionary! { "Annots" => Object::Array(vec![Object::Reference(reply)]) }, dictionary! { "MediaBox" => rect(612, 792) });
+        let root = doc.trailer.get(b"Root").and_then(Object::as_reference).unwrap();
+        doc.get_dictionary_mut(root)
+            .unwrap()
+            .set("AcroForm", dictionary! { "Fields" => Object::Array(vec![Object::Reference(field)]) });
+
+        let after = strip_and_reload(&mut doc);
+        assert!(!mentions(&after, b"Ben Meadows"), "the replied-to comment kept its author");
+        assert!(!mentions(&after, DATE.as_bytes()), "a date survived");
+        assert!(mentions(&after, b"customer_name"), "the field lost its name");
+        assert!(mentions(&after, b"original"), "the comment itself went");
     }
 
     /// A form field's widget is an annotation too, and there /T is the field's

@@ -692,6 +692,8 @@ pub struct Optimized {
     /// Files attached inside a PDF, kept as they were: no mode reads them.
     /// Zero for every other format.
     pub attachments: usize,
+    /// JavaScript actions removed from a PDF. Zero for every other format.
+    pub scripts: usize,
 }
 
 /// Optimize an encoded image, dispatching on its format.
@@ -769,6 +771,7 @@ pub fn optimize_as(
                 original_bytes: bytes.len(),
                 converted_from: None,
                 attachments: r.attachments,
+                scripts: r.scripts,
             });
         }
 
@@ -792,6 +795,7 @@ pub fn optimize_as(
                 original_bytes: bytes.len(),
                 converted_from: None,
                 attachments: 0,
+                scripts: 0,
             });
         }
 
@@ -816,6 +820,7 @@ pub fn optimize_as(
                 original_bytes: bytes.len(),
                 converted_from: None,
                 attachments: 0,
+                scripts: 0,
             });
         }
 
@@ -846,6 +851,7 @@ pub fn optimize_as(
                 original_bytes: bytes.len(),
                 converted_from: None,
                 attachments: 0,
+                scripts: 0,
             });
         }
 
@@ -880,6 +886,7 @@ pub fn optimize_as(
             original_bytes: bytes.len(),
             converted_from: None,
             attachments: 0,
+            scripts: 0,
         });
     }
 
@@ -946,6 +953,7 @@ pub fn optimize_as(
             original_bytes: bytes.len(),
             converted_from: None,
             attachments: r.attachments,
+            scripts: r.scripts,
         });
     }
 
@@ -976,6 +984,7 @@ pub fn optimize_as(
             original_bytes: bytes.len(),
             converted_from: None,
             attachments: 0,
+            scripts: 0,
         });
     }
 
@@ -1077,6 +1086,7 @@ pub fn optimize_as(
         original_bytes: bytes.len(),
         converted_from,
         attachments: 0,
+        scripts: 0,
     })
 }
 
@@ -1154,6 +1164,7 @@ fn hdr_in_place(
         original_bytes: source.bytes.len(),
         converted_from: None,
         attachments: 0,
+        scripts: 0,
     })
 }
 

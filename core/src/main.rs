@@ -24,6 +24,15 @@ fn attachments_note(n: usize) -> String {
     }
 }
 
+/// Scripts removed from a PDF, for the same line.
+fn scripts_note(n: usize) -> String {
+    match n {
+        0 => String::new(),
+        1 => "  1 script removed".into(),
+        n => format!("  {n} scripts removed"),
+    }
+}
+
 fn usage() -> ! {
     eprintln!(
         "usage: squint <image> [--mode fast|quality] [--target <score>] [--quality <n>] [--probes <n>]
@@ -124,12 +133,13 @@ fn main() {
         match optimize(&bytes, Mode::Strip, 0.0, 0.0, None, probes, None) {
             Ok(r) => {
                 println!(
-                    "{}  {:>7.0} KB -> {:>7.0} KB  {:>5.1}%  metadata removed, pixels untouched{}{}  {:.3}s",
+                    "{}  {:>7.0} KB -> {:>7.0} KB  {:>5.1}%  metadata removed, pixels untouched{}{}{}  {:.3}s",
                     path,
                     bytes.len() as f64 / 1024.0,
                     r.data.len() as f64 / 1024.0,
                     100.0 * r.data.len() as f64 / bytes.len() as f64,
                     hdr_note(r.hdr),
+                    scripts_note(r.scripts),
                     attachments_note(r.attachments),
                     t0.elapsed().as_secs_f64()
                 );
@@ -199,7 +209,7 @@ fn main() {
         match optimize_as(&bytes, format, requested, target, fixed_quality, png_min_quality, probes, None) {
             Ok(r) => {
                 println!(
-                    "{}  {} {:>7.0} KB -> {:>7.0} KB  {:>5.1}%  images re-encoded in place  {:.3}s",
+                    "{}  {} {:>7.0} KB -> {:>7.0} KB  {:>5.1}%  images re-encoded in place{}{}  {:.3}s",
                     path,
                     match pages {
                         Some(n) => format!("{n} pages "),
@@ -208,6 +218,8 @@ fn main() {
                     bytes.len() as f64 / 1024.0,
                     r.data.len() as f64 / 1024.0,
                     100.0 * r.data.len() as f64 / bytes.len() as f64,
+                    scripts_note(r.scripts),
+                    attachments_note(r.attachments),
                     t0.elapsed().as_secs_f64()
                 );
                 if let Some(o) = &out_path {

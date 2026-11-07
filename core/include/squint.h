@@ -65,6 +65,9 @@ typedef struct {
     // through as they arrived; the app says so rather than calling the
     // document clean. Zero for every other format and on failure.
     int attachments;
+    // JavaScript actions removed from a PDF, which the app reports. Zero for
+    // every other format and on failure.
+    int scripts;
 } SquintResult;
 
 // The input format is detected from the bytes. HEIC is decoded for fast and
