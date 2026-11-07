@@ -7,7 +7,7 @@ final class Job: ObservableObject, Identifiable {
         case waiting
         case working
         /// Finished and smaller.
-        case done(bytes: Int, originalBytes: Int, score: Double?, hdr: Engine.Hdr, quantized: Bool, outputExtension: String, attachments: Int)
+        case done(bytes: Int, originalBytes: Int, score: Double?, hdr: Engine.Hdr, quantized: Bool, outputExtension: String, attachments: Int, scripts: Int, qualityFallback: Bool)
         /// Finished, but the file was already as small as it can be.
         case alreadyOptimal
         case failed(String)
@@ -41,7 +41,7 @@ final class Job: ObservableObject, Identifiable {
         case .alreadyOptimal:
             return mode == .strip ? "nothing to remove" : "already optimal"
         case .failed(let message): return message
-        case .done(let bytes, let original, let score, let hdr, let quantized, let outputExtension, let attachments):
+        case .done(let bytes, let original, let score, let hdr, let quantized, let outputExtension, let attachments, let scripts, let qualityFallback):
             let saved = 100 - (100 * Double(bytes) / Double(original))
             // Strip is run to answer a question about the file's contents, not
             // its size, so it leads with what came out. A byte count is the
@@ -66,6 +66,15 @@ final class Job: ObservableObject, Identifiable {
             // between a smaller file and a changed picture.
             if quantized {
                 text += ", colours reduced"
+            }
+            // The target that was set was not searched for, which the row has
+            // to say: the result was encoded at the fixed quality.
+            if qualityFallback {
+                text += ", too large to search, so shrunk at a fixed quality"
+            }
+            // A script is a payload of its own, so removing one is said.
+            if scripts > 0 {
+                text += scripts == 1 ? ", 1 script removed" : ", \(scripts) scripts removed"
             }
             // Files attached to a PDF come through as they arrived. Strip did
             // not read them, so a location inside one would still be there.

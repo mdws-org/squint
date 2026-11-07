@@ -65,6 +65,12 @@ typedef struct {
     // through as they arrived; the app says so rather than calling the
     // document clean. Zero for every other format and on failure.
     int attachments;
+    // JavaScript actions removed from a PDF, which the app reports. Zero for
+    // every other format and on failure.
+    int scripts;
+    // Non-zero when quality mode was asked for and the picture has more pixels
+    // than a search may take on, so it was encoded once at the fixed quality.
+    int quality_fallback;
 } SquintResult;
 
 // The input format is detected from the bytes. HEIC is decoded for fast and

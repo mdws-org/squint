@@ -55,6 +55,11 @@ enum Engine {
         /// Files attached inside a PDF. The engine reads none of them, so a
         /// Strip cannot vouch for what they carry.
         let attachments: Int
+        /// JavaScript actions removed from a PDF.
+        let scripts: Int
+        /// Quality was asked for, but the picture was too large to search and
+        /// was encoded once at the fixed quality.
+        let qualityFallback: Bool
 
         var ratio: Double { Double(data.count) / Double(originalBytes) }
 
@@ -116,7 +121,9 @@ enum Engine {
             quantized: result.quantized != 0,
             originalBytes: result.original_len,
             converted: result.converted != 0,
-            attachments: Int(result.attachments)
+            attachments: Int(result.attachments),
+            scripts: Int(result.scripts),
+            qualityFallback: result.quality_fallback != 0
         )
     }
 }

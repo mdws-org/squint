@@ -72,14 +72,10 @@ pub fn strip_gif(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
             let ext_start = pos;
             pos += 2;
 
-            let mut first_sub_block = true;
-            // An application extension is identified by exactly eleven bytes in
-            // its first sub-block. Accepting a longer one that merely starts
-            // with the name would let a file carry anything it likes through a
-            // stripper by prefixing it with a name the stripper keeps.
-            let mut application = None;
-            // The data sub-blocks after the name, which is where an
-            // application keeps what it keeps.
+            // The first sub-block is the extension's fixed header: an
+            // application's name, a graphic control's four bytes, a plain
+            // text's grid. What follows it is the extension's data.
+            let mut first: Option<&[u8]> = None;
             let mut data: Vec<&[u8]> = Vec::new();
             let mut terminated = false;
 
@@ -93,13 +89,11 @@ pub fn strip_gif(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
                 if pos + sub_len > bytes.len() {
                     return None;
                 }
-                if first_sub_block {
-                    if label == 0xFF && sub_len == 11 {
-                        application = Some(&bytes[pos..pos + 11]);
-                    }
-                    first_sub_block = false;
+                let block = &bytes[pos..pos + sub_len];
+                if first.is_none() {
+                    first = Some(block);
                 } else {
-                    data.push(&bytes[pos..pos + sub_len]);
+                    data.push(block);
                 }
                 pos += sub_len;
             }
@@ -117,9 +111,15 @@ pub fn strip_gif(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
             // Everything else goes without being named, which is how a comment,
             // XMP, and whatever a future encoder invents all leave.
             //
-            // The two kept applications are kept by what their data is, not by
-            // their name alone, since sub-blocks after the data a name promises
-            // would otherwise carry anything through.
+            // Every kept extension is kept by what its data is, not by its
+            // label or name alone, since sub-blocks after the data a label
+            // promises would otherwise carry anything through.
+            //
+            // An application extension is identified by exactly eleven bytes in
+            // its first sub-block. Accepting a longer one that merely starts
+            // with the name would let a file carry anything it likes through a
+            // stripper by prefixing it with a name the stripper keeps.
+            let application = first.filter(|f| label == 0xFF && f.len() == 11);
             match application {
                 Some(b"NETSCAPE2.0") => {
                     // Only the loop count is written back, in its one form:
@@ -145,7 +145,34 @@ pub fn strip_gif(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
                     }
                     out.extend_from_slice(&bytes[ext_start..pos]);
                 }
-                _ if matches!(label, 0xF9 | 0x01) => out.extend_from_slice(&bytes[ext_start..pos]),
+                // A graphic control is one sub-block of four bytes: flags, a
+                // two byte delay and a transparent index. Those four are
+                // written back and anything after them goes. A first block of
+                // any other length is not one this walk can read.
+                _ if label == 0xF9 => match first {
+                    Some(control) if control.len() == 4 => {
+                        out.extend_from_slice(&[0x21, 0xF9, 0x04]);
+                        out.extend_from_slice(control);
+                        out.push(0x00);
+                    }
+                    _ => return None,
+                },
+                // A plain text extension draws its text into a grid of cells,
+                // one character to a cell, and a viewer stops drawing where the
+                // grid ends. Text past that point is never drawn, so it is not
+                // picture, and it goes.
+                _ if label == 0x01 => {
+                    let grid = first.filter(|f| f.len() == 12)?;
+                    let text = data.concat();
+                    let kept = &text[..text.len().min(plain_text_cells(grid)?)];
+                    out.extend_from_slice(&[0x21, 0x01, 0x0C]);
+                    out.extend_from_slice(grid);
+                    for block in kept.chunks(255) {
+                        out.push(block.len() as u8);
+                        out.extend_from_slice(block);
+                    }
+                    out.push(0x00);
+                }
                 _ => {}
             }
         } else if block_type == 0x2C {
@@ -201,6 +228,20 @@ pub fn strip_gif(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
 
     let bytes_removed = bytes.len() - out.len();
     Some((out, bytes_removed))
+}
+
+/// How many characters a plain text extension's grid holds, from its twelve
+/// byte header: the grid's width and height in pixels at bytes 4 and 6, and a
+/// cell's width and height at bytes 8 and 9. `None` for a cell with no size,
+/// which describes no grid at all.
+fn plain_text_cells(grid: &[u8]) -> Option<usize> {
+    let width = u16::from_le_bytes([grid[4], grid[5]]) as usize;
+    let height = u16::from_le_bytes([grid[6], grid[7]]) as usize;
+    let (cell_width, cell_height) = (grid[8] as usize, grid[9] as usize);
+    if cell_width == 0 || cell_height == 0 {
+        return None;
+    }
+    Some((width / cell_width) * (height / cell_height))
 }
 
 /// Whether `data` is one ICC profile and nothing else: at least the 128-byte
@@ -359,6 +400,56 @@ mod tests {
         let source = gif_with(std::slice::from_ref(&icc), Some(0));
         let (out, _) = strip_gif(&source).expect("a well formed profile strips");
         assert!(out.windows(icc.len()).any(|w| w == icc.as_slice()), "the colour profile changed");
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// An extension with its first sub-block and then the data after it.
+    fn extension(label: u8, blocks: &[&[u8]]) -> Vec<u8> {
+        let mut e = vec![0x21, label];
+        for b in blocks {
+            e.push(b.len() as u8);
+            e.extend_from_slice(b);
+        }
+        e.push(0x00);
+        e
+    }
+
+    #[test]
+    fn a_graphic_control_keeps_its_four_bytes_and_nothing_after_them() {
+        let control: &[u8] = &[0x04, 0x0A, 0x00, 0x01];
+        let source = gif_with(&[extension(0xF9, &[control, b"uid=jdoe gps 51.5,-0.12"])], Some(0));
+        let (out, wiped) = strip_gif(&source).expect("a graphic control with a payload strips");
+        assert!(!contains(&out, b"gps 51.5"), "a payload after the graphic control survived");
+        assert!(contains(&out, &[0x21, 0xF9, 0x04, 0x04, 0x0A, 0x00, 0x01, 0x00]), "the frame delay was lost");
+        assert_eq!(wiped, 1 + b"uid=jdoe gps 51.5,-0.12".len());
+    }
+
+    #[test]
+    fn a_graphic_control_of_another_length_is_refused() {
+        let source = gif_with(&[extension(0xF9, &[b"\x04\x0A\x00\x01gps"])], Some(0));
+        assert!(strip_gif(&source).is_none());
+    }
+
+    #[test]
+    fn plain_text_past_the_end_of_its_grid_does_not_survive() {
+        // A grid 16 by 8 pixels of 8 by 8 cells holds two characters.
+        let grid: &[u8] = &[0, 0, 0, 0, 16, 0, 8, 0, 8, 8, 1, 0];
+        let source = gif_with(&[extension(0x01, &[grid, b"OKuid=jdoe gps 51.5,-0.12"])], Some(0));
+        let (out, _) = strip_gif(&source).expect("a plain text extension strips");
+        assert!(!contains(&out, b"gps 51.5"), "text past the grid survived");
+        let mut drawn = vec![0x21, 0x01, 0x0C];
+        drawn.extend_from_slice(grid);
+        drawn.extend_from_slice(&[2, b'O', b'K', 0x00]);
+        assert!(contains(&out, &drawn), "the text the grid draws was not kept as it was");
+    }
+
+    #[test]
+    fn plain_text_whose_header_is_not_twelve_bytes_is_refused() {
+        let source = gif_with(&[extension(0x01, &[&[0u8; 11], b"text"])], Some(0));
+        assert!(strip_gif(&source).is_none());
     }
 
     fn build_test_gif() -> Vec<u8> {

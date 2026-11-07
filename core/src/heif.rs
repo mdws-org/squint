@@ -380,6 +380,9 @@ pub fn is_complete(bytes: &[u8]) -> bool {
 
 /// Remove a HEIF's metadata where it lies, leaving the picture untouched.
 ///
+/// Besides the items below, every item's name is cleared, and metadata boxes
+/// are turned into `free` boxes as `free_metadata_boxes` describes.
+///
 /// Returns the result and how many bytes were replaced. Zero means the file
 /// carried none of the items this removes, which is a different outcome from a
 /// failure and is reported as one.
@@ -474,9 +477,65 @@ pub fn strip_heif(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
         }
         wiped += old.len();
     }
+    wiped += clear_item_names(bytes, &iinf, &mut out);
     wiped += free_metadata_boxes(bytes, &mut out);
     Some((out, wiped))
 }
+
+/// Clear the name every `infe` entry carries, returning how many bytes of
+/// name were cleared.
+///
+/// The name is free text a writer may fill with anything, a file name such as
+/// `IMG_0042.HEIC` included. It is the first of the entry's null-terminated
+/// strings; a `mime` item's content type and encoding, and a `uri ` item's
+/// type, follow it. Those are moved up to sit after an empty name and the
+/// bytes they leave are zeroed, so the entry keeps its length, nothing else in
+/// the file moves, and every string after the name still reads as itself.
+fn clear_item_names(bytes: &[u8], iinf: &Box, out: &mut [u8]) -> usize {
+    let body = iinf.body();
+    let entries = &bytes[body.clone()];
+    if entries.is_empty() {
+        return 0;
+    }
+    let mut at = if entries[0] == 0 { 6 } else { 8 };
+    let mut cleared = 0;
+    while at + 12 <= entries.len() {
+        let size = u32::from_be_bytes([entries[at], entries[at + 1], entries[at + 2], entries[at + 3]]) as usize;
+        if size < 12 || at + size > entries.len() {
+            break;
+        }
+        let entry = &entries[at..at + size];
+        // After the twelve byte FullBox header: versions 0 and 1 hold a
+        // sixteen bit id and protection index before the name; version 2 adds
+        // the four byte type, and version 3 widens the id to thirty-two bits.
+        let name_at = match entry[8] {
+            0 | 1 => Some(16),
+            2 => Some(20),
+            3 => Some(22),
+            _ => None,
+        };
+        if let (b"infe", Some(name_at)) = (&entry[4..8], name_at.filter(|n| *n < size)) {
+            let field = &entry[name_at..];
+            let name_len = field.iter().position(|b| *b == 0).unwrap_or(field.len());
+            if name_len > 0 {
+                let rest = &field[(name_len + 1).min(field.len())..];
+                let mut replacement = vec![0u8; field.len()];
+                replacement[1..1 + rest.len()].copy_from_slice(rest);
+                let start = body.start + at + name_at;
+                out[start..start + field.len()].copy_from_slice(&replacement);
+                cleared += name_len;
+            }
+        }
+        at += size;
+    }
+    cleared
+}
+
+/// Boxes inside the file-level `meta` that hold metadata rather than anything
+/// a picture is drawn from: XMP as text or binary XML (`xml `, `bxml`),
+/// QuickTime metadata keys and values (`keys`, `ilst`), and user data
+/// (`udta`).
+const META_METADATA_BOXES: [&[u8; 4]; 5] = [b"xml ", b"bxml", b"keys", b"ilst", b"udta"];
 
 /// `uuid` user types of top-level boxes holding metadata: C2PA content
 /// credentials (author, tools, edit history) and XMP in Adobe's box form.
@@ -491,6 +550,7 @@ const METADATA_UUIDS: [[u8; 16]; 2] = [
 /// records stay true.
 ///
 /// - A top-level `uuid` box whose user type is in `METADATA_UUIDS`.
+/// - A box in the file-level `meta` whose kind is in `META_METADATA_BOXES`.
 /// - `udta` and `meta` inside the movie box and inside each of its tracks:
 ///   an animated AVIF or a HEIF sequence keeps location (`©xyz`), copyright
 ///   and the like there.
@@ -504,6 +564,13 @@ fn free_metadata_boxes(bytes: &[u8], out: &mut [u8]) -> usize {
             freed += free_in_place(out, &b);
         } else if kind == b"moov" {
             freed += free_movie_metadata(bytes, out, body);
+        } else if kind == b"meta" && body.len() >= 4 {
+            // A full box: its children start past the version and flags.
+            for (inner, m) in boxes(bytes, body.start + 4..body.end) {
+                if META_METADATA_BOXES.iter().any(|k| k[..] == *inner) {
+                    freed += free_in_place(out, &m);
+                }
+            }
         }
     }
     freed
@@ -1058,6 +1125,98 @@ pub(crate) mod tests {
         assert!(out[exif].iter().all(|b| *b == 0), "the payload should be zeroed");
         // The coded picture is sixteen bytes of 0xAA and must be untouched.
         assert_eq!(out.iter().filter(|b| **b == 0xAA).count(), 16);
+    }
+
+    /// `heif` with `extra` inserted at `at`, the boxes starting at each of
+    /// `enclosing` grown to hold it, and every extent past it moved along, so
+    /// the result is laid out as a writer would have laid it out.
+    fn inserted(heif: &[u8], at: usize, extra: &[u8], enclosing: &[usize]) -> Vec<u8> {
+        let mut out = [&heif[..at], extra, &heif[at..]].concat();
+        for &b in enclosing {
+            let size = u32::from_be_bytes([out[b], out[b + 1], out[b + 2], out[b + 3]]) as usize;
+            out[b..b + 4].copy_from_slice(&be32((size + extra.len()) as u32));
+        }
+        // `heif_with_exif` writes a version 1 `iloc` of sixteen byte entries,
+        // each holding one four byte offset at its ninth byte.
+        let iloc = find(&out, b"iloc").expect("an index");
+        let count = u16::from_be_bytes([out[iloc.at + 14], out[iloc.at + 15]]) as usize;
+        for k in 0..count {
+            let o = iloc.at + 16 + k * 16 + 8;
+            let offset = u32::from_be_bytes([out[o], out[o + 1], out[o + 2], out[o + 3]]) as usize;
+            if offset >= at {
+                out[o..o + 4].copy_from_slice(&be32((offset + extra.len()) as u32));
+            }
+        }
+        out
+    }
+
+    /// Where the file-level `meta` starts and ends.
+    fn meta_of(heif: &[u8]) -> (usize, usize) {
+        let (_, meta) = boxes(heif, 0..heif.len()).into_iter().find(|(k, _)| *k == b"meta").expect("meta");
+        (meta.at, meta.at + meta.size)
+    }
+
+    #[test]
+    fn xmp_and_quicktime_metadata_inside_meta_are_removed() {
+        let (heif, _) = heif_with_exif();
+        let (meta_at, meta_end) = meta_of(&heif);
+        let extra = [
+            bmff_box(b"xml ", b"\0\0\0\0<x:xmpmeta>GPS 33.4484,-112.0740</x:xmpmeta>"),
+            bmff_box(b"bxml", b"\0\0\0\0binary xml naming Jane Q Roofer"),
+            bmff_box(b"keys", &[&[0u8; 8][..], &bmff_box(b"mdta", b"com.apple.quicktime.author")].concat()),
+            bmff_box(b"ilst", &bmff_box(&[0, 0, 0, 1], &bmff_box(b"data", b"\0\0\0\x01\0\0\0\0Jane Doe"))),
+        ]
+        .concat();
+        let source = inserted(&heif, meta_end, &extra, &[meta_at]);
+        assert!(strip_heif(&heif).is_some(), "the control must strip");
+
+        let (out, _) = strip_heif(&source).expect("a well formed heif");
+        assert_eq!(out.len(), source.len(), "nothing moves");
+        for mark in [&b"GPS 33.4484"[..], b"Jane Q Roofer", b"quicktime.author", b"Jane Doe"] {
+            assert!(!contains(&out, mark), "{} survived", String::from_utf8_lossy(mark));
+        }
+        assert!(!contains(&out, b"GPS 51.5 N"), "the EXIF item survived");
+        assert_eq!(out.iter().filter(|b| **b == 0xAA).count(), 16, "the picture changed");
+        let (twice, _) = strip_heif(&out).expect("still well formed");
+        assert_eq!(twice, out, "a second strip changed the file again");
+    }
+
+    #[test]
+    fn an_item_name_is_cleared_and_the_item_keeps_its_type() {
+        let (heif, _) = heif_with_exif();
+        let (meta_at, _) = meta_of(&heif);
+        let iinf = find(&heif, b"iinf").expect("an item list");
+        // The first entry follows the list's version, flags and count, and
+        // `heif_with_exif` ends it at the type, with no name at all.
+        let infe = iinf.at + 14;
+        let size = u32::from_be_bytes([heif[infe], heif[infe + 1], heif[infe + 2], heif[infe + 3]]) as usize;
+        let source = inserted(&heif, infe + size, b"IMG_0042.HEIC\0", &[meta_at, iinf.at, infe]);
+        assert!(contains(&source, b"IMG_0042"));
+
+        let (out, _) = strip_heif(&source).expect("a well formed heif");
+        assert!(!contains(&out, b"IMG_0042"), "the item name survived");
+        let items = item_types(&out, &find(&out, b"iinf").expect("an item list"));
+        assert_eq!(&items[0].kind, b"hvc1");
+    }
+
+    #[test]
+    fn a_mime_items_name_goes_and_its_content_type_still_reads() {
+        let (heif, _) = heif_with_exif();
+        let (meta_at, _) = meta_of(&heif);
+        let iinf = find(&heif, b"iinf").expect("an item list");
+        let first = iinf.at + 14;
+        let size = u32::from_be_bytes([heif[first], heif[first + 1], heif[first + 2], heif[first + 3]]) as usize;
+        let second = first + size;
+        let mut source = heif;
+        source[second + 16..second + 20].copy_from_slice(b"mime");
+        let strings = b"photo at 51.5 N.xmp\0application/rdf+xml\0";
+        let source = inserted(&source, second + size, strings, &[meta_at, iinf.at, second]);
+
+        let (out, _) = strip_heif(&source).expect("a well formed heif");
+        assert!(!contains(&out, b"photo at 51.5"), "the item name survived");
+        let items = item_types(&out, &find(&out, b"iinf").expect("an item list"));
+        assert_eq!(&items[1].kind, b"mime");
+        assert_eq!(items[1].content_type, b"application/rdf+xml", "the content type no longer reads");
     }
 
     /// One ISOBMFF box with a 32-bit size.

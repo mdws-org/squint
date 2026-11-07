@@ -3,7 +3,7 @@
 //! This drives the engine without a user interface so that quality and speed can
 //! be measured against real photographs before any application exists.
 
-use squint_core::{score, optimize, optimize_as, png, Hdr, Mode, OutputFormat, Source, JPEG_SCORE_CEILING};
+use squint_core::{score, optimize, optimize_as, png, Hdr, Mode, OutputFormat, Source, JPEG_SCORE_CEILING, max_quality_pixels};
 use std::time::Instant;
 
 /// How the gain map fared, for the line the harness prints.
@@ -21,6 +21,54 @@ fn attachments_note(n: usize) -> String {
         0 => String::new(),
         1 => "  1 attached file kept unread".into(),
         n => format!("  {n} attached files kept unread"),
+    }
+}
+
+/// Scripts removed from a PDF, for the same line.
+fn scripts_note(n: usize) -> String {
+    match n {
+        0 => String::new(),
+        1 => "  1 script removed".into(),
+        n => format!("  {n} scripts removed"),
+    }
+}
+
+/// A quality search skipped because the picture is too large to search.
+fn fallback_note(fell_back: bool) -> String {
+    if fell_back {
+        format!(
+            "  over {} MP, so encoded once at the fixed quality rather than searched",
+            max_quality_pixels() / 1_000_000
+        )
+    } else {
+        String::new()
+    }
+}
+
+/// What a file looked like when it was read: its length and when it was last
+/// written. A file whose stamp has changed since is not the file that was read.
+type Stamp = Option<(u64, std::time::SystemTime)>;
+
+fn stamp(path: &str) -> Stamp {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
+}
+
+/// Write a result to `out`, unless `out` is the source and the source has
+/// changed since it was read: the result was made from the old bytes, and
+/// writing it would replace whatever was written in the meantime.
+fn try_write_out(out: &str, data: &[u8], source: &str, read_at: Stamp) -> Result<(), String> {
+    let same = std::fs::canonicalize(out).ok().is_some_and(|o| std::fs::canonicalize(source).ok() == Some(o));
+    if same && (read_at.is_none() || stamp(source) != read_at) {
+        return Err(format!("{source} changed while squint was working on it, so nothing was written"));
+    }
+    std::fs::write(out, data).map_err(|e| format!("write failed: {e}"))
+}
+
+fn write_out(out: &str, data: &[u8], source: &str, read_at: Stamp) {
+    if let Err(e) = try_write_out(out, data, source, read_at) {
+        eprintln!("{e}");
+        std::process::exit(1)
     }
 }
 
@@ -96,6 +144,8 @@ fn main() {
         i += 2;
     }
 
+    // Taken before the read, so that a write landing between the two is seen.
+    let read_at = stamp(path);
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
@@ -124,17 +174,18 @@ fn main() {
         match optimize(&bytes, Mode::Strip, 0.0, 0.0, None, probes, None) {
             Ok(r) => {
                 println!(
-                    "{}  {:>7.0} KB -> {:>7.0} KB  {:>5.1}%  metadata removed, pixels untouched{}{}  {:.3}s",
+                    "{}  {:>7.0} KB -> {:>7.0} KB  {:>5.1}%  metadata removed, pixels untouched{}{}{}  {:.3}s",
                     path,
                     bytes.len() as f64 / 1024.0,
                     r.data.len() as f64 / 1024.0,
                     100.0 * r.data.len() as f64 / bytes.len() as f64,
                     hdr_note(r.hdr),
+                    scripts_note(r.scripts),
                     attachments_note(r.attachments),
                     t0.elapsed().as_secs_f64()
                 );
                 if let Some(o) = &out_path {
-                    std::fs::write(o, &r.data).unwrap_or_else(|e| { eprintln!("write failed: {e}"); std::process::exit(1) });
+                    write_out(o, &r.data, path, read_at);
                     println!("         wrote {o}");
                 }
             }
@@ -157,17 +208,18 @@ fn main() {
         match png::optimize_png(&bytes, png_min_quality, measure.then_some(target), effort, max_dimension) {
             Ok(r) => {
                 println!(
-                    "{}  {:>7.0} KB -> {:>7.0} KB  {:>5.1}%  {}{}  {:.3}s",
+                    "{}  {:>7.0} KB -> {:>7.0} KB  {:>5.1}%  {}{}{}  {:.3}s",
                     path,
                     bytes.len() as f64 / 1024.0,
                     r.data.len() as f64 / 1024.0,
                     100.0 * r.data.len() as f64 / bytes.len() as f64,
                     if r.quantized { "quantized" } else { "lossless" },
                     match r.score { Some(s) => format!("  score {s:.3}"), None => String::new() },
+                    fallback_note(r.quality_fallback),
                     t0.elapsed().as_secs_f64()
                 );
                 if let Some(o) = &out_path {
-                    std::fs::write(o, &r.data).unwrap_or_else(|e| { eprintln!("write failed: {e}"); std::process::exit(1) });
+                    write_out(o, &r.data, path, read_at);
                     println!("         wrote {o}");
                 }
             }
@@ -199,7 +251,7 @@ fn main() {
         match optimize_as(&bytes, format, requested, target, fixed_quality, png_min_quality, probes, None) {
             Ok(r) => {
                 println!(
-                    "{}  {} {:>7.0} KB -> {:>7.0} KB  {:>5.1}%  images re-encoded in place  {:.3}s",
+                    "{}  {} {:>7.0} KB -> {:>7.0} KB  {:>5.1}%  images re-encoded in place{}{}{}  {:.3}s",
                     path,
                     match pages {
                         Some(n) => format!("{n} pages "),
@@ -208,11 +260,13 @@ fn main() {
                     bytes.len() as f64 / 1024.0,
                     r.data.len() as f64 / 1024.0,
                     100.0 * r.data.len() as f64 / bytes.len() as f64,
+                    scripts_note(r.scripts),
+                    attachments_note(r.attachments),
+                    fallback_note(r.quality_fallback),
                     t0.elapsed().as_secs_f64()
                 );
                 if let Some(o) = &out_path {
-                    std::fs::write(o, &r.data)
-                        .unwrap_or_else(|e| { eprintln!("write failed: {e}"); std::process::exit(1) });
+                    write_out(o, &r.data, path, read_at);
                     println!("         wrote {o}");
                 }
             }
@@ -287,7 +341,7 @@ fn main() {
                 None => format!("  {:>5.1}% of original", 100.0 * r.data.len() as f64 / bytes.len() as f64),
             };
             println!(
-                "{:<8} {:<6} {:>7.0} KB{}{}  {} probes  {:.3}s{}{}{}",
+                "{:<8} {:<6} {:>7.0} KB{}{}  {} probes  {:.3}s{}{}{}{}",
                 mode,
                 r.quality.map_or("-".to_string(), |q| format!("q{q:.1}")),
                 r.data.len() as f64 / 1024.0,
@@ -300,7 +354,8 @@ fn main() {
                     Some(f) => format!("  written as {} (from {f})", format.extension().to_uppercase()),
                     None => "".into(),
                 },
-                attachments_note(r.attachments)
+                attachments_note(r.attachments),
+                fallback_note(r.quality_fallback)
             );
             if let Some(o) = &out_path {
                 // A converted result is a different kind of file from its
@@ -316,7 +371,7 @@ fn main() {
                     );
                     std::process::exit(1)
                 }
-                std::fs::write(o, &r.data).unwrap_or_else(|e| { eprintln!("write failed: {e}"); std::process::exit(1) });
+                write_out(o, &r.data, path, read_at);
                 println!("         wrote {o}");
             }
         }
@@ -325,5 +380,35 @@ fn main() {
             println!("self-score {s:.4} (sanity check, expect 100)");
         }
         _ => usage(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file edited while squint worked on it was replaced by a result made
+    /// from the bytes it held before the edit.
+    #[test]
+    fn a_source_that_changed_since_it_was_read_is_not_written_over() {
+        let dir = std::env::temp_dir().join(format!("squint-write-out-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("photo.jpg");
+        let path = file.to_str().unwrap();
+        std::fs::write(&file, b"the original").unwrap();
+
+        let read_at = stamp(path);
+        try_write_out(path, b"the result", path, read_at).expect("an unchanged source is written over");
+        assert_eq!(std::fs::read(&file).unwrap(), b"the result");
+
+        let read_at = stamp(path);
+        std::fs::write(&file, b"an edit made while squint was working").unwrap();
+        assert!(try_write_out(path, b"the result", path, read_at).is_err(), "the edit was written over");
+        assert_eq!(std::fs::read(&file).unwrap(), b"an edit made while squint was working");
+
+        // Written somewhere else, the result goes regardless.
+        let other = dir.join("copy.jpg");
+        try_write_out(other.to_str().unwrap(), b"the result", path, read_at).expect("a copy is written");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

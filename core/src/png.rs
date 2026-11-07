@@ -22,16 +22,19 @@ impl RgbaImage {
         Self::decode_capped(bytes, None)
     }
 
+    /// Decoded with the orientation an `eXIf` chunk records applied to the
+    /// pixels, because the re-encoded file carries no `eXIf` to say it.
     pub fn decode_capped(bytes: &[u8], max_dimension: Option<u32>) -> Result<Self, Error> {
         let img = crate::capped(crate::decode_limited(bytes)?, max_dimension).to_rgba8();
         let (width, height) = (img.width() as usize, img.height() as usize);
-        let pixels = img
+        let pixels: Vec<rgb::RGBA8> = img
             .into_raw()
             .as_chunks::<4>()
             .0
             .iter()
             .map(|c| rgb::RGBA8::new(c[0], c[1], c[2], c[3]))
             .collect();
+        let (pixels, width, height) = crate::oriented(&pixels, width, height, orientation(bytes));
         Ok(RgbaImage { pixels, width, height })
     }
 
@@ -219,6 +222,9 @@ pub struct PngResult {
     pub data: Vec<u8>,
     pub score: Option<f64>,
     pub quantized: bool,
+    /// A target was given, but the picture has more than the pixels a search
+    /// may take on, so the colours were handled as Fast handles them.
+    pub quality_fallback: bool,
 }
 
 /// Optimize a PNG. With `min_quality` set, colours are quantized first.
@@ -231,7 +237,23 @@ pub fn optimize_png(
     effort: Effort,
     max_dimension: Option<u32>,
 ) -> Result<PngResult, Error> {
+    optimize_png_within(bytes, min_quality, target, effort, max_dimension, crate::max_quality_pixels())
+}
+
+/// `optimize_png`, with the largest picture a colour search may take on named
+/// rather than taken from `max_quality_pixels()`. Above it a target is dropped
+/// and the colours are reduced to `min_quality`, as Fast reduces them.
+pub(crate) fn optimize_png_within(
+    bytes: &[u8],
+    min_quality: Option<u8>,
+    target: Option<f64>,
+    effort: Effort,
+    max_dimension: Option<u32>,
+    quality_pixels: usize,
+) -> Result<PngResult, Error> {
     let source = RgbaImage::decode_capped(bytes, max_dimension)?;
+    let quality_fallback = target.is_some() && source.width.saturating_mul(source.height) > quality_pixels;
+    let target = if quality_fallback { None } else { target };
 
     // Quality mode promises a score, and a picture this small cannot be scored.
     if target.is_some() && source.shorter_side() < crate::MIN_PERCEPTUAL_DIM {
@@ -267,7 +289,7 @@ pub fn optimize_png(
         None => None,
     };
 
-    Ok(PngResult { data: optimized, score, quantized })
+    Ok(PngResult { data: optimized, score, quantized, quality_fallback })
 }
 
 /// The colour floor to quantize at, or `None` to leave the colours alone.
@@ -338,6 +360,43 @@ fn search_colours(source: &RgbaImage, target: f64) -> Result<Option<u8>, Error> 
 }
 
 
+/// Which way up this PNG says it goes, 1 when it does not say.
+///
+/// A PNG records a turn only in the TIFF block of an `eXIf` chunk, the same
+/// block a JPEG keeps in APP1, so the tag is read by the same walk.
+pub fn orientation(png: &[u8]) -> u16 {
+    chunks(png)
+        .and_then(|found| {
+            found
+                .into_iter()
+                .find(|(kind, _)| *kind == b"eXIf")
+                .and_then(|(_, whole)| crate::metadata::orientation_in_tiff(&whole[8..whole.len() - 4]))
+        })
+        .unwrap_or(1)
+}
+
+/// A whole chunk: length, kind, data and the checksum over kind and data.
+fn chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + 12);
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(kind);
+    out.extend_from_slice(data);
+    out.extend_from_slice(&crc32(&out[4..]).to_be_bytes());
+    out
+}
+
+/// The CRC-32 a PNG chunk carries (ISO 3309, reflected, polynomial 0xEDB88320).
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &b in bytes {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+        }
+    }
+    !crc
+}
+
 /// Chunks a PNG needs in order to render. Everything else is metadata.
 ///
 /// The animation chunks are here because an animated PNG's later frames are
@@ -358,6 +417,10 @@ const PNG_KEEP: [&[u8; 4]; 13] = [
 /// `eXIf` (location and camera data), `tIME`, and `caBX` (C2PA credentials).
 ///
 /// The colour chunks are kept, for the same reason the JPEG path keeps ICC.
+/// An orientation the `eXIf` chunk recorded is written back in an `eXIf` of
+/// its own holding nothing else, before the first `IDAT` as the format asks:
+/// the pixels are copied untouched, so the tag is all that says which way up
+/// they go.
 ///
 /// Refuses rather than returning what it managed to copy. A file whose chunk
 /// lengths do not walk cleanly, or that is missing a header, pixels, or an end
@@ -365,6 +428,7 @@ const PNG_KEEP: [&[u8; 4]; 13] = [
 /// partial copy of a photograph is worse than no copy at all.
 pub fn strip_png(png: &[u8]) -> Option<Vec<u8>> {
     let walked = chunks(png)?;
+    let turned = orientation(png);
     let mut out = Vec::with_capacity(png.len());
     out.extend_from_slice(SIGNATURE);
 
@@ -372,7 +436,12 @@ pub fn strip_png(png: &[u8]) -> Option<Vec<u8>> {
     for (kind, whole) in walked {
         match kind {
             b"IHDR" => header = true,
-            b"IDAT" => pixels = true,
+            b"IDAT" if !pixels => {
+                pixels = true;
+                if turned != 1 {
+                    out.extend_from_slice(&chunk(b"eXIf", &crate::metadata::orientation_tiff(turned)));
+                }
+            }
             b"IEND" => end = true,
             _ => {}
         }
@@ -381,4 +450,55 @@ pub fn strip_png(png: &[u8]) -> Option<Vec<u8>> {
         }
     }
     (header && pixels && end).then_some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Written by ExifTool 13.55 (`-n -Orientation=6`) into a PNG: an `eXIf`
+    /// chunk holding the orientation and YCbCrPositioning. Made by
+    /// `tools/audit-2026-11-06.py make`.
+    const EXIFTOOL_ORIENTATION_6: &[u8] = include_bytes!("../tests/fixtures/orientation-6.png");
+
+    fn exif_chunks(png: &[u8]) -> Vec<Vec<u8>> {
+        chunks(png)
+            .expect("walks as a PNG")
+            .into_iter()
+            .filter(|(kind, _)| *kind == b"eXIf")
+            .map(|(_, whole)| whole[8..whole.len() - 4].to_vec())
+            .collect()
+    }
+
+    #[test]
+    fn a_strip_keeps_which_way_up_a_png_goes_and_nothing_else_of_its_exif() {
+        assert_eq!(orientation(EXIFTOOL_ORIENTATION_6), 6, "the fixture is not turned");
+        let out = strip_png(EXIFTOOL_ORIENTATION_6).expect("a well formed file");
+        assert_eq!(orientation(&out), 6, "the picture would come back on its side");
+        assert_eq!(exif_chunks(&out), vec![crate::metadata::orientation_tiff(6)], "more than the turn survived");
+        assert!(out.len() < EXIFTOOL_ORIENTATION_6.len());
+        // What a strip writes, a second strip leaves as it is.
+        assert_eq!(strip_png(&out).expect("the result strips"), out);
+    }
+
+    #[test]
+    fn a_re_encoded_png_has_its_turn_in_the_pixels() {
+        let source = RgbaImage::decode(EXIFTOOL_ORIENTATION_6).expect("decodes");
+        let plain = image::load_from_memory(EXIFTOOL_ORIENTATION_6).expect("decodes");
+        assert_eq!(
+            (source.width, source.height),
+            (plain.height() as usize, plain.width() as usize),
+            "a quarter turn was not applied"
+        );
+        let out = optimize_png(EXIFTOOL_ORIENTATION_6, None, None, Effort::Quick, None).expect("re-encodes");
+        let back = image::load_from_memory(&out.data).expect("the result decodes");
+        assert_eq!((back.width() as usize, back.height() as usize), (source.width, source.height));
+        assert!(exif_chunks(&out.data).is_empty(), "the re-encode carried EXIF across");
+    }
+
+    #[test]
+    fn a_chunk_checksum_is_the_one_png_readers_check() {
+        // The IEND chunk every PNG ends with has this checksum.
+        assert_eq!(chunk(b"IEND", &[]), [0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82]);
+    }
 }

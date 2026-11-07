@@ -40,6 +40,63 @@ pub const JPEG_SCORE_CEILING: f64 = 91.0;
 /// phone photograph is a fifth of it, and a large stitched panorama still fits.
 pub const MAX_PIXELS: usize = 250_000_000;
 
+/// Peak memory of a quality search per pixel, rounded up.
+///
+/// A search holds the picture, each candidate and the metric's working planes
+/// at once, so its peak grows with the pixel count. Peak footprint measured on
+/// svk (M1, 8 GB) with the release build: 1.64 GB for a 6 megapixel JPEG (274
+/// bytes a pixel) and 3.56 GB for a 12 megapixel one (296).
+pub const QUALITY_BYTES_PER_PIXEL: u64 = 300;
+
+/// Physical memory assumed when the machine cannot be asked.
+const FALLBACK_MEMORY: u64 = 8 << 30;
+
+/// The most pixels a quality search will take on: the count whose search fits
+/// in half of this Mac's memory. A picture above it is encoded once at the
+/// fixed quality, as Fast does, and the result says so.
+///
+/// Nothing else bounds one job: the queue's memory model only limits how many
+/// run together, and `MAX_PIXELS` lets through a picture whose search would
+/// ask for over 60 GB. Half of memory keeps a 12 megapixel phone photograph
+/// searchable on an 8 GB Mac (about 14 megapixels there, 28 on 16 GB, 57 on
+/// 32 GB).
+pub fn max_quality_pixels() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| quality_pixels_for_memory(physical_memory().unwrap_or(FALLBACK_MEMORY)))
+}
+
+/// The quality-search pixel budget for a machine with `memory` bytes.
+pub fn quality_pixels_for_memory(memory: u64) -> usize {
+    usize::try_from(memory / 2 / QUALITY_BYTES_PER_PIXEL).unwrap_or(usize::MAX)
+}
+
+/// Installed memory in bytes, from the `hw.memsize` sysctl.
+#[cfg(target_os = "macos")]
+fn physical_memory() -> Option<u64> {
+    extern "C" {
+        fn sysctlbyname(
+            name: *const std::ffi::c_char,
+            oldp: *mut std::ffi::c_void,
+            oldlenp: *mut usize,
+            newp: *mut std::ffi::c_void,
+            newlen: usize,
+        ) -> std::ffi::c_int;
+    }
+    let mut value: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    // SAFETY: the name is NUL-terminated, and `value`/`len` describe a writable
+    // u64 that outlives the call.
+    let rc = unsafe {
+        sysctlbyname(c"hw.memsize".as_ptr(), (&raw mut value).cast(), &raw mut len, std::ptr::null_mut(), 0)
+    };
+    (rc == 0 && len == std::mem::size_of::<u64>() && value > 0).then_some(value)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn physical_memory() -> Option<u64> {
+    None
+}
+
 /// Ceiling on what a decoder may allocate, as a backstop behind the size check.
 ///
 /// Large enough for any picture that passes `MAX_PIXELS`, including the
@@ -365,7 +422,7 @@ pub(crate) fn strip_jpeg_file(bytes: &[u8], orientation: u16) -> Result<Option<(
                 .map(|img| strip_gain_map(img))
                 .collect::<Result<Vec<_>, _>>()?;
             let hdr = if found.has_gain_map { Hdr::Preserved } else { Hdr::Absent };
-            match gainmap::attach(&bare, &cleaned, found.iso_segment.as_deref()) {
+            match gainmap::attach_listed(&bare, &cleaned, &found.entries, found.iso_segment.as_deref()) {
                 Some(joined) => (joined, hdr),
                 // Reattaching failed, so whatever was carried is gone.
                 None if found.has_gain_map => (bare, Hdr::Dropped),
@@ -692,6 +749,12 @@ pub struct Optimized {
     /// Files attached inside a PDF, kept as they were: no mode reads them.
     /// Zero for every other format.
     pub attachments: usize,
+    /// JavaScript actions removed from a PDF. Zero for every other format.
+    pub scripts: usize,
+    /// Quality was asked for, but the picture (or a picture inside a PDF) has
+    /// more than `max_quality_pixels()`, so it was encoded once at the fixed
+    /// quality instead of searched.
+    pub quality_fallback: bool,
 }
 
 /// Optimize an encoded image, dispatching on its format.
@@ -736,6 +799,25 @@ pub fn optimize_as(
     max_probes: usize,
     max_dimension: Option<u32>,
 ) -> Result<Optimized, Error> {
+    let settings = Settings { mode, target, fixed_quality, png_min_quality, max_probes, max_dimension };
+    optimize_within(bytes, format, &settings, max_quality_pixels())
+}
+
+/// What a caller asked `optimize_as` for, carried as one value.
+#[derive(Clone, Copy)]
+struct Settings {
+    mode: Mode,
+    target: f64,
+    fixed_quality: f32,
+    png_min_quality: Option<u8>,
+    max_probes: usize,
+    max_dimension: Option<u32>,
+}
+
+/// `optimize_as`, with the largest picture a quality search may take on named
+/// rather than taken from `max_quality_pixels()`.
+fn optimize_within(bytes: &[u8], format: OutputFormat, settings: &Settings, quality_pixels: usize) -> Result<Optimized, Error> {
+    let Settings { mode, target, fixed_quality, png_min_quality, max_probes, max_dimension } = *settings;
     if mode == Mode::Strip {
         // A PDF says who wrote it, with what, and when, in its info dictionary
         // and again in an XMP packet. Both go; the pages are untouched.
@@ -769,6 +851,8 @@ pub fn optimize_as(
                 original_bytes: bytes.len(),
                 converted_from: None,
                 attachments: r.attachments,
+                scripts: r.scripts,
+                quality_fallback: r.quality_fallback,
             });
         }
 
@@ -792,6 +876,8 @@ pub fn optimize_as(
                 original_bytes: bytes.len(),
                 converted_from: None,
                 attachments: 0,
+                scripts: 0,
+                quality_fallback: false,
             });
         }
 
@@ -801,7 +887,9 @@ pub fn optimize_as(
         if webp::is_webp(bytes) {
             let (stripped, wiped) = webp::strip_webp(bytes)
                 .ok_or_else(|| Error::Decode("this WebP is not laid out as expected".into()))?;
-            if wiped == 0 {
+            // An `EXIF` chunk holding only the orientation is dropped and
+            // written back the same, so a second Strip is caught here.
+            if wiped == 0 || stripped == bytes {
                 return Err(Error::NothingToRemove);
             }
             return Ok(Optimized {
@@ -814,6 +902,8 @@ pub fn optimize_as(
                 original_bytes: bytes.len(),
                 converted_from: None,
                 attachments: 0,
+                scripts: 0,
+                quality_fallback: false,
             });
         }
 
@@ -844,6 +934,8 @@ pub fn optimize_as(
                 original_bytes: bytes.len(),
                 converted_from: None,
                 attachments: 0,
+                scripts: 0,
+                quality_fallback: false,
             });
         }
 
@@ -878,6 +970,8 @@ pub fn optimize_as(
             original_bytes: bytes.len(),
             converted_from: None,
             attachments: 0,
+            scripts: 0,
+            quality_fallback: false,
         });
     }
 
@@ -944,6 +1038,8 @@ pub fn optimize_as(
             original_bytes: bytes.len(),
             converted_from: None,
             attachments: r.attachments,
+            scripts: r.scripts,
+            quality_fallback: r.quality_fallback,
         });
     }
 
@@ -957,12 +1053,13 @@ pub fn optimize_as(
             // percent.
             Mode::Fast | Mode::Strip => png::Effort::Quick,
         };
-        let r = png::optimize_png(
+        let r = png::optimize_png_within(
             bytes,
             png_min_quality,
             (mode == Mode::Quality).then_some(target),
             effort,
             max_dimension,
+            quality_pixels,
         )?;
         return Ok(Optimized {
             data: r.data,
@@ -974,6 +1071,8 @@ pub fn optimize_as(
             original_bytes: bytes.len(),
             converted_from: None,
             attachments: 0,
+            scripts: 0,
+            quality_fallback: r.quality_fallback,
         });
     }
 
@@ -1009,6 +1108,11 @@ pub fn optimize_as(
     let image = src.image;
     let icc = src.icc;
 
+    // Decided on the picture as decoded, after any cap on its size, since that
+    // is what the search would hold.
+    let quality_fallback = mode == Mode::Quality && image.width.saturating_mul(image.height) > quality_pixels;
+    let mode = if quality_fallback { Mode::Fast } else { mode };
+
     // A JPEG photograph with a gain map, rewritten in place at its own size,
     // keeps the map. Copies, caps and conversions do not: they are made to be
     // sent somewhere small, and the original beside them keeps its range.
@@ -1019,7 +1123,9 @@ pub fn optimize_as(
         && gainmap::extract(bytes).is_some_and(|found| found.has_gain_map)
     {
         let hdr = HdrSource { bytes, orientation };
-        return hdr_in_place(&hdr, &image, icc.as_deref(), mode, target, fixed_quality, max_probes, size_to_beat);
+        let mut r = hdr_in_place(&hdr, &image, icc.as_deref(), mode, target, fixed_quality, max_probes, size_to_beat)?;
+        r.quality_fallback = quality_fallback;
+        return Ok(r);
     }
     #[cfg(not(target_os = "macos"))]
     let _ = orientation;
@@ -1075,6 +1181,8 @@ pub fn optimize_as(
         original_bytes: bytes.len(),
         converted_from,
         attachments: 0,
+        scripts: 0,
+        quality_fallback,
     })
 }
 
@@ -1152,6 +1260,8 @@ fn hdr_in_place(
         original_bytes: source.bytes.len(),
         converted_from: None,
         attachments: 0,
+        scripts: 0,
+        quality_fallback: false,
     })
 }
 
@@ -1437,6 +1547,67 @@ mod tests {
             })
             .collect();
         png::RgbaImage { pixels, width: side, height: side }.encode_png().unwrap()
+    }
+
+    /// A noisy photograph-like JPEG, so a fixed-quality re-encode of it is
+    /// smaller and a search has something to measure.
+    fn noisy_jpeg(side: usize) -> Vec<u8> {
+        let mut state = 1u32;
+        let pixels: Vec<u8> = (0..side * side * 3)
+            .map(|i| {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                ((i % 256) as u8).wrapping_add((state >> 24) as u8 / 4)
+            })
+            .collect();
+        encode_jpeg(&Image::from_rgb8(&pixels, side, side), 95.0, None).expect("encodes")
+    }
+
+    /// A 12 MP phone photograph (4032x3024) must stay searchable on an 8 GB
+    /// Mac, and the budget must grow with memory rather than sit at one number.
+    #[test]
+    fn the_search_budget_scales_with_memory_and_keeps_a_phone_photo_searchable() {
+        let phone = 4032 * 3024;
+        let eight = quality_pixels_for_memory(8 << 30);
+        assert!(eight > phone, "a 12 MP photo would not be searched on 8 GB ({eight})");
+        assert!(eight < 20_000_000, "8 GB allows a search that would not fit ({eight})");
+        assert!(quality_pixels_for_memory(16 << 30).abs_diff(2 * eight) <= 1, "16 GB is not twice 8 GB");
+        if cfg!(target_os = "macos") {
+            assert!(physical_memory().is_some(), "hw.memsize could not be read");
+        }
+        assert_eq!(max_quality_pixels(), quality_pixels_for_memory(physical_memory().unwrap_or(FALLBACK_MEMORY)));
+    }
+
+    /// A search's memory grows with the picture, about 300 bytes a pixel, and
+    /// nothing bounded it: the decode limit let through a picture whose search
+    /// would ask for tens of gigabytes. Above the budget, quality is encoded
+    /// once at the fixed quality, and the result says so.
+    #[test]
+    fn a_picture_above_the_search_budget_is_encoded_once_and_says_so() {
+        let quality = Settings {
+            mode: Mode::Quality,
+            target: 70.0,
+            fixed_quality: 75.0,
+            png_min_quality: Some(70),
+            max_probes: 6,
+            max_dimension: None,
+        };
+        let jpeg = noisy_jpeg(160);
+        let over = optimize_within(&jpeg, OutputFormat::Jpeg, &quality, 159 * 160).unwrap_or_else(|e| panic!("{e}"));
+        assert!(over.quality_fallback, "the result does not say the search was skipped");
+        assert!(over.probes.is_empty(), "a picture over the budget was searched");
+        assert_eq!((over.score, over.quality), (None, Some(75.0)), "not encoded as Fast encodes");
+        let fast = optimize(&jpeg, Mode::Fast, 70.0, 75.0, Some(70), 6, None).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(over.data, fast.data, "the fallback is not what Fast writes");
+
+        let within = optimize_within(&jpeg, OutputFormat::Jpeg, &quality, 160 * 160).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!within.quality_fallback);
+        assert!(!within.probes.is_empty(), "a picture inside the budget was not searched");
+
+        let png = photographic_png(160);
+        let lossless = Settings { png_min_quality: None, ..quality };
+        let over = optimize_within(&png, OutputFormat::Jpeg, &lossless, 159 * 160).unwrap_or_else(|e| panic!("{e}"));
+        assert!(over.quality_fallback, "a PNG over the budget does not say so");
+        assert_eq!(over.score, None, "a PNG over the budget was searched");
     }
 
     #[test]
@@ -1823,6 +1994,114 @@ mod tests {
             jpeg.extend_from_slice(&[0xFF, 0xD9]);
             assert_eq!(extract_orientation(&jpeg), turned);
         }
+    }
+
+    /// A JPEG whose only EXIF field is the orientation, with the field's type,
+    /// value and byte order as given, and a scan to strip.
+    fn jpeg_with_orientation(kind: u16, value: u32, big: bool) -> Vec<u8> {
+        let u16b = |v: u16| if big { v.to_be_bytes() } else { v.to_le_bytes() };
+        let u32b = |v: u32| if big { v.to_be_bytes() } else { v.to_le_bytes() };
+        let mut exif = b"Exif\0\0".to_vec();
+        exif.extend_from_slice(if big { b"MM" } else { b"II" });
+        exif.extend_from_slice(&u16b(42));
+        exif.extend_from_slice(&u32b(8));
+        exif.extend_from_slice(&u16b(1));
+        exif.extend_from_slice(&u16b(0x0112));
+        exif.extend_from_slice(&u16b(kind));
+        exif.extend_from_slice(&u32b(1));
+        // A SHORT sits in the value field's first two bytes, a LONG fills it.
+        if kind == 3 {
+            exif.extend_from_slice(&u16b(value as u16));
+            exif.extend_from_slice(&[0, 0]);
+        } else {
+            exif.extend_from_slice(&u32b(value));
+        }
+        exif.extend_from_slice(&u32b(0));
+        let mut jpeg = vec![0xFF, 0xD8];
+        jpeg.extend(segment(0xE1, &exif));
+        jpeg.extend(segment(0xFE, b"a comment, so a strip has something to remove"));
+        jpeg.extend(segment(0xC0, b"frame"));
+        jpeg.extend(segment(0xDA, b"\x01\x01\x00"));
+        jpeg.extend_from_slice(&[0x11, 0x22, 0xFF, 0xD9]);
+        jpeg
+    }
+
+    /// Image I/O reads an orientation only when it is a SHORT from 1 to 8.
+    /// A big-endian LONG 6 was read as 0 and a little-endian one as 6, so Strip
+    /// wrote back an orientation of 0, which no reader accepts, or a turn the
+    /// source's viewers never applied.
+    #[test]
+    fn an_orientation_that_is_not_a_short_from_1_to_8_is_no_orientation() {
+        for big in [true, false] {
+            assert_eq!(extract_orientation(&jpeg_with_orientation(3, 6, big)), 6, "the control must read");
+            for (kind, value) in [(4u16, 6u32), (3, 0), (3, 9), (9, 6)] {
+                let jpeg = jpeg_with_orientation(kind, value, big);
+                assert_eq!(extract_orientation(&jpeg), 1, "type {kind} value {value} big-endian {big} was read");
+                let out = optimize(&jpeg, Mode::Strip, 0.0, 0.0, None, 0, None).unwrap_or_else(|e| panic!("{e}"));
+                assert!(
+                    !out.data.windows(2).any(|w| w == [0xFF, 0xE1]),
+                    "type {kind} value {value} big-endian {big} wrote an orientation back"
+                );
+            }
+        }
+    }
+
+    /// A stereo pair as a 3D camera writes one: two views, each listed in the
+    /// Multi Picture Format index as a disparity image (type 0x020002), the
+    /// first also flagged as the picture to show (0x20000000).
+    fn stereo_pair() -> Vec<u8> {
+        let view = |name: &[u8]| {
+            let mut j = vec![0xFF, 0xD8];
+            j.extend(segment(0xFE, name));
+            j.extend(segment(0xC0, b"frame"));
+            j.extend(segment(0xDA, b"\x01\x01\x00"));
+            j.extend_from_slice(&[0x11, 0x22, 0xFF, 0xD9]);
+            j
+        };
+        let (left, right) = (view(b"left view"), view(b"right view"));
+        let index = |primary_len: u32, right_at: u32| {
+            let mut p = b"MPF\0MM\x00\x2a\x00\x00\x00\x08\x00\x03".to_vec();
+            p.extend_from_slice(&[0xB0, 0x00, 0x00, 0x07, 0, 0, 0, 4, b'0', b'1', b'0', b'0']);
+            p.extend_from_slice(&[0xB0, 0x01, 0x00, 0x04, 0, 0, 0, 1, 0, 0, 0, 2]);
+            p.extend_from_slice(&[0xB0, 0x02, 0x00, 0x07, 0, 0, 0, 32, 0, 0, 0, 50, 0, 0, 0, 0]);
+            for (attribute, size, at) in [(0x2002_0002u32, primary_len, 0u32), (0x0002_0002, right.len() as u32, right_at)] {
+                p.extend_from_slice(&attribute.to_be_bytes());
+                p.extend_from_slice(&size.to_be_bytes());
+                p.extend_from_slice(&at.to_be_bytes());
+                p.extend_from_slice(&[0, 0, 0, 0]);
+            }
+            p
+        };
+        // The index goes straight after SOI, so its TIFF header sits ten bytes
+        // in: SOI, the segment's marker and length, and "MPF\0".
+        let primary_len = left.len() + 4 + index(0, 0).len();
+        let mut out = vec![0xFF, 0xD8];
+        out.extend(segment(0xE2, &index(primary_len as u32, (primary_len - 10) as u32)));
+        out.extend_from_slice(&left[2..]);
+        out.extend_from_slice(&right);
+        out
+    }
+
+    /// The type and flags of each picture a Multi Picture Format index lists,
+    /// read from the bytes.
+    fn listed_attributes(jpeg: &[u8]) -> Vec<u32> {
+        let at = jpeg.windows(4).position(|w| w == b"MPF\0").expect("an index") + 4;
+        let count = u32::from_be_bytes(jpeg[at + 30..at + 34].try_into().unwrap()) as usize;
+        (0..count)
+            .map(|k| u32::from_be_bytes(jpeg[at + 50 + 16 * k..at + 54 + 16 * k].try_into().unwrap()))
+            .collect()
+    }
+
+    /// Strip wrote every secondary back as type 0, undefined, and the primary
+    /// as a plain baseline primary, so a stereo pair stopped saying it was one.
+    #[test]
+    fn strip_keeps_the_types_a_stereo_pair_lists_its_views_under() {
+        let source = stereo_pair();
+        assert_eq!(listed_attributes(&source), [0x2002_0002, 0x0002_0002], "the fixture is not a stereo pair");
+        let out = optimize(&source, Mode::Strip, 0.0, 0.0, None, 0, None).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(listed_attributes(&out.data), [0x2002_0002, 0x0002_0002], "the views lost their types");
+        assert!(!out.data.windows(9).any(|w| w == b"left view"), "the primary's comment survived");
+        assert!(!out.data.windows(10).any(|w| w == b"right view"), "the second view's comment survived");
     }
 
     #[test]

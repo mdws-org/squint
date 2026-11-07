@@ -92,6 +92,11 @@ pub fn is_animated(bytes: &[u8]) -> bool {
 /// some of its chunks, so `kept` is only ever built on by a walk that returned
 /// `Some`, and a refusal never leaves a partial file behind.
 pub fn strip_webp(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
+    // Read before the `EXIF` chunk goes, and written back on its own: the
+    // pixels are copied untouched, so the tag is all that says which way up
+    // they go, and a portrait photograph left without it comes back on its
+    // side.
+    let turned = orientation(bytes);
     let mut kept: Vec<&[u8]> = Vec::new();
     let mut has_picture = false;
     let mut wiped = 0;
@@ -122,6 +127,14 @@ pub fn strip_webp(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
     for chunk in kept {
         out.extend_from_slice(chunk);
     }
+    // At the end, where the format puts `EXIF`. The block is twenty six bytes,
+    // an even length, so no pad byte follows it.
+    if turned != 1 {
+        let block = crate::metadata::orientation_tiff(turned);
+        out.extend_from_slice(b"EXIF");
+        out.extend_from_slice(&(block.len() as u32).to_le_bytes());
+        out.extend_from_slice(&block);
+    }
     let size = (out.len() - 8) as u32;
     out[4..8].copy_from_slice(&size.to_le_bytes());
 
@@ -130,7 +143,7 @@ pub fn strip_webp(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
     // for a chunk that is no longer here describes a file that does not exist,
     // and a reader that believes the header rather than the chain will go
     // looking for an `EXIF` it will not find. The bits come down with the
-    // chunks. `VP8X` is the first chunk when it is present at all, so its
+    // chunks, except the `EXIF` bit when the orientation chunk replaced one. `VP8X` is the first chunk when it is present at all, so its
     // payload begins at a known place: four bytes of type, four of length.
     // The payload length is checked, not assumed. A `VP8X` is a structurally
     // fine chunk with a length of zero, and the walk accepts one, so without
@@ -141,7 +154,10 @@ pub fn strip_webp(bytes: &[u8]) -> Option<(Vec<u8>, usize)> {
         && &out[12..16] == b"VP8X"
         && u32::from_le_bytes([out[16], out[17], out[18], out[19]]) >= 1;
     if vp8x_payload && out.len() > 20 {
-        out[20] &= !(VP8X_EXIF_FLAG | VP8X_XMP_FLAG);
+        out[20] &= !VP8X_XMP_FLAG;
+        if turned == 1 {
+            out[20] &= !VP8X_EXIF_FLAG;
+        }
     }
 
     Some((out, wiped))
@@ -169,8 +185,8 @@ pub fn icc_profile(bytes: &[u8]) -> Option<Vec<u8>> {
 /// recorded is the TIFF block inside its `EXIF` chunk, which is the same block
 /// a JPEG keeps in APP1, so the tag is read by the same walk.
 ///
-/// Strip removes that chunk, and is right to: the turn has already been applied
-/// to the pixels by then, and what remains of the block identifies a camera.
+/// Strip removes that chunk, which names a camera, and writes the turn back in
+/// a chunk of its own. A re-encode applies the turn to the pixels instead.
 pub fn orientation(bytes: &[u8]) -> u16 {
     let mut found = None;
     let walked = walk(bytes, |chunk| {
@@ -583,12 +599,40 @@ mod tests {
         lying[4..8].copy_from_slice(&4096u32.to_le_bytes());
         assert_eq!(orientation(&lying), 1, "a malformed file says nothing");
 
-        // And the chunk still leaves in a strip: by then the turn is in the
-        // pixels and what remains of the block names a camera.
-        let turned = webp(&[(b"VP8 ", &[0xAA; 16]), (b"EXIF", &tiff(6, true))]);
+        // The chunk leaves in a strip and the turn is written back on its
+        // own, because the pixels it describes are copied untouched.
+        let turned = webp(&[(b"VP8 ", &[0xAA; 16]), (b"EXIF", &tiff(6, false))]);
         let (out, wiped) = strip_webp(&turned).expect("a frame is present");
         assert!(wiped > 0);
-        assert_eq!(orientation(&out), 1, "the tag went with the chunk");
+        assert_eq!(orientation(&out), 6, "the turn did not survive the strip");
+    }
+
+    /// Written by ExifTool 13.55 (`-n -Orientation=6`) into a lossless WebP:
+    /// an `EXIF` chunk holding the orientation and YCbCrPositioning, and the
+    /// `VP8X` header ExifTool adds to announce it. Made by
+    /// `tools/audit-2026-11-06.py make`.
+    const EXIFTOOL_ORIENTATION_6: &[u8] = include_bytes!("../tests/fixtures/orientation-6.webp");
+
+    #[test]
+    fn a_strip_keeps_which_way_up_a_webp_goes_and_nothing_else_of_its_exif() {
+        assert_eq!(orientation(EXIFTOOL_ORIENTATION_6), 6, "the fixture is not turned");
+        let (out, wiped) = strip_webp(EXIFTOOL_ORIENTATION_6).expect("a well formed file");
+        assert!(wiped > 0, "the camera's block was not removed");
+        assert_eq!(orientation(&out), 6, "the picture would come back on its side");
+
+        let mut exif = Vec::new();
+        walk(&out, |chunk| {
+            if &chunk.id == b"EXIF" {
+                exif.push(chunk.payload.to_vec());
+            }
+        })
+        .expect("the result walks as a WebP");
+        assert_eq!(exif, vec![crate::metadata::orientation_tiff(6)], "more than the turn survived");
+        assert_eq!(out[20] & VP8X_EXIF_FLAG, VP8X_EXIF_FLAG, "the header stopped announcing the chunk");
+
+        // What a strip writes, a second strip leaves as it is.
+        let (again, _) = strip_webp(&out).expect("the result strips");
+        assert_eq!(again, out);
     }
 
     #[test]
