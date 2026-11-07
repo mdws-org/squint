@@ -377,7 +377,7 @@ pub(crate) fn strip_jpeg_file(bytes: &[u8], orientation: u16) -> Result<Option<(
                 .map(|img| strip_gain_map(img))
                 .collect::<Result<Vec<_>, _>>()?;
             let hdr = if found.has_gain_map { Hdr::Preserved } else { Hdr::Absent };
-            match gainmap::attach(&bare, &cleaned, found.iso_segment.as_deref()) {
+            match gainmap::attach_listed(&bare, &cleaned, &found.entries, found.iso_segment.as_deref()) {
                 Some(joined) => (joined, hdr),
                 // Reattaching failed, so whatever was carried is gone.
                 None if found.has_gain_map => (bare, Hdr::Dropped),
@@ -1984,6 +1984,64 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A stereo pair as a 3D camera writes one: two views, each listed in the
+    /// Multi Picture Format index as a disparity image (type 0x020002), the
+    /// first also flagged as the picture to show (0x20000000).
+    fn stereo_pair() -> Vec<u8> {
+        let view = |name: &[u8]| {
+            let mut j = vec![0xFF, 0xD8];
+            j.extend(segment(0xFE, name));
+            j.extend(segment(0xC0, b"frame"));
+            j.extend(segment(0xDA, b"\x01\x01\x00"));
+            j.extend_from_slice(&[0x11, 0x22, 0xFF, 0xD9]);
+            j
+        };
+        let (left, right) = (view(b"left view"), view(b"right view"));
+        let index = |primary_len: u32, right_at: u32| {
+            let mut p = b"MPF\0MM\x00\x2a\x00\x00\x00\x08\x00\x03".to_vec();
+            p.extend_from_slice(&[0xB0, 0x00, 0x00, 0x07, 0, 0, 0, 4, b'0', b'1', b'0', b'0']);
+            p.extend_from_slice(&[0xB0, 0x01, 0x00, 0x04, 0, 0, 0, 1, 0, 0, 0, 2]);
+            p.extend_from_slice(&[0xB0, 0x02, 0x00, 0x07, 0, 0, 0, 32, 0, 0, 0, 50, 0, 0, 0, 0]);
+            for (attribute, size, at) in [(0x2002_0002u32, primary_len, 0u32), (0x0002_0002, right.len() as u32, right_at)] {
+                p.extend_from_slice(&attribute.to_be_bytes());
+                p.extend_from_slice(&size.to_be_bytes());
+                p.extend_from_slice(&at.to_be_bytes());
+                p.extend_from_slice(&[0, 0, 0, 0]);
+            }
+            p
+        };
+        // The index goes straight after SOI, so its TIFF header sits ten bytes
+        // in: SOI, the segment's marker and length, and "MPF\0".
+        let primary_len = left.len() + 4 + index(0, 0).len();
+        let mut out = vec![0xFF, 0xD8];
+        out.extend(segment(0xE2, &index(primary_len as u32, (primary_len - 10) as u32)));
+        out.extend_from_slice(&left[2..]);
+        out.extend_from_slice(&right);
+        out
+    }
+
+    /// The type and flags of each picture a Multi Picture Format index lists,
+    /// read from the bytes.
+    fn listed_attributes(jpeg: &[u8]) -> Vec<u32> {
+        let at = jpeg.windows(4).position(|w| w == b"MPF\0").expect("an index") + 4;
+        let count = u32::from_be_bytes(jpeg[at + 30..at + 34].try_into().unwrap()) as usize;
+        (0..count)
+            .map(|k| u32::from_be_bytes(jpeg[at + 50 + 16 * k..at + 54 + 16 * k].try_into().unwrap()))
+            .collect()
+    }
+
+    /// Strip wrote every secondary back as type 0, undefined, and the primary
+    /// as a plain baseline primary, so a stereo pair stopped saying it was one.
+    #[test]
+    fn strip_keeps_the_types_a_stereo_pair_lists_its_views_under() {
+        let source = stereo_pair();
+        assert_eq!(listed_attributes(&source), [0x2002_0002, 0x0002_0002], "the fixture is not a stereo pair");
+        let out = optimize(&source, Mode::Strip, 0.0, 0.0, None, 0, None).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(listed_attributes(&out.data), [0x2002_0002, 0x0002_0002], "the views lost their types");
+        assert!(!out.data.windows(9).any(|w| w == b"left view"), "the primary's comment survived");
+        assert!(!out.data.windows(10).any(|w| w == b"right view"), "the second view's comment survived");
     }
 
     #[test]

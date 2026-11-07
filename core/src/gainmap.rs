@@ -27,6 +27,22 @@ pub struct Secondaries {
     /// Whether any of them identifies itself as a gain map, as opposed to a
     /// stereo view or an oversized thumbnail.
     pub has_gain_map: bool,
+    /// What the index said of every picture, the primary first, in the order
+    /// it lists them: the type and flags, and which entries depend on which.
+    pub entries: Vec<MpEntry>,
+}
+
+/// What a Multi Picture Format index entry says about its picture, apart
+/// from where the picture is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MpEntry {
+    /// Flags in the top five bits (dependent parent, dependent child,
+    /// representative image), the format in the next three, and the type in
+    /// the low twenty-four: baseline primary, a large thumbnail, a panorama,
+    /// a disparity or multi-angle view, or undefined, which a gain map is.
+    pub attribute: u32,
+    /// The one-based entry numbers of the pictures this one depends on, or 0.
+    pub dependents: [u16; 2],
 }
 
 const MPF_TAG: &[u8] = b"MPF\0";
@@ -80,12 +96,13 @@ fn segments(jpeg: &[u8]) -> Vec<(u8, usize, &[u8])> {
     out
 }
 
-/// Byte ranges of the images listed in the Multi Picture Format index.
+/// Every image the Multi Picture Format index lists: its byte range, and what
+/// the entry says about it.
 ///
 /// Entry offsets are measured from the start of the format's own TIFF header,
 /// not from the start of the file, and the first image is always recorded as
 /// offset zero. Both quirks are in the specification.
-fn mpf_images(jpeg: &[u8]) -> Option<Vec<(usize, usize)>> {
+fn mpf_entries(jpeg: &[u8]) -> Option<Vec<(usize, usize, MpEntry)>> {
     let (payload_start, payload) = segments(jpeg)
         .into_iter()
         .find(|(m, _, p)| *m == 0xE2 && p.starts_with(MPF_TAG))
@@ -126,8 +143,10 @@ fn mpf_images(jpeg: &[u8]) -> Option<Vec<(usize, usize)>> {
     let mut out = Vec::new();
     for k in 0..entries_len / 16 {
         let e = entries_at + k * 16;
+        let attribute = u32at(e)?;
         let size = u32at(e + 4)? as usize;
         let rel = u32at(e + 8)? as usize;
+        let dependents = [u16at(e + 12)?, u16at(e + 14)?];
         // The first image is recorded as offset zero and starts at the file
         // head. No other image can start there.
         let start = match (k, rel) {
@@ -138,7 +157,7 @@ fn mpf_images(jpeg: &[u8]) -> Option<Vec<(usize, usize)>> {
         if start + size > jpeg.len() {
             return None;
         }
-        out.push((start, size));
+        out.push((start, size, MpEntry { attribute, dependents }));
     }
     Some(out)
 }
@@ -153,12 +172,13 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// data — a second view, a larger thumbnail, the brightness map — and the mode
 /// that promises to leave pixels alone has no business choosing between them.
 pub fn extract(jpeg: &[u8]) -> Option<Secondaries> {
-    let listed = mpf_images(jpeg)?;
+    let listed = mpf_entries(jpeg)?;
     let images: Vec<Vec<u8>> = listed
         .iter()
         .skip(1)
-        .map(|&(start, size)| jpeg[start..start + size].to_vec())
+        .map(|&(start, size, _)| jpeg[start..start + size].to_vec())
         .collect();
+    let entries = listed.iter().map(|&(_, _, entry)| entry).collect();
     if images.is_empty() {
         return None;
     }
@@ -172,7 +192,7 @@ pub fn extract(jpeg: &[u8]) -> Option<Secondaries> {
         .find(|(m, _, p)| *m == 0xE2 && p.starts_with(ISO_TAG))
         .map(|(_, _, p)| p.to_vec());
 
-    Some(Secondaries { images, iso_segment, has_gain_map })
+    Some(Secondaries { images, iso_segment, has_gain_map, entries })
 }
 
 /// Whether a file signals high dynamic range at all.
@@ -287,6 +307,13 @@ const MPF_ENTRIES_REL: u32 = 50;
 /// Multi Picture Format type code for the baseline primary image.
 const MP_TYPE_PRIMARY: u32 = 0x0003_0000;
 
+/// What an index written from nothing says: a baseline primary, then
+/// pictures of undefined type, which is what a gain map is listed as.
+fn default_entries(images: usize) -> Vec<MpEntry> {
+    let entry = |attribute| MpEntry { attribute, dependents: [0, 0] };
+    std::iter::once(entry(MP_TYPE_PRIMARY)).chain(std::iter::repeat_n(entry(0), images)).collect()
+}
+
 /// Payload size for a file holding `images` pictures in total.
 fn mpf_payload_len(images: usize) -> usize {
     MPF_HEADER_LEN + 16 * images
@@ -297,7 +324,8 @@ fn mpf_payload_len(images: usize) -> usize {
 /// `tiff_base` is where the format's TIFF header sits in the finished file,
 /// because every offset in the index is measured from there rather than from
 /// the start of the file, and the first image is always recorded as zero.
-fn mpf_segment(primary_len: usize, secondaries: &[usize], tiff_base: usize) -> Vec<u8> {
+/// `entries` holds one entry for the primary and one for each secondary.
+fn mpf_segment(primary_len: usize, secondaries: &[usize], tiff_base: usize, entries: &[MpEntry]) -> Vec<u8> {
     let total = 1 + secondaries.len();
     let mut p = Vec::with_capacity(mpf_payload_len(total));
     p.extend_from_slice(MPF_TAG);
@@ -316,17 +344,17 @@ fn mpf_segment(primary_len: usize, secondaries: &[usize], tiff_base: usize) -> V
     p.extend_from_slice(&0u32.to_be_bytes()); // no further index
     debug_assert_eq!(p.len(), MPF_HEADER_LEN);
 
-    let mut entry = |attr: u32, size: u32, offset: u32| {
-        p.extend_from_slice(&attr.to_be_bytes());
+    let mut entry = |listed: MpEntry, size: u32, offset: u32| {
+        p.extend_from_slice(&listed.attribute.to_be_bytes());
         p.extend_from_slice(&size.to_be_bytes());
         p.extend_from_slice(&offset.to_be_bytes());
-        p.extend_from_slice(&0u16.to_be_bytes()); // no dependent image
-        p.extend_from_slice(&0u16.to_be_bytes());
+        p.extend_from_slice(&listed.dependents[0].to_be_bytes());
+        p.extend_from_slice(&listed.dependents[1].to_be_bytes());
     };
-    entry(MP_TYPE_PRIMARY, primary_len as u32, 0);
+    entry(entries[0], primary_len as u32, 0);
     let mut at = primary_len;
-    for &size in secondaries {
-        entry(0, size as u32, (at - tiff_base) as u32);
+    for (&size, &listed) in secondaries.iter().zip(&entries[1..]) {
+        entry(listed, size as u32, (at - tiff_base) as u32);
         at += size;
     }
     debug_assert_eq!(p.len(), mpf_payload_len(total));
@@ -340,6 +368,17 @@ fn mpf_segment(primary_len: usize, secondaries: &[usize], tiff_base: usize) -> V
 /// The knot is cut by knowing the index is a fixed 86 bytes: the primary's final
 /// length can be computed before a single byte is written.
 pub fn attach(primary: &[u8], images: &[Vec<u8>], iso_segment: Option<&[u8]>) -> Option<Vec<u8>> {
+    attach_listed(primary, images, &default_entries(images.len()), iso_segment)
+}
+
+/// `attach`, writing each picture's index entry as `entries` gives it: the
+/// primary's, then each secondary's. A source's stereo views and thumbnails
+/// keep the types it listed them under, which a reader goes by. `entries` of
+/// any other length than the pictures is a refusal.
+pub fn attach_listed(primary: &[u8], images: &[Vec<u8>], entries: &[MpEntry], iso_segment: Option<&[u8]>) -> Option<Vec<u8>> {
+    if entries.len() != 1 + images.len() {
+        return None;
+    }
     if images.is_empty() {
         return Some(primary.to_vec());
     }
@@ -358,7 +397,7 @@ pub fn attach(primary: &[u8], images: &[Vec<u8>], iso_segment: Option<&[u8]>) ->
 
     let tiff_base = mpf_payload_start + MPF_TAG.len();
     let sizes: Vec<usize> = images.iter().map(Vec::len).collect();
-    let segment = mpf_segment(out.len(), &sizes, tiff_base);
+    let segment = mpf_segment(out.len(), &sizes, tiff_base, entries);
     out[mpf_payload_start..mpf_payload_start + payload_len].copy_from_slice(&segment);
     for image in images {
         out.extend_from_slice(image);
@@ -369,6 +408,11 @@ pub fn attach(primary: &[u8], images: &[Vec<u8>], iso_segment: Option<&[u8]>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Byte ranges of the images listed in the Multi Picture Format index.
+    fn mpf_images(jpeg: &[u8]) -> Option<Vec<(usize, usize)>> {
+        Some(mpf_entries(jpeg)?.into_iter().map(|(start, size, _)| (start, size)).collect())
+    }
 
     /// The smallest thing that parses as a JPEG for the purposes of these tests:
     /// a start marker, an APP0, and an end marker.
