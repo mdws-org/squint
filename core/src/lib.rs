@@ -40,6 +40,18 @@ pub const JPEG_SCORE_CEILING: f64 = 91.0;
 /// phone photograph is a fifth of it, and a large stitched panorama still fits.
 pub const MAX_PIXELS: usize = 250_000_000;
 
+/// The most pixels a quality search will take on. A picture above it is
+/// encoded once at the fixed quality, as Fast does, and the result says so.
+///
+/// A search holds the picture, each candidate and the metric's working planes
+/// at once, so its peak grows with the pixel count: measured on svk with the
+/// release build at 263 bytes a pixel for a 12 megapixel photograph (3.16 GB)
+/// and 275 for a 6 megapixel one (1.65 GB). Nothing else bounds one job. The
+/// queue's memory model only limits how many run together, and `MAX_PIXELS`
+/// lets through a picture whose search would ask for over 60 GB. At this cap a
+/// search peaks near 13 GB.
+pub const MAX_QUALITY_PIXELS: usize = 50_000_000;
+
 /// Ceiling on what a decoder may allocate, as a backstop behind the size check.
 ///
 /// Large enough for any picture that passes `MAX_PIXELS`, including the
@@ -694,6 +706,10 @@ pub struct Optimized {
     pub attachments: usize,
     /// JavaScript actions removed from a PDF. Zero for every other format.
     pub scripts: usize,
+    /// Quality was asked for, but the picture (or a picture inside a PDF) has
+    /// more than `MAX_QUALITY_PIXELS`, so it was encoded once at the fixed
+    /// quality instead of searched.
+    pub quality_fallback: bool,
 }
 
 /// Optimize an encoded image, dispatching on its format.
@@ -738,6 +754,25 @@ pub fn optimize_as(
     max_probes: usize,
     max_dimension: Option<u32>,
 ) -> Result<Optimized, Error> {
+    let settings = Settings { mode, target, fixed_quality, png_min_quality, max_probes, max_dimension };
+    optimize_within(bytes, format, &settings, MAX_QUALITY_PIXELS)
+}
+
+/// What a caller asked `optimize_as` for, carried as one value.
+#[derive(Clone, Copy)]
+struct Settings {
+    mode: Mode,
+    target: f64,
+    fixed_quality: f32,
+    png_min_quality: Option<u8>,
+    max_probes: usize,
+    max_dimension: Option<u32>,
+}
+
+/// `optimize_as`, with the largest picture a quality search may take on named
+/// rather than taken from `MAX_QUALITY_PIXELS`.
+fn optimize_within(bytes: &[u8], format: OutputFormat, settings: &Settings, quality_pixels: usize) -> Result<Optimized, Error> {
+    let Settings { mode, target, fixed_quality, png_min_quality, max_probes, max_dimension } = *settings;
     if mode == Mode::Strip {
         // A PDF says who wrote it, with what, and when, in its info dictionary
         // and again in an XMP packet. Both go; the pages are untouched.
@@ -772,6 +807,7 @@ pub fn optimize_as(
                 converted_from: None,
                 attachments: r.attachments,
                 scripts: r.scripts,
+                quality_fallback: r.quality_fallback,
             });
         }
 
@@ -796,6 +832,7 @@ pub fn optimize_as(
                 converted_from: None,
                 attachments: 0,
                 scripts: 0,
+                quality_fallback: false,
             });
         }
 
@@ -821,6 +858,7 @@ pub fn optimize_as(
                 converted_from: None,
                 attachments: 0,
                 scripts: 0,
+                quality_fallback: false,
             });
         }
 
@@ -852,6 +890,7 @@ pub fn optimize_as(
                 converted_from: None,
                 attachments: 0,
                 scripts: 0,
+                quality_fallback: false,
             });
         }
 
@@ -887,6 +926,7 @@ pub fn optimize_as(
             converted_from: None,
             attachments: 0,
             scripts: 0,
+            quality_fallback: false,
         });
     }
 
@@ -954,6 +994,7 @@ pub fn optimize_as(
             converted_from: None,
             attachments: r.attachments,
             scripts: r.scripts,
+            quality_fallback: r.quality_fallback,
         });
     }
 
@@ -967,12 +1008,13 @@ pub fn optimize_as(
             // percent.
             Mode::Fast | Mode::Strip => png::Effort::Quick,
         };
-        let r = png::optimize_png(
+        let r = png::optimize_png_within(
             bytes,
             png_min_quality,
             (mode == Mode::Quality).then_some(target),
             effort,
             max_dimension,
+            quality_pixels,
         )?;
         return Ok(Optimized {
             data: r.data,
@@ -985,6 +1027,7 @@ pub fn optimize_as(
             converted_from: None,
             attachments: 0,
             scripts: 0,
+            quality_fallback: r.quality_fallback,
         });
     }
 
@@ -1020,6 +1063,11 @@ pub fn optimize_as(
     let image = src.image;
     let icc = src.icc;
 
+    // Decided on the picture as decoded, after any cap on its size, since that
+    // is what the search would hold.
+    let quality_fallback = mode == Mode::Quality && image.width.saturating_mul(image.height) > quality_pixels;
+    let mode = if quality_fallback { Mode::Fast } else { mode };
+
     // A JPEG photograph with a gain map, rewritten in place at its own size,
     // keeps the map. Copies, caps and conversions do not: they are made to be
     // sent somewhere small, and the original beside them keeps its range.
@@ -1030,7 +1078,9 @@ pub fn optimize_as(
         && gainmap::extract(bytes).is_some_and(|found| found.has_gain_map)
     {
         let hdr = HdrSource { bytes, orientation };
-        return hdr_in_place(&hdr, &image, icc.as_deref(), mode, target, fixed_quality, max_probes, size_to_beat);
+        let mut r = hdr_in_place(&hdr, &image, icc.as_deref(), mode, target, fixed_quality, max_probes, size_to_beat)?;
+        r.quality_fallback = quality_fallback;
+        return Ok(r);
     }
     #[cfg(not(target_os = "macos"))]
     let _ = orientation;
@@ -1087,6 +1137,7 @@ pub fn optimize_as(
         converted_from,
         attachments: 0,
         scripts: 0,
+        quality_fallback,
     })
 }
 
@@ -1165,6 +1216,7 @@ fn hdr_in_place(
         converted_from: None,
         attachments: 0,
         scripts: 0,
+        quality_fallback: false,
     })
 }
 
@@ -1450,6 +1502,52 @@ mod tests {
             })
             .collect();
         png::RgbaImage { pixels, width: side, height: side }.encode_png().unwrap()
+    }
+
+    /// A noisy photograph-like JPEG, so a fixed-quality re-encode of it is
+    /// smaller and a search has something to measure.
+    fn noisy_jpeg(side: usize) -> Vec<u8> {
+        let mut state = 1u32;
+        let pixels: Vec<u8> = (0..side * side * 3)
+            .map(|i| {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                ((i % 256) as u8).wrapping_add((state >> 24) as u8 / 4)
+            })
+            .collect();
+        encode_jpeg(&Image::from_rgb8(&pixels, side, side), 95.0, None).expect("encodes")
+    }
+
+    /// A search's memory grows with the picture, about 263 bytes a pixel, and
+    /// nothing bounded it: the decode limit let through a picture whose search
+    /// would ask for tens of gigabytes. Above the budget, quality is encoded
+    /// once at the fixed quality, and the result says so.
+    #[test]
+    fn a_picture_above_the_search_budget_is_encoded_once_and_says_so() {
+        let quality = Settings {
+            mode: Mode::Quality,
+            target: 70.0,
+            fixed_quality: 75.0,
+            png_min_quality: Some(70),
+            max_probes: 6,
+            max_dimension: None,
+        };
+        let jpeg = noisy_jpeg(160);
+        let over = optimize_within(&jpeg, OutputFormat::Jpeg, &quality, 159 * 160).unwrap_or_else(|e| panic!("{e}"));
+        assert!(over.quality_fallback, "the result does not say the search was skipped");
+        assert!(over.probes.is_empty(), "a picture over the budget was searched");
+        assert_eq!((over.score, over.quality), (None, Some(75.0)), "not encoded as Fast encodes");
+        let fast = optimize(&jpeg, Mode::Fast, 70.0, 75.0, Some(70), 6, None).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(over.data, fast.data, "the fallback is not what Fast writes");
+
+        let within = optimize_within(&jpeg, OutputFormat::Jpeg, &quality, 160 * 160).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!within.quality_fallback);
+        assert!(!within.probes.is_empty(), "a picture inside the budget was not searched");
+
+        let png = photographic_png(160);
+        let lossless = Settings { png_min_quality: None, ..quality };
+        let over = optimize_within(&png, OutputFormat::Jpeg, &lossless, 159 * 160).unwrap_or_else(|e| panic!("{e}"));
+        assert!(over.quality_fallback, "a PNG over the budget does not say so");
+        assert_eq!(over.score, None, "a PNG over the budget was searched");
     }
 
     #[test]

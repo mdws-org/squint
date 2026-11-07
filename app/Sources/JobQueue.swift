@@ -183,7 +183,8 @@ final class JobQueue: ObservableObject {
                     quantized: result.quantized,
                     outputExtension: result.outputExtension,
                     attachments: result.attachments,
-                    scripts: result.scripts
+                    scripts: result.scripts,
+                    qualityFallback: result.qualityFallback
                 )
             } catch let failure as Engine.Failure {
                 // "Already optimal" answers a question about the original.

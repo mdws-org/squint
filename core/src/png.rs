@@ -222,6 +222,9 @@ pub struct PngResult {
     pub data: Vec<u8>,
     pub score: Option<f64>,
     pub quantized: bool,
+    /// A target was given, but the picture has more than the pixels a search
+    /// may take on, so the colours were handled as Fast handles them.
+    pub quality_fallback: bool,
 }
 
 /// Optimize a PNG. With `min_quality` set, colours are quantized first.
@@ -234,7 +237,23 @@ pub fn optimize_png(
     effort: Effort,
     max_dimension: Option<u32>,
 ) -> Result<PngResult, Error> {
+    optimize_png_within(bytes, min_quality, target, effort, max_dimension, crate::MAX_QUALITY_PIXELS)
+}
+
+/// `optimize_png`, with the largest picture a colour search may take on named
+/// rather than taken from `MAX_QUALITY_PIXELS`. Above it a target is dropped
+/// and the colours are reduced to `min_quality`, as Fast reduces them.
+pub(crate) fn optimize_png_within(
+    bytes: &[u8],
+    min_quality: Option<u8>,
+    target: Option<f64>,
+    effort: Effort,
+    max_dimension: Option<u32>,
+    quality_pixels: usize,
+) -> Result<PngResult, Error> {
     let source = RgbaImage::decode_capped(bytes, max_dimension)?;
+    let quality_fallback = target.is_some() && source.width.saturating_mul(source.height) > quality_pixels;
+    let target = if quality_fallback { None } else { target };
 
     // Quality mode promises a score, and a picture this small cannot be scored.
     if target.is_some() && source.shorter_side() < crate::MIN_PERCEPTUAL_DIM {
@@ -270,7 +289,7 @@ pub fn optimize_png(
         None => None,
     };
 
-    Ok(PngResult { data: optimized, score, quantized })
+    Ok(PngResult { data: optimized, score, quantized, quality_fallback })
 }
 
 /// The colour floor to quantize at, or `None` to leave the colours alone.

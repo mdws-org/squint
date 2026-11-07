@@ -3,7 +3,7 @@
 //! This drives the engine without a user interface so that quality and speed can
 //! be measured against real photographs before any application exists.
 
-use squint_core::{score, optimize, optimize_as, png, Hdr, Mode, OutputFormat, Source, JPEG_SCORE_CEILING};
+use squint_core::{score, optimize, optimize_as, png, Hdr, Mode, OutputFormat, Source, JPEG_SCORE_CEILING, MAX_QUALITY_PIXELS};
 use std::time::Instant;
 
 /// How the gain map fared, for the line the harness prints.
@@ -30,6 +30,18 @@ fn scripts_note(n: usize) -> String {
         0 => String::new(),
         1 => "  1 script removed".into(),
         n => format!("  {n} scripts removed"),
+    }
+}
+
+/// A quality search skipped because the picture is too large to search.
+fn fallback_note(fell_back: bool) -> String {
+    if fell_back {
+        format!(
+            "  over {} MP, so encoded once at the fixed quality rather than searched",
+            MAX_QUALITY_PIXELS / 1_000_000
+        )
+    } else {
+        String::new()
     }
 }
 
@@ -167,13 +179,14 @@ fn main() {
         match png::optimize_png(&bytes, png_min_quality, measure.then_some(target), effort, max_dimension) {
             Ok(r) => {
                 println!(
-                    "{}  {:>7.0} KB -> {:>7.0} KB  {:>5.1}%  {}{}  {:.3}s",
+                    "{}  {:>7.0} KB -> {:>7.0} KB  {:>5.1}%  {}{}{}  {:.3}s",
                     path,
                     bytes.len() as f64 / 1024.0,
                     r.data.len() as f64 / 1024.0,
                     100.0 * r.data.len() as f64 / bytes.len() as f64,
                     if r.quantized { "quantized" } else { "lossless" },
                     match r.score { Some(s) => format!("  score {s:.3}"), None => String::new() },
+                    fallback_note(r.quality_fallback),
                     t0.elapsed().as_secs_f64()
                 );
                 if let Some(o) = &out_path {
@@ -209,7 +222,7 @@ fn main() {
         match optimize_as(&bytes, format, requested, target, fixed_quality, png_min_quality, probes, None) {
             Ok(r) => {
                 println!(
-                    "{}  {} {:>7.0} KB -> {:>7.0} KB  {:>5.1}%  images re-encoded in place{}{}  {:.3}s",
+                    "{}  {} {:>7.0} KB -> {:>7.0} KB  {:>5.1}%  images re-encoded in place{}{}{}  {:.3}s",
                     path,
                     match pages {
                         Some(n) => format!("{n} pages "),
@@ -220,6 +233,7 @@ fn main() {
                     100.0 * r.data.len() as f64 / bytes.len() as f64,
                     scripts_note(r.scripts),
                     attachments_note(r.attachments),
+                    fallback_note(r.quality_fallback),
                     t0.elapsed().as_secs_f64()
                 );
                 if let Some(o) = &out_path {
@@ -299,7 +313,7 @@ fn main() {
                 None => format!("  {:>5.1}% of original", 100.0 * r.data.len() as f64 / bytes.len() as f64),
             };
             println!(
-                "{:<8} {:<6} {:>7.0} KB{}{}  {} probes  {:.3}s{}{}{}",
+                "{:<8} {:<6} {:>7.0} KB{}{}  {} probes  {:.3}s{}{}{}{}",
                 mode,
                 r.quality.map_or("-".to_string(), |q| format!("q{q:.1}")),
                 r.data.len() as f64 / 1024.0,
@@ -312,7 +326,8 @@ fn main() {
                     Some(f) => format!("  written as {} (from {f})", format.extension().to_uppercase()),
                     None => "".into(),
                 },
-                attachments_note(r.attachments)
+                attachments_note(r.attachments),
+                fallback_note(r.quality_fallback)
             );
             if let Some(o) = &out_path {
                 // A converted result is a different kind of file from its

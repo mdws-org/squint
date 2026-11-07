@@ -62,6 +62,9 @@ pub struct Rewritten {
     /// document whose only removable content is a script is not reported as
     /// having nothing to remove.
     pub scripts: usize,
+    /// Quality was asked for and at least one picture had more than
+    /// `MAX_QUALITY_PIXELS`, so it was encoded once at the fixed quality.
+    pub quality_fallback: bool,
 }
 
 /// Files attached to the document, as a reader finds them: every filespec
@@ -475,6 +478,7 @@ pub fn rewrite(
             metadata_removed,
             attachments,
             scripts,
+            quality_fallback: false,
         });
     }
 
@@ -485,6 +489,7 @@ pub fn rewrite(
     let candidates = image_candidates(&doc);
 
     let mut images_rewritten = 0usize;
+    let mut quality_fallback = false;
     let images_seen = candidates.len();
 
     for id in candidates {
@@ -517,11 +522,12 @@ pub fn rewrite(
             }
             _ => None,
         };
-        let Some((encoded, w, h)) =
+        let Some((encoded, w, h, fell_back)) =
             encode_one(&image, mode, target, fixed_quality, max_probes, capped)
         else {
             continue;
         };
+        quality_fallback |= fell_back;
 
         // Never grow: a picture already smaller than anything this can produce
         // keeps the bytes it arrived with.
@@ -554,7 +560,15 @@ pub fn rewrite(
     doc.save_modern(&mut out)
         .map_err(|e| Error::Encode(format!("this PDF could not be written: {e}")))?;
 
-    Ok(Rewritten { data: out, images_rewritten, images_seen, metadata_removed, attachments: attachment_count(&doc), scripts })
+    Ok(Rewritten {
+        data: out,
+        images_rewritten,
+        images_seen,
+        metadata_removed,
+        attachments: attachment_count(&doc),
+        scripts,
+        quality_fallback,
+    })
 }
 
 /// Draw a picture smaller, through the same filter every other cap here uses.
@@ -566,7 +580,8 @@ fn downscaled(picture: &Image, edge: u32) -> Option<Image> {
     Some(Image::from_rgb8(&smaller.into_raw(), w, h))
 }
 
-/// Encode one picture the way the mode asks for, with the size it came out as.
+/// Encode one picture the way the mode asks for, with the size it came out as
+/// and whether a quality search was skipped for its size.
 fn encode_one(
     image: &Image,
     mode: Mode,
@@ -574,7 +589,7 @@ fn encode_one(
     fixed_quality: f32,
     max_probes: usize,
     cap: Option<u32>,
-) -> Option<(Vec<u8>, usize, usize)> {
+) -> Option<(Vec<u8>, usize, usize, bool)> {
     let scaled;
     let image = match cap {
         Some(edge) => {
@@ -583,8 +598,9 @@ fn encode_one(
         }
         None => image,
     };
+    let too_large = image.width.saturating_mul(image.height) > crate::MAX_QUALITY_PIXELS;
     let encoded = match mode {
-        Mode::Quality if image.shorter_side() >= crate::MIN_PERCEPTUAL_DIM => {
+        Mode::Quality if image.shorter_side() >= crate::MIN_PERCEPTUAL_DIM && !too_large => {
             // No size to beat here: the caller compares against the stream it
             // is replacing, which is a different thing from this picture alone.
             search_as(OutputFormat::Jpeg, image, target, max_probes, None, None)
@@ -593,7 +609,7 @@ fn encode_one(
         }
         _ => encode_jpeg(image, fixed_quality, None).ok()?,
     };
-    Some((encoded, image.width, image.height))
+    Some((encoded, image.width, image.height, mode == Mode::Quality && too_large))
 }
 
 /// Remove what the document says about itself.

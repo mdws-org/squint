@@ -73,6 +73,9 @@ pub struct SquintResult {
     /// JavaScript actions removed from a PDF. Zero for every other format and
     /// on failure.
     pub scripts: c_int,
+    /// Non-zero when quality was asked for and the picture was too large to
+    /// search, so it was encoded once at the fixed quality.
+    pub quality_fallback: c_int,
 }
 
 impl SquintResult {
@@ -92,6 +95,7 @@ impl SquintResult {
             converted: 0,
             attachments: 0,
             scripts: 0,
+            quality_fallback: 0,
         }
     }
 }
@@ -235,6 +239,7 @@ pub unsafe extern "C" fn squint_optimize_as(
                 converted: if out.converted_from.is_some() { 1 } else { 0 },
                 attachments: c_int::try_from(out.attachments).unwrap_or(c_int::MAX),
                 scripts: c_int::try_from(out.scripts).unwrap_or(c_int::MAX),
+                quality_fallback: c_int::from(out.quality_fallback),
             }
         }
         Err(e) => SquintResult::failure(code_for(&e), input_len, Some(&e.to_string())),
