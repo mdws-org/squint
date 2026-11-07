@@ -34,3 +34,15 @@ python3 tools/corpus-run.py core/target/release/squint corpus -o corpus-report.j
 Exit codes: 0 clean, 1 dangerous runs, 2 the harness itself failed (no executable binary, missing or changed seeds, no controls, nothing tested).
 
 Verified by substitution: a stand-in engine that writes a black JPEG for every input scores 199 dangerous runs on a 61-file corpus, every control included.
+
+## Audit repro files
+
+`audit-2026-11-06.py` writes one repro file per finding of the 2026-11-06 audit (`docs/audits/2026-11-06.md`) and judges an engine's output on them with tools other than squint: `exiftool -a -G1 -u`, Image I/O through `imageio-probe.swift`, and a byte scan with every Flate stream of a PDF inflated.
+
+```
+tools/audit-2026-11-06.py make fx core/target/release/squint
+tools/audit-2026-11-06.py judge fx core/target/release/squint
+tools/audit-2026-11-06.py measure mem core/target/release/squint
+```
+
+`make` needs macOS `sips` and `exiftool`; the engine is used only to write the base WebP. `judge` prints a line per check and exits 1 when any check finds a defect. `measure` reports the peak memory of Fast and Quality at 1.5, 3, 6 and 12 megapixels from `/usr/bin/time -l`, and needs about 3.5 GB free. `core/tests/fixtures/orientation-6.webp` and `orientation-6.png` are copies of two files `make` writes.
