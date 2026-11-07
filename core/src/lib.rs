@@ -1571,8 +1571,10 @@ mod tests {
         assert!(eight > phone, "a 12 MP photo would not be searched on 8 GB ({eight})");
         assert!(eight < 20_000_000, "8 GB allows a search that would not fit ({eight})");
         assert!(quality_pixels_for_memory(16 << 30).abs_diff(2 * eight) <= 1, "16 GB is not twice 8 GB");
-        assert!(physical_memory().is_some(), "hw.memsize could not be read");
-        assert_eq!(max_quality_pixels(), quality_pixels_for_memory(physical_memory().unwrap_or(0)));
+        if cfg!(target_os = "macos") {
+            assert!(physical_memory().is_some(), "hw.memsize could not be read");
+        }
+        assert_eq!(max_quality_pixels(), quality_pixels_for_memory(physical_memory().unwrap_or(FALLBACK_MEMORY)));
     }
 
     /// A search's memory grows with the picture, about 300 bytes a pixel, and
