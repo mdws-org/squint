@@ -210,7 +210,7 @@ Both sides of a comparison must be interpreted in the same colour space. Compari
 
 Fast mode is bounded by core count. It peaks at 167 MB per file.
 
-Quality mode is bounded by memory, and exceeding that bound is not merely wasteful but harmful. A 12 megapixel comparison peaks at 2.84 GB, and a whole 12 megapixel search at 3.16 GB, measured on 2026-11-07. A search's peak grows with the pixel count, so a picture over 50 megapixels is not searched: it is encoded once at the fixed quality, as Shrink does, and the result says so. Sixteen files on an 8 core, 8 GB machine took 36 seconds at two concurrent, 60 at four, and 116 at eight, against about 63 seconds run one at a time.
+Quality mode is bounded by memory, and exceeding that bound is not merely wasteful but harmful. A 12 megapixel comparison peaks at 2.84 GB, and a whole 12 megapixel search at 3.16 GB, measured on 2026-11-07. A search's peak grows with the pixel count, about 300 bytes a pixel, so a picture whose search would need more than half of the Mac's memory is not searched (about 14 megapixels on 8 GB, 28 on 16 GB, 57 on 32 GB): it is encoded once at the fixed quality, as Shrink does, and the result says so. Sixteen files on an 8 core, 8 GB machine took 36 seconds at two concurrent, 60 at four, and 116 at eight, against about 63 seconds run one at a time.
 
 ## Command line
 
