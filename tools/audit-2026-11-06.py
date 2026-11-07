@@ -333,7 +333,7 @@ def long_orientation_exif(value, order):
 def mpf_index(sizes, attrs, primary_len, tiff_base):
     entries = b""
     at = primary_len
-    for k, (size, attr) in enumerate(zip(sizes, attrs)):
+    for k, (size, attr) in enumerate(zip(sizes, attrs, strict=True)):
         offset = 0 if k == 0 else at - tiff_base
         if k:
             at += size
