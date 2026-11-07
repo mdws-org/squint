@@ -128,9 +128,26 @@ fn attachment_count(doc: &Document) -> usize {
 /// The marker is allowed to sit a little way in: some writers put a byte order
 /// mark or stray whitespace first, and a file that opens everywhere else should
 /// not be refused here on a technicality.
+///
+/// A file that opens as one of the pictures squint reads is that picture, even
+/// with the marker in its first kilobyte: a JPEG comment or a PNG text chunk
+/// can hold any text, and read as a PDF the picture is refused as one lopdf
+/// cannot parse.
 pub fn is_pdf(bytes: &[u8]) -> bool {
     let window = &bytes[..bytes.len().min(1024)];
-    window.windows(5).any(|w| w == b"%PDF-")
+    window.windows(5).any(|w| w == b"%PDF-") && !is_picture(bytes)
+}
+
+/// Whether these bytes open the way one of the formats squint reads as a
+/// picture does.
+fn is_picture(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xFF, 0xD8, 0xFF])
+        || bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        || crate::gif::is_gif(bytes)
+        || crate::webp::is_webp(bytes)
+        || crate::heif::is_isobmff_image(bytes)
+        || crate::tiff::is_tiff(bytes)
+        || crate::svg::is_svg(bytes)
 }
 
 /// Filters whose contents this module will not attempt to re-encode.
@@ -1861,6 +1878,25 @@ mod tests {
         let mut late = vec![b'x'; 4096];
         late.extend_from_slice(b"%PDF-1.7");
         assert!(!is_pdf(&late));
+    }
+
+    /// A picture whose first kilobyte holds the marker, in a JPEG comment as
+    /// ExifTool writes one or a PNG text chunk, was read as a PDF, and Strip
+    /// refused it as a document lopdf could not parse.
+    #[test]
+    fn a_picture_carrying_the_marker_is_still_a_picture() {
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xFE, 0x00, 0x1A];
+        jpeg.extend_from_slice(b"%PDF-1.7 scanned by Jane");
+        jpeg.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x07, b'f', b'r', b'a', b'm', b'e']);
+        jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x05, 0x01, 0x01, 0x00, 0x11, 0x22, 0xFF, 0xD9]);
+        assert!(!is_pdf(&jpeg), "a JPEG with the marker in a comment was read as a PDF");
+        let out = crate::optimize(&jpeg, Mode::Strip, 0.0, 0.0, None, 0, None).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!out.data.windows(5).any(|w| w == b"%PDF-"), "the comment survived");
+
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+        png.extend_from_slice(&[0; 17]);
+        png.extend_from_slice(b"\0\0\0\x10tEXt%PDF-1.4 notes");
+        assert!(!is_pdf(&png), "a PNG with the marker in a text chunk was read as a PDF");
     }
 
     #[test]
