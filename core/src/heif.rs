@@ -1207,7 +1207,7 @@ pub(crate) mod tests {
         let first = iinf.at + 14;
         let size = u32::from_be_bytes([heif[first], heif[first + 1], heif[first + 2], heif[first + 3]]) as usize;
         let second = first + size;
-        let mut source = heif.clone();
+        let mut source = heif;
         source[second + 16..second + 20].copy_from_slice(b"mime");
         let strings = b"photo at 51.5 N.xmp\0application/rdf+xml\0";
         let source = inserted(&source, second + size, strings, &[meta_at, iinf.at, second]);
