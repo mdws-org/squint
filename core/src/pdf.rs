@@ -63,7 +63,7 @@ pub struct Rewritten {
     /// having nothing to remove.
     pub scripts: usize,
     /// Quality was asked for and at least one picture had more than
-    /// `MAX_QUALITY_PIXELS`, so it was encoded once at the fixed quality.
+    /// `max_quality_pixels()`, so it was encoded once at the fixed quality.
     pub quality_fallback: bool,
 }
 
@@ -615,7 +615,7 @@ fn encode_one(
         }
         None => image,
     };
-    let too_large = image.width.saturating_mul(image.height) > crate::MAX_QUALITY_PIXELS;
+    let too_large = image.width.saturating_mul(image.height) > crate::max_quality_pixels();
     let encoded = match mode {
         Mode::Quality if image.shorter_side() >= crate::MIN_PERCEPTUAL_DIM && !too_large => {
             // No size to beat here: the caller compares against the stream it

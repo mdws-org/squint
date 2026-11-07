@@ -237,11 +237,11 @@ pub fn optimize_png(
     effort: Effort,
     max_dimension: Option<u32>,
 ) -> Result<PngResult, Error> {
-    optimize_png_within(bytes, min_quality, target, effort, max_dimension, crate::MAX_QUALITY_PIXELS)
+    optimize_png_within(bytes, min_quality, target, effort, max_dimension, crate::max_quality_pixels())
 }
 
 /// `optimize_png`, with the largest picture a colour search may take on named
-/// rather than taken from `MAX_QUALITY_PIXELS`. Above it a target is dropped
+/// rather than taken from `max_quality_pixels()`. Above it a target is dropped
 /// and the colours are reduced to `min_quality`, as Fast reduces them.
 pub(crate) fn optimize_png_within(
     bytes: &[u8],

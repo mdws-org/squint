@@ -40,17 +40,62 @@ pub const JPEG_SCORE_CEILING: f64 = 91.0;
 /// phone photograph is a fifth of it, and a large stitched panorama still fits.
 pub const MAX_PIXELS: usize = 250_000_000;
 
-/// The most pixels a quality search will take on. A picture above it is
-/// encoded once at the fixed quality, as Fast does, and the result says so.
+/// Peak memory of a quality search per pixel, rounded up.
 ///
 /// A search holds the picture, each candidate and the metric's working planes
-/// at once, so its peak grows with the pixel count: measured on svk with the
-/// release build at 263 bytes a pixel for a 12 megapixel photograph (3.16 GB)
-/// and 275 for a 6 megapixel one (1.65 GB). Nothing else bounds one job. The
-/// queue's memory model only limits how many run together, and `MAX_PIXELS`
-/// lets through a picture whose search would ask for over 60 GB. At this cap a
-/// search peaks near 13 GB.
-pub const MAX_QUALITY_PIXELS: usize = 50_000_000;
+/// at once, so its peak grows with the pixel count. Peak footprint measured on
+/// svk (M1, 8 GB) with the release build: 1.64 GB for a 6 megapixel JPEG (274
+/// bytes a pixel) and 3.56 GB for a 12 megapixel one (296).
+pub const QUALITY_BYTES_PER_PIXEL: u64 = 300;
+
+/// Physical memory assumed when the machine cannot be asked.
+const FALLBACK_MEMORY: u64 = 8 << 30;
+
+/// The most pixels a quality search will take on: the count whose search fits
+/// in half of this Mac's memory. A picture above it is encoded once at the
+/// fixed quality, as Fast does, and the result says so.
+///
+/// Nothing else bounds one job: the queue's memory model only limits how many
+/// run together, and `MAX_PIXELS` lets through a picture whose search would
+/// ask for over 60 GB. Half of memory keeps a 12 megapixel phone photograph
+/// searchable on an 8 GB Mac (about 14 megapixels there, 28 on 16 GB, 57 on
+/// 32 GB).
+pub fn max_quality_pixels() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| quality_pixels_for_memory(physical_memory().unwrap_or(FALLBACK_MEMORY)))
+}
+
+/// The quality-search pixel budget for a machine with `memory` bytes.
+pub fn quality_pixels_for_memory(memory: u64) -> usize {
+    usize::try_from(memory / 2 / QUALITY_BYTES_PER_PIXEL).unwrap_or(usize::MAX)
+}
+
+/// Installed memory in bytes, from the `hw.memsize` sysctl.
+#[cfg(target_os = "macos")]
+fn physical_memory() -> Option<u64> {
+    extern "C" {
+        fn sysctlbyname(
+            name: *const std::ffi::c_char,
+            oldp: *mut std::ffi::c_void,
+            oldlenp: *mut usize,
+            newp: *mut std::ffi::c_void,
+            newlen: usize,
+        ) -> std::ffi::c_int;
+    }
+    let mut value: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    // SAFETY: the name is NUL-terminated, and `value`/`len` describe a writable
+    // u64 that outlives the call.
+    let rc = unsafe {
+        sysctlbyname(c"hw.memsize".as_ptr(), (&raw mut value).cast(), &raw mut len, std::ptr::null_mut(), 0)
+    };
+    (rc == 0 && len == std::mem::size_of::<u64>() && value > 0).then_some(value)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn physical_memory() -> Option<u64> {
+    None
+}
 
 /// Ceiling on what a decoder may allocate, as a backstop behind the size check.
 ///
@@ -707,7 +752,7 @@ pub struct Optimized {
     /// JavaScript actions removed from a PDF. Zero for every other format.
     pub scripts: usize,
     /// Quality was asked for, but the picture (or a picture inside a PDF) has
-    /// more than `MAX_QUALITY_PIXELS`, so it was encoded once at the fixed
+    /// more than `max_quality_pixels()`, so it was encoded once at the fixed
     /// quality instead of searched.
     pub quality_fallback: bool,
 }
@@ -755,7 +800,7 @@ pub fn optimize_as(
     max_dimension: Option<u32>,
 ) -> Result<Optimized, Error> {
     let settings = Settings { mode, target, fixed_quality, png_min_quality, max_probes, max_dimension };
-    optimize_within(bytes, format, &settings, MAX_QUALITY_PIXELS)
+    optimize_within(bytes, format, &settings, max_quality_pixels())
 }
 
 /// What a caller asked `optimize_as` for, carried as one value.
@@ -770,7 +815,7 @@ struct Settings {
 }
 
 /// `optimize_as`, with the largest picture a quality search may take on named
-/// rather than taken from `MAX_QUALITY_PIXELS`.
+/// rather than taken from `max_quality_pixels()`.
 fn optimize_within(bytes: &[u8], format: OutputFormat, settings: &Settings, quality_pixels: usize) -> Result<Optimized, Error> {
     let Settings { mode, target, fixed_quality, png_min_quality, max_probes, max_dimension } = *settings;
     if mode == Mode::Strip {
@@ -1517,7 +1562,20 @@ mod tests {
         encode_jpeg(&Image::from_rgb8(&pixels, side, side), 95.0, None).expect("encodes")
     }
 
-    /// A search's memory grows with the picture, about 263 bytes a pixel, and
+    /// A 12 MP phone photograph (4032x3024) must stay searchable on an 8 GB
+    /// Mac, and the budget must grow with memory rather than sit at one number.
+    #[test]
+    fn the_search_budget_scales_with_memory_and_keeps_a_phone_photo_searchable() {
+        let phone = 4032 * 3024;
+        let eight = quality_pixels_for_memory(8 << 30);
+        assert!(eight > phone, "a 12 MP photo would not be searched on 8 GB ({eight})");
+        assert!(eight < 20_000_000, "8 GB allows a search that would not fit ({eight})");
+        assert!(quality_pixels_for_memory(16 << 30).abs_diff(2 * eight) <= 1, "16 GB is not twice 8 GB");
+        assert!(physical_memory().is_some(), "hw.memsize could not be read");
+        assert_eq!(max_quality_pixels(), quality_pixels_for_memory(physical_memory().unwrap_or(0)));
+    }
+
+    /// A search's memory grows with the picture, about 300 bytes a pixel, and
     /// nothing bounded it: the decode limit let through a picture whose search
     /// would ask for tens of gigabytes. Above the budget, quality is encoded
     /// once at the fixed quality, and the result says so.

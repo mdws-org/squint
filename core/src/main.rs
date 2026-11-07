@@ -3,7 +3,7 @@
 //! This drives the engine without a user interface so that quality and speed can
 //! be measured against real photographs before any application exists.
 
-use squint_core::{score, optimize, optimize_as, png, Hdr, Mode, OutputFormat, Source, JPEG_SCORE_CEILING, MAX_QUALITY_PIXELS};
+use squint_core::{score, optimize, optimize_as, png, Hdr, Mode, OutputFormat, Source, JPEG_SCORE_CEILING, max_quality_pixels};
 use std::time::Instant;
 
 /// How the gain map fared, for the line the harness prints.
@@ -38,7 +38,7 @@ fn fallback_note(fell_back: bool) -> String {
     if fell_back {
         format!(
             "  over {} MP, so encoded once at the fixed quality rather than searched",
-            MAX_QUALITY_PIXELS / 1_000_000
+            max_quality_pixels() / 1_000_000
         )
     } else {
         String::new()
