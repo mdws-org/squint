@@ -1936,6 +1936,56 @@ mod tests {
         }
     }
 
+    /// A JPEG whose only EXIF field is the orientation, with the field's type,
+    /// value and byte order as given, and a scan to strip.
+    fn jpeg_with_orientation(kind: u16, value: u32, big: bool) -> Vec<u8> {
+        let u16b = |v: u16| if big { v.to_be_bytes() } else { v.to_le_bytes() };
+        let u32b = |v: u32| if big { v.to_be_bytes() } else { v.to_le_bytes() };
+        let mut exif = b"Exif\0\0".to_vec();
+        exif.extend_from_slice(if big { b"MM" } else { b"II" });
+        exif.extend_from_slice(&u16b(42));
+        exif.extend_from_slice(&u32b(8));
+        exif.extend_from_slice(&u16b(1));
+        exif.extend_from_slice(&u16b(0x0112));
+        exif.extend_from_slice(&u16b(kind));
+        exif.extend_from_slice(&u32b(1));
+        // A SHORT sits in the value field's first two bytes, a LONG fills it.
+        if kind == 3 {
+            exif.extend_from_slice(&u16b(value as u16));
+            exif.extend_from_slice(&[0, 0]);
+        } else {
+            exif.extend_from_slice(&u32b(value));
+        }
+        exif.extend_from_slice(&u32b(0));
+        let mut jpeg = vec![0xFF, 0xD8];
+        jpeg.extend(segment(0xE1, &exif));
+        jpeg.extend(segment(0xFE, b"a comment, so a strip has something to remove"));
+        jpeg.extend(segment(0xC0, b"frame"));
+        jpeg.extend(segment(0xDA, b"\x01\x01\x00"));
+        jpeg.extend_from_slice(&[0x11, 0x22, 0xFF, 0xD9]);
+        jpeg
+    }
+
+    /// Image I/O reads an orientation only when it is a SHORT from 1 to 8.
+    /// A big-endian LONG 6 was read as 0 and a little-endian one as 6, so Strip
+    /// wrote back an orientation of 0, which no reader accepts, or a turn the
+    /// source's viewers never applied.
+    #[test]
+    fn an_orientation_that_is_not_a_short_from_1_to_8_is_no_orientation() {
+        for big in [true, false] {
+            assert_eq!(extract_orientation(&jpeg_with_orientation(3, 6, big)), 6, "the control must read");
+            for (kind, value) in [(4u16, 6u32), (3, 0), (3, 9), (9, 6)] {
+                let jpeg = jpeg_with_orientation(kind, value, big);
+                assert_eq!(extract_orientation(&jpeg), 1, "type {kind} value {value} big-endian {big} was read");
+                let out = optimize(&jpeg, Mode::Strip, 0.0, 0.0, None, 0, None).unwrap_or_else(|e| panic!("{e}"));
+                assert!(
+                    !out.data.windows(2).any(|w| w == [0xFF, 0xE1]),
+                    "type {kind} value {value} big-endian {big} wrote an orientation back"
+                );
+            }
+        }
+    }
+
     #[test]
     fn perceptual_targeting_is_refused_below_the_valid_size() {
         let img = Image { pixels: vec![[0, 0, 0]; 100 * 100], width: 100, height: 100 };

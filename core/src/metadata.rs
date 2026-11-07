@@ -86,6 +86,13 @@ pub fn extract_orientation(jpeg: &[u8]) -> u16 {
 ///
 /// `None` distinguishes "this is not a TIFF block, or it has no orientation"
 /// from an orientation of 1, which is a picture that is already upright.
+///
+/// An orientation is read only as Image I/O reads one: typed SHORT, as EXIF
+/// defines it, and from 1 to 8. A field of any other type or value is no
+/// orientation at all. Measured on macOS 27.2: Image I/O draws a JPEG whose
+/// orientation is a LONG 6, in either byte order, unturned and reports no
+/// orientation, so turning it here would turn a picture its viewers show
+/// upright, and writing the value back would write a tag no reader accepts.
 pub(crate) fn orientation_in_tiff(tiff: &[u8]) -> Option<u16> {
     // Some writers put the JPEG marker on the WebP chunk too. Skipping it here
     // costs nothing and saves the caller from having to know.
@@ -119,8 +126,10 @@ pub(crate) fn orientation_in_tiff(tiff: &[u8]) -> Option<u16> {
             break;
         }
         if u16at(tiff, off) == 0x0112 {
-            // Value is a SHORT stored in the first two bytes of the value field.
-            return Some(u16at(tiff, off + 8));
+            // A SHORT sits in the first two bytes of the four byte value field.
+            const SHORT: u16 = 3;
+            let value = (u16at(tiff, off + 2) == SHORT).then(|| u16at(tiff, off + 8));
+            return value.filter(|v| (1..=8).contains(v));
         }
     }
     None
