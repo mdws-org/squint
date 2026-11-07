@@ -801,7 +801,9 @@ pub fn optimize_as(
         if webp::is_webp(bytes) {
             let (stripped, wiped) = webp::strip_webp(bytes)
                 .ok_or_else(|| Error::Decode("this WebP is not laid out as expected".into()))?;
-            if wiped == 0 {
+            // An `EXIF` chunk holding only the orientation is dropped and
+            // written back the same, so a second Strip is caught here.
+            if wiped == 0 || stripped == bytes {
                 return Err(Error::NothingToRemove);
             }
             return Ok(Optimized {

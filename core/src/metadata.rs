@@ -140,6 +140,14 @@ pub(crate) fn orientation_in_tiff(tiff: &[u8]) -> Option<u16> {
 pub fn orientation_segment(orientation: u16) -> Vec<u8> {
     let mut p = Vec::with_capacity(32);
     p.extend_from_slice(b"Exif\0\0");
+    p.extend_from_slice(&orientation_tiff(orientation));
+    p
+}
+
+/// The TIFF block inside `orientation_segment`, with no `Exif\0\0` marker in
+/// front: the form a WebP `EXIF` chunk and a PNG `eXIf` chunk hold it in.
+pub(crate) fn orientation_tiff(orientation: u16) -> Vec<u8> {
+    let mut p = Vec::with_capacity(26);
     p.extend_from_slice(b"MM\x00\x2a\x00\x00\x00\x08"); // big endian, first entry at 8
     p.extend_from_slice(&1u16.to_be_bytes()); // one field
     p.extend_from_slice(&0x0112u16.to_be_bytes()); // orientation
