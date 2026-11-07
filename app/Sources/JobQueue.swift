@@ -122,12 +122,33 @@ final class JobQueue: ObservableObject {
         }
     }
 
+    /// What a file looked like when it was read: its length, when it was last
+    /// written, and which file on the volume it is.
+    private struct Stamp: Equatable {
+        let size: Int
+        let modified: Date
+        let file: Int
+
+        init(_ url: URL) throws {
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            size = (attributes[.size] as? NSNumber)?.intValue ?? -1
+            modified = attributes[.modificationDate] as? Date ?? .distantPast
+            file = (attributes[.systemFileNumber] as? NSNumber)?.intValue ?? -1
+        }
+    }
+
     /// Read, optimize, and replace. The work happens off the main actor; only the
     /// state update comes back to it.
+    ///
+    /// The file is stamped before it is read and checked again before it is
+    /// replaced. A quality search can take a minute, and an edit saved in that
+    /// time would otherwise be overwritten by a result made from the bytes
+    /// the file held before it.
     private static func process(_ job: Job, preset: Preset, target: Double) async {
         let url = await job.url
         let outcome: Job.State = await Task.detached(priority: .userInitiated) {
             do {
+                let readAt = try Stamp(url)
                 let input = try Data(contentsOf: url)
                 // Judged from the bytes, not the name: a JPEG that arrived
                 // as `.heic` is a JPEG and may be replaced in place as one,
@@ -169,6 +190,9 @@ final class JobQueue: ObservableObject {
                     )
                 }
                 if landsOnSource {
+                    guard try Stamp(url) == readAt else {
+                        return .failed("the file changed while Squint was working on it, so nothing was written")
+                    }
                     try Writer.replaceInPlace(url, with: result.data)
                 } else {
                     // A derived copy: the original is not touched, and a copy

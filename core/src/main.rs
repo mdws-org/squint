@@ -45,6 +45,33 @@ fn fallback_note(fell_back: bool) -> String {
     }
 }
 
+/// What a file looked like when it was read: its length and when it was last
+/// written. A file whose stamp has changed since is not the file that was read.
+type Stamp = Option<(u64, std::time::SystemTime)>;
+
+fn stamp(path: &str) -> Stamp {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
+}
+
+/// Write a result to `out`, unless `out` is the source and the source has
+/// changed since it was read: the result was made from the old bytes, and
+/// writing it would replace whatever was written in the meantime.
+fn try_write_out(out: &str, data: &[u8], source: &str, read_at: Stamp) -> Result<(), String> {
+    let same = std::fs::canonicalize(out).ok().is_some_and(|o| std::fs::canonicalize(source).ok() == Some(o));
+    if same && (read_at.is_none() || stamp(source) != read_at) {
+        return Err(format!("{source} changed while squint was working on it, so nothing was written"));
+    }
+    std::fs::write(out, data).map_err(|e| format!("write failed: {e}"))
+}
+
+fn write_out(out: &str, data: &[u8], source: &str, read_at: Stamp) {
+    if let Err(e) = try_write_out(out, data, source, read_at) {
+        eprintln!("{e}");
+        std::process::exit(1)
+    }
+}
+
 fn usage() -> ! {
     eprintln!(
         "usage: squint <image> [--mode fast|quality] [--target <score>] [--quality <n>] [--probes <n>]
@@ -117,6 +144,8 @@ fn main() {
         i += 2;
     }
 
+    // Taken before the read, so that a write landing between the two is seen.
+    let read_at = stamp(path);
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
@@ -156,7 +185,7 @@ fn main() {
                     t0.elapsed().as_secs_f64()
                 );
                 if let Some(o) = &out_path {
-                    std::fs::write(o, &r.data).unwrap_or_else(|e| { eprintln!("write failed: {e}"); std::process::exit(1) });
+                    write_out(o, &r.data, path, read_at);
                     println!("         wrote {o}");
                 }
             }
@@ -190,7 +219,7 @@ fn main() {
                     t0.elapsed().as_secs_f64()
                 );
                 if let Some(o) = &out_path {
-                    std::fs::write(o, &r.data).unwrap_or_else(|e| { eprintln!("write failed: {e}"); std::process::exit(1) });
+                    write_out(o, &r.data, path, read_at);
                     println!("         wrote {o}");
                 }
             }
@@ -237,8 +266,7 @@ fn main() {
                     t0.elapsed().as_secs_f64()
                 );
                 if let Some(o) = &out_path {
-                    std::fs::write(o, &r.data)
-                        .unwrap_or_else(|e| { eprintln!("write failed: {e}"); std::process::exit(1) });
+                    write_out(o, &r.data, path, read_at);
                     println!("         wrote {o}");
                 }
             }
@@ -343,7 +371,7 @@ fn main() {
                     );
                     std::process::exit(1)
                 }
-                std::fs::write(o, &r.data).unwrap_or_else(|e| { eprintln!("write failed: {e}"); std::process::exit(1) });
+                write_out(o, &r.data, path, read_at);
                 println!("         wrote {o}");
             }
         }
@@ -352,5 +380,35 @@ fn main() {
             println!("self-score {s:.4} (sanity check, expect 100)");
         }
         _ => usage(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file edited while squint worked on it was replaced by a result made
+    /// from the bytes it held before the edit.
+    #[test]
+    fn a_source_that_changed_since_it_was_read_is_not_written_over() {
+        let dir = std::env::temp_dir().join(format!("squint-write-out-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("photo.jpg");
+        let path = file.to_str().unwrap();
+        std::fs::write(&file, b"the original").unwrap();
+
+        let read_at = stamp(path);
+        try_write_out(path, b"the result", path, read_at).expect("an unchanged source is written over");
+        assert_eq!(std::fs::read(&file).unwrap(), b"the result");
+
+        let read_at = stamp(path);
+        std::fs::write(&file, b"an edit made while squint was working").unwrap();
+        assert!(try_write_out(path, b"the result", path, read_at).is_err(), "the edit was written over");
+        assert_eq!(std::fs::read(&file).unwrap(), b"an edit made while squint was working");
+
+        // Written somewhere else, the result goes regardless.
+        let other = dir.join("copy.jpg");
+        try_write_out(other.to_str().unwrap(), b"the result", path, read_at).expect("a copy is written");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
