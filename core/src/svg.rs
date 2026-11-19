@@ -105,16 +105,18 @@ pub fn rasterize(
     long_edge: Option<u32>,
     max_pixels: usize,
 ) -> Result<(Vec<u8>, usize, usize), crate::Error> {
-    let mut opt = usvg::Options::default();
-    opt.fontdb = get_fontdb();
     // An SVG can name a file and have the renderer fetch it: `<image
     // href="file:///…">` is resolved from disk by the default resolver. A
     // program whose purpose is removing what a picture discloses must not be
     // talked into reading the filesystem by the picture it was handed, so only
     // data URLs are honoured and a path resolves to nothing.
-    opt.image_href_resolver = usvg::ImageHrefResolver {
-        resolve_data: usvg::ImageHrefResolver::default_data_resolver(),
-        resolve_string: Box::new(|_href, _opts| None),
+    let opt = usvg::Options {
+        fontdb: get_fontdb(),
+        image_href_resolver: usvg::ImageHrefResolver {
+            resolve_data: usvg::ImageHrefResolver::default_data_resolver(),
+            resolve_string: Box::new(|_href, _opts| None),
+        },
+        ..usvg::Options::default()
     };
 
     let tree = usvg::Tree::from_data(bytes, &opt)
@@ -166,7 +168,9 @@ pub fn rasterize(
     // premultiplication is the identity. Dropping it is all that is left.
     let rgb = pixmap
         .take()
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|p| [p[0], p[1], p[2]])
         .collect();
     Ok((rgb, target_w, target_h))

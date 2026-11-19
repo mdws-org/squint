@@ -72,6 +72,12 @@ pub struct SquintResult {
     /// Files attached inside a PDF, kept as they were because no mode reads
     /// them. Zero for every other format and on failure.
     pub attachments: c_int,
+    /// JavaScript actions removed from a PDF. Zero for every other format and
+    /// on failure.
+    pub scripts: c_int,
+    /// Non-zero when quality was asked for and the picture was too large to
+    /// search, so it was encoded once at the fixed quality.
+    pub quality_fallback: c_int,
 }
 
 impl SquintResult {
@@ -90,6 +96,8 @@ impl SquintResult {
             error_message,
             converted: 0,
             attachments: 0,
+            scripts: 0,
+            quality_fallback: 0,
         }
     }
 }
@@ -133,16 +141,20 @@ pub unsafe extern "C" fn squint_optimize(
     png_min_quality: c_int,
     max_dimension: c_int,
 ) -> SquintResult {
-    squint_optimize_as(
-        input,
-        input_len,
-        SQUINT_FORMAT_JPEG,
-        mode,
-        target,
-        fixed_quality,
-        png_min_quality,
-        max_dimension,
-    )
+    // SAFETY: `squint_optimize_as` asks only that `input` point to `input_len`
+    // readable bytes, which is this function's own contract with its caller.
+    unsafe {
+        squint_optimize_as(
+            input,
+            input_len,
+            SQUINT_FORMAT_JPEG,
+            mode,
+            target,
+            fixed_quality,
+            png_min_quality,
+            max_dimension,
+        )
+    }
 }
 
 /// Optimize, writing the format the caller names.
@@ -162,7 +174,6 @@ pub unsafe extern "C" fn squint_optimize(
 /// # Safety
 /// `input` must point to `input_len` readable bytes.
 #[no_mangle]
-#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn squint_optimize_as(
     input: *const u8,
     input_len: usize,
@@ -182,7 +193,10 @@ pub unsafe extern "C" fn squint_optimize_as(
         SQUINT_FORMAT_WEBP_LOSSLESS => OutputFormat::WebpLossless,
         _ => return SquintResult::failure(SQUINT_ERR_UNKNOWN_FORMAT, input_len, None),
     };
-    let bytes = std::slice::from_raw_parts(input, input_len);
+    // SAFETY: `input` was checked non-null above, a `u8` pointer has no
+    // alignment to meet, and the caller guarantees `input_len` readable bytes
+    // behind it for the length of this call.
+    let bytes = unsafe { std::slice::from_raw_parts(input, input_len) };
     // Every mode is named here and any other value is refused. Collapsing the
     // unrecognised case into fast is what once silently turned strip into a
     // re-encode: the caller asked for the pixels to be left alone and got
@@ -222,8 +236,17 @@ pub unsafe extern "C" fn squint_strip_typed(input: *const u8, input_len: usize, 
     if input.is_null() || input_len == 0 {
         return SquintResult::failure(SQUINT_ERR_NULL_INPUT, 0, None);
     }
-    let bytes = std::slice::from_raw_parts(input, input_len);
-    let hint = if type_hint.is_null() { None } else { std::ffi::CStr::from_ptr(type_hint).to_str().ok() };
+    // SAFETY: `input` was checked non-null above, a `u8` pointer has no
+    // alignment to meet, and the caller guarantees `input_len` readable bytes
+    // behind it for the length of this call.
+    let bytes = unsafe { std::slice::from_raw_parts(input, input_len) };
+    let hint = if type_hint.is_null() {
+        None
+    } else {
+        // SAFETY: `type_hint` was checked non-null, and the caller guarantees
+        // it points to a NUL-terminated string that lives through this call.
+        unsafe { std::ffi::CStr::from_ptr(type_hint) }.to_str().ok()
+    };
     // As in `squint_optimize_as`: nothing may unwind past this frame.
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| strip_typed(bytes, hint)))
         .unwrap_or(Err(Error::Panicked));
@@ -232,11 +255,11 @@ pub unsafe extern "C" fn squint_strip_typed(input: *const u8, input_len: usize, 
 
 fn result_of(outcome: Result<Optimized, Error>, input_len: usize) -> SquintResult {
     match outcome {
-        Ok(mut out) => {
-            out.data.shrink_to_fit();
+        Ok(out) => {
+            // A boxed slice has no spare capacity, so `len` alone is enough to
+            // rebuild it in `squint_result_free`.
             let len = out.data.len();
-            let ptr = out.data.as_mut_ptr();
-            std::mem::forget(out.data);
+            let ptr = Box::into_raw(out.data.into_boxed_slice()).cast::<u8>();
             SquintResult {
                 data: ptr,
                 len,
@@ -252,6 +275,8 @@ fn result_of(outcome: Result<Optimized, Error>, input_len: usize) -> SquintResul
                 error_message: std::ptr::null_mut(),
                 converted: if out.converted_from.is_some() { 1 } else { 0 },
                 attachments: c_int::try_from(out.attachments).unwrap_or(c_int::MAX),
+                scripts: c_int::try_from(out.scripts).unwrap_or(c_int::MAX),
+                quality_fallback: c_int::from(out.quality_fallback),
             }
         }
         Err(e) => SquintResult::failure(code_for(&e), input_len, Some(&e.to_string())),
@@ -267,232 +292,16 @@ fn result_of(outcome: Result<Optimized, Error>, input_len: usize) -> SquintResul
 #[no_mangle]
 pub unsafe extern "C" fn squint_result_free(result: SquintResult) {
     if !result.data.is_null() && result.len > 0 {
-        drop(Vec::from_raw_parts(result.data, result.len, result.len));
+        let data = std::ptr::slice_from_raw_parts_mut(result.data, result.len);
+        // SAFETY: a non-null `data` was made by `Box::into_raw` on a boxed
+        // slice of exactly `len` bytes in `squint_optimize_as`, and the caller
+        // guarantees this result came from this library and is freed once.
+        drop(unsafe { Box::from_raw(data) });
     }
     if !result.error_message.is_null() {
-        drop(std::ffi::CString::from_raw(result.error_message));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A picture with no structure to exploit, so a PNG of it is close to raw
-    /// size and any lossy encode of it is far smaller: the never-grow rule can
-    /// never be what decides these tests.
-    fn noisy_png(side: u32) -> Vec<u8> {
-        let mut state: u32 = 0x9E37_79B9;
-        let img = image::RgbImage::from_fn(side, side, |_, _| {
-            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            let b = state.to_be_bytes();
-            image::Rgb([b[0], b[1], b[2]])
-        });
-        let mut out = std::io::Cursor::new(Vec::new());
-        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
-        out.into_inner()
-    }
-
-    unsafe fn call(bytes: &[u8], format: c_int, mode: c_int) -> SquintResult {
-        squint_optimize_as(bytes.as_ptr(), bytes.len(), format, mode, 80.0, 75.0, -1, 0)
-    }
-
-    #[test]
-    fn a_typed_strip_with_no_input_is_refused_and_a_null_type_is_none() {
-        let r = unsafe { squint_strip_typed(std::ptr::null(), 0, std::ptr::null()) };
-        assert_eq!(r.error, SQUINT_ERR_NULL_INPUT);
-        unsafe { squint_result_free(r) };
-        // A TIFF of ordinary pixels with a camera maker to strip.
-        const MAKE: &[u8] = b"Acme Camera Co\0";
-        let mut tiff = b"II\x2A\x00\0\0\0\0".to_vec();
-        tiff.extend_from_slice(MAKE);
-        tiff.extend_from_slice(&[0xAA; 16]);
-        let dir = tiff.len() as u32;
-        tiff[4..8].copy_from_slice(&dir.to_le_bytes());
-        tiff.extend_from_slice(&4u16.to_le_bytes());
-        for (tag, kind, count, value) in
-            [(0x0106u16, 3u16, 1u32, 2u32), (0x010F, 2, MAKE.len() as u32, 8), (0x0111, 4, 1, 8 + MAKE.len() as u32), (0x0117, 4, 1, 16)]
-        {
-            for field in [&tag.to_le_bytes()[..], &kind.to_le_bytes(), &count.to_le_bytes(), &value.to_le_bytes()] {
-                tiff.extend_from_slice(field);
-            }
-        }
-        tiff.extend_from_slice(&[0; 4]);
-        for hint in [None, Some(c"public.tiff")] {
-            let r = unsafe { squint_strip_typed(tiff.as_ptr(), tiff.len(), hint.map_or(std::ptr::null(), |h| h.as_ptr())) };
-            assert_eq!(r.error, SQUINT_OK, "with {hint:?}");
-            let out = unsafe { std::slice::from_raw_parts(r.data, r.len) };
-            assert!(!out.windows(4).any(|w| w == b"Acme"), "the maker stayed with {hint:?}");
-            unsafe { squint_result_free(r) };
-        }
-    }
-
-    /// A camera raw that nothing here opens as a raw comes back as its own
-    /// error code, with the engine's sentence.
-    #[test]
-    fn a_refused_camera_raw_has_its_own_code() {
-        let mut tiff = b"II\x2A\x00\0\0\0\0".to_vec();
-        tiff.extend_from_slice(b"Acme Camera Co\0\0");
-        tiff.extend_from_slice(&[0xAA; 16]);
-        tiff[4..8].copy_from_slice(&40u32.to_le_bytes());
-        tiff.extend_from_slice(&4u16.to_le_bytes());
-        for (tag, kind, count, value) in [(0x0106u16, 3u16, 1u32, 32803u32), (0x010F, 2, 15, 8), (0x0111, 4, 1, 24), (0x0117, 4, 1, 16)] {
-            for field in [&tag.to_le_bytes()[..], &kind.to_le_bytes(), &count.to_le_bytes(), &value.to_le_bytes()] {
-                tiff.extend_from_slice(field);
-            }
-        }
-        tiff.extend_from_slice(&[0; 4]);
-        let r = unsafe { squint_strip_typed(tiff.as_ptr(), tiff.len(), c"com.nikon.raw-image".as_ptr()) };
-        assert_eq!(r.error, SQUINT_ERR_RAW);
-        assert!(r.data.is_null());
-        let message = unsafe { std::ffi::CStr::from_ptr(r.error_message) }.to_str().unwrap().to_owned();
-        assert!(message.contains("DNG"), "{message}");
-        assert!(!unsafe { std::ffi::CStr::from_ptr(squint_error_message(SQUINT_ERR_RAW)) }.to_bytes().starts_with(b"unknown"));
-        unsafe { squint_result_free(r) };
-        // The older entry point strips through the same check.
-        let r = unsafe { call(&tiff, SQUINT_FORMAT_JPEG, SQUINT_MODE_STRIP) };
-        assert_eq!(r.error, SQUINT_ERR_RAW);
-        unsafe { squint_result_free(r) };
-    }
-
-    #[test]
-    fn a_format_code_the_engine_does_not_know_is_refused() {
-        let png = noisy_png(16);
-        // 99 is nobody's format. Reading it as JPEG would hand the caller a
-        // JPEG it did not ask for and let it be written over the source.
-        let r = unsafe { call(&png, 99, SQUINT_MODE_FAST) };
-        assert_eq!(r.error, SQUINT_ERR_UNKNOWN_FORMAT);
-        assert!(r.data.is_null());
-        assert_eq!(r.original_len, png.len());
-        unsafe { squint_result_free(r) };
-    }
-
-    #[test]
-    fn a_mode_code_the_engine_does_not_know_is_refused() {
-        let png = noisy_png(16);
-        // Read as fast, this would re-encode a file whose caller may have
-        // asked for its pixels to be left alone.
-        let r = unsafe { call(&png, SQUINT_FORMAT_JPEG, 7) };
-        assert_eq!(r.error, SQUINT_ERR_UNKNOWN_MODE);
-        assert!(r.data.is_null());
-        unsafe { squint_result_free(r) };
-    }
-
-    /// A PDF with a long producer entry, so that a Strip of it shrinks, and
-    /// one attached file listed in its EmbeddedFiles name tree.
-    fn pdf_with_an_attachment() -> Vec<u8> {
-        let producer = "x".repeat(4000);
-        let objects = [
-            "<</Type/Catalog/Pages 2 0 R/Names<</EmbeddedFiles<</Names[(a.txt)4 0 R]>>>>>>".to_string(),
-            "<</Type/Pages/Kids[]/Count 0>>".to_string(),
-            format!("<</Producer({producer})>>"),
-            "<</Type/Filespec/F(a.txt)/EF<</F 5 0 R>>>>".to_string(),
-            "<</Type/EmbeddedFile/Length 5>>stream\nhello\nendstream".to_string(),
-        ];
-        let mut out = String::from("%PDF-1.7\n");
-        let mut offsets = Vec::new();
-        for (i, body) in objects.iter().enumerate() {
-            offsets.push(out.len());
-            out.push_str(&format!("{} 0 obj{body}endobj\n", i + 1));
-        }
-        let xref = out.len();
-        out.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1));
-        for offset in offsets {
-            out.push_str(&format!("{offset:010} 00000 n \n"));
-        }
-        out.push_str(&format!("trailer<</Size {}/Root 1 0 R/Info 3 0 R>>\nstartxref\n{xref}\n%%EOF\n", objects.len() + 1));
-        out.into_bytes()
-    }
-
-    /// The count of attached files reaches the app with the result, so the row
-    /// can say they were kept unread.
-    #[test]
-    fn a_strip_reports_the_files_attached_to_a_pdf() {
-        let pdf = pdf_with_an_attachment();
-        let r = unsafe { call(&pdf, SQUINT_FORMAT_JPEG, SQUINT_MODE_STRIP) };
-        assert_eq!(r.error, SQUINT_OK, "{:?}", unsafe { std::ffi::CStr::from_ptr(r.error_message) });
-        assert_eq!(r.attachments, 1);
-        unsafe { squint_result_free(r) };
-    }
-
-    /// Three hand-written objects with no room to spare: removing the one
-    /// producer entry cannot pay for the object and cross-reference streams the
-    /// rewrite adds, so a Strip of it comes out larger.
-    fn tiny_pdf_with_producer() -> Vec<u8> {
-        let objects = ["<</Type/Catalog/Pages 2 0 R>>", "<</Type/Pages/Kids[]/Count 0>>", "<</Producer(x)>>"];
-        let mut out = String::from("%PDF-1.4\n");
-        let mut offsets = Vec::new();
-        for (i, body) in objects.iter().enumerate() {
-            offsets.push(out.len());
-            out.push_str(&format!("{} 0 obj{body}endobj\n", i + 1));
-        }
-        let xref = out.len();
-        out.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1));
-        for offset in offsets {
-            out.push_str(&format!("{offset:010} 00000 n \n"));
-        }
-        out.push_str(&format!("trailer<</Size {}/Root 1 0 R/Info 3 0 R>>\nstartxref\n{xref}\n%%EOF\n", objects.len() + 1));
-        out.into_bytes()
-    }
-
-    /// A Strip that found metadata but would have grown the file keeps the
-    /// original, metadata included. It came back under the already-optimal
-    /// code, which the app words as "nothing to remove" in Strip mode: a claim
-    /// about privacy that was false.
-    #[test]
-    fn a_strip_that_would_grow_is_not_reported_as_nothing_to_remove() {
-        let pdf = tiny_pdf_with_producer();
-        let r = unsafe { squint_optimize(pdf.as_ptr(), pdf.len(), SQUINT_MODE_STRIP, 80.0, 75.0, -1, 0) };
-        let code = r.error;
-        unsafe { squint_result_free(r) };
-        assert_ne!(code, SQUINT_OK, "the test premise is a Strip that grows");
-        assert_ne!(code, SQUINT_ERR_NO_SMALLER, "a grown Strip was reported as nothing to remove");
-    }
-
-    #[test]
-    fn the_plain_entry_point_still_means_the_input_format() {
-        let png = noisy_png(64);
-        let r = unsafe {
-            squint_optimize(png.as_ptr(), png.len(), SQUINT_MODE_FAST, 80.0, 75.0, -1, 0)
-        };
-        // Noise may already be as small as a PNG gets, which is an outcome and
-        // not a routing fault. What must hold is that nothing was converted.
-        if r.error == SQUINT_OK {
-            let out = unsafe { std::slice::from_raw_parts(r.data, r.len) };
-            assert!(out.starts_with(&[0x89, b'P', b'N', b'G']), "a PNG stays a PNG");
-            assert_eq!(r.converted, 0);
-        } else {
-            assert_eq!(r.error, SQUINT_ERR_NO_SMALLER);
-        }
-        unsafe { squint_result_free(r) };
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn asking_for_avif_reports_a_conversion() {
-        let png = noisy_png(128);
-        let r = unsafe { call(&png, SQUINT_FORMAT_AVIF, SQUINT_MODE_FAST) };
-        assert_eq!(r.error, SQUINT_OK, "{}", unsafe {
-            if r.error_message.is_null() {
-                String::new()
-            } else {
-                std::ffi::CStr::from_ptr(r.error_message).to_string_lossy().into_owned()
-            }
-        });
-        let out = unsafe { std::slice::from_raw_parts(r.data, r.len) };
-        assert_eq!(&out[4..8], b"ftyp", "the bytes are an ISOBMFF container");
-        assert_eq!(r.converted, 1, "an AVIF made from a PNG is a different kind of file");
-        assert!(r.len < png.len());
-        unsafe { squint_result_free(r) };
-    }
-
-    #[test]
-    fn a_pdf_asked_for_as_avif_is_refused_not_converted() {
-        let pdf = b"%PDF-1.4\n1 0 obj << /Type /Catalog >> endobj\ntrailer << /Root 1 0 R >>\n%%EOF\n";
-        let r = unsafe { call(pdf, SQUINT_FORMAT_AVIF, SQUINT_MODE_FAST) };
-        assert_eq!(r.error, SQUINT_ERR_READ_ONLY);
-        assert!(r.data.is_null());
-        unsafe { squint_result_free(r) };
+        // SAFETY: a non-null `error_message` was made by `CString::into_raw` in
+        // `SquintResult::failure`, and the caller guarantees it is freed once.
+        drop(unsafe { std::ffi::CString::from_raw(result.error_message) });
     }
 }
 
@@ -522,4 +331,277 @@ pub extern "C" fn squint_error_message(code: c_int) -> *const c_char {
         _ => b"unknown error\0",
     };
     s.as_ptr() as *const c_char
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A picture with no structure to exploit, so a PNG of it is close to raw
+    /// size and any lossy encode of it is far smaller: the never-grow rule can
+    /// never be what decides these tests.
+    fn noisy_png(side: u32) -> Vec<u8> {
+        let mut state: u32 = 0x9E37_79B9;
+        let img = image::RgbImage::from_fn(side, side, |_, _| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let b = state.to_be_bytes();
+            image::Rgb([b[0], b[1], b[2]])
+        });
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
+    fn call(bytes: &[u8], format: c_int, mode: c_int) -> SquintResult {
+        // SAFETY: the pointer and length come from one live slice.
+        unsafe { squint_optimize_as(bytes.as_ptr(), bytes.len(), format, mode, 80.0, 75.0, -1, 0) }
+    }
+
+    fn free(r: SquintResult) {
+        // SAFETY: every result in these tests comes from this library and is
+        // passed here once, after its last read.
+        unsafe { squint_result_free(r) }
+    }
+
+    fn message(r: &SquintResult) -> String {
+        if r.error_message.is_null() {
+            return String::new();
+        }
+        // SAFETY: a non-null `error_message` is a NUL-terminated string from
+        // `CString::into_raw`, alive until `r` is freed, which `r`'s borrow
+        // here prevents.
+        unsafe { std::ffi::CStr::from_ptr(r.error_message) }.to_string_lossy().into_owned()
+    }
+
+    fn output(r: &SquintResult) -> &[u8] {
+        assert!(!r.data.is_null());
+        // SAFETY: a non-null `data` points to `len` initialized bytes owned by
+        // `r`, and the returned slice borrows `r`, so it cannot outlive the
+        // free that takes `r` by value.
+        unsafe { std::slice::from_raw_parts(r.data, r.len) }
+    }
+
+    fn strip_typed_call(bytes: &[u8], hint: Option<&std::ffi::CStr>) -> SquintResult {
+        // SAFETY: the pointer and length come from one live slice, and the hint
+        // is null or a live NUL-terminated string.
+        unsafe { squint_strip_typed(bytes.as_ptr(), bytes.len(), hint.map_or(std::ptr::null(), std::ffi::CStr::as_ptr)) }
+    }
+
+    #[test]
+    fn a_typed_strip_with_no_input_is_refused_and_a_null_type_is_none() {
+        // SAFETY: a null input is the case under test, which the function
+        // checks before reading anything; the hint is null.
+        let r = unsafe { squint_strip_typed(std::ptr::null(), 0, std::ptr::null()) };
+        assert_eq!(r.error, SQUINT_ERR_NULL_INPUT);
+        free(r);
+        // A TIFF of ordinary pixels with a camera maker to strip.
+        const MAKE: &[u8] = b"Acme Camera Co\0";
+        let mut tiff = b"II\x2A\x00\0\0\0\0".to_vec();
+        tiff.extend_from_slice(MAKE);
+        tiff.extend_from_slice(&[0xAA; 16]);
+        let dir = tiff.len() as u32;
+        tiff[4..8].copy_from_slice(&dir.to_le_bytes());
+        tiff.extend_from_slice(&4u16.to_le_bytes());
+        for (tag, kind, count, value) in
+            [(0x0106u16, 3u16, 1u32, 2u32), (0x010F, 2, MAKE.len() as u32, 8), (0x0111, 4, 1, 8 + MAKE.len() as u32), (0x0117, 4, 1, 16)]
+        {
+            for field in [&tag.to_le_bytes()[..], &kind.to_le_bytes(), &count.to_le_bytes(), &value.to_le_bytes()] {
+                tiff.extend_from_slice(field);
+            }
+        }
+        tiff.extend_from_slice(&[0; 4]);
+        for hint in [None, Some(c"public.tiff")] {
+            let r = strip_typed_call(&tiff, hint);
+            assert_eq!(r.error, SQUINT_OK, "with {hint:?}");
+            assert!(!output(&r).windows(4).any(|w| w == b"Acme"), "the maker stayed with {hint:?}");
+            free(r);
+        }
+    }
+
+    /// A camera raw that nothing here opens as a raw comes back as its own
+    /// error code, with the engine's sentence.
+    #[test]
+    fn a_refused_camera_raw_has_its_own_code() {
+        let mut tiff = b"II\x2A\x00\0\0\0\0".to_vec();
+        tiff.extend_from_slice(b"Acme Camera Co\0\0");
+        tiff.extend_from_slice(&[0xAA; 16]);
+        tiff[4..8].copy_from_slice(&40u32.to_le_bytes());
+        tiff.extend_from_slice(&4u16.to_le_bytes());
+        for (tag, kind, count, value) in [(0x0106u16, 3u16, 1u32, 32803u32), (0x010F, 2, 15, 8), (0x0111, 4, 1, 24), (0x0117, 4, 1, 16)] {
+            for field in [&tag.to_le_bytes()[..], &kind.to_le_bytes(), &count.to_le_bytes(), &value.to_le_bytes()] {
+                tiff.extend_from_slice(field);
+            }
+        }
+        tiff.extend_from_slice(&[0; 4]);
+        let r = strip_typed_call(&tiff, Some(c"com.nikon.raw-image"));
+        assert_eq!(r.error, SQUINT_ERR_RAW);
+        assert!(r.data.is_null());
+        let text = message(&r);
+        assert!(text.contains("DNG"), "{text}");
+        // SAFETY: `squint_error_message` returns a static NUL-terminated string.
+        let fixed = unsafe { std::ffi::CStr::from_ptr(squint_error_message(SQUINT_ERR_RAW)) };
+        assert!(!fixed.to_bytes().starts_with(b"unknown"));
+        free(r);
+        // The older entry point strips through the same check.
+        let r = call(&tiff, SQUINT_FORMAT_JPEG, SQUINT_MODE_STRIP);
+        assert_eq!(r.error, SQUINT_ERR_RAW);
+        free(r);
+    }
+
+    #[test]
+    fn a_format_code_the_engine_does_not_know_is_refused() {
+        let png = noisy_png(16);
+        // 99 is nobody's format. Reading it as JPEG would hand the caller a
+        // JPEG it did not ask for and let it be written over the source.
+        let r = call(&png, 99, SQUINT_MODE_FAST);
+        assert_eq!(r.error, SQUINT_ERR_UNKNOWN_FORMAT);
+        assert!(r.data.is_null());
+        assert_eq!(r.original_len, png.len());
+        free(r);
+    }
+
+    #[test]
+    fn a_mode_code_the_engine_does_not_know_is_refused() {
+        let png = noisy_png(16);
+        // Read as fast, this would re-encode a file whose caller may have
+        // asked for its pixels to be left alone.
+        let r = call(&png, SQUINT_FORMAT_JPEG, 7);
+        assert_eq!(r.error, SQUINT_ERR_UNKNOWN_MODE);
+        assert!(r.data.is_null());
+        free(r);
+    }
+
+    /// A PDF with a long producer entry, so that a Strip of it shrinks, and
+    /// one attached file listed in its EmbeddedFiles name tree.
+    fn pdf_with_an_attachment() -> Vec<u8> {
+        let producer = "x".repeat(4000);
+        let objects = [
+            "<</Type/Catalog/Pages 2 0 R/Names<</EmbeddedFiles<</Names[(a.txt)4 0 R]>>>>>>".to_string(),
+            "<</Type/Pages/Kids[]/Count 0>>".to_string(),
+            format!("<</Producer({producer})>>"),
+            "<</Type/Filespec/F(a.txt)/EF<</F 5 0 R>>>>".to_string(),
+            "<</Type/EmbeddedFile/Length 5>>stream\nhello\nendstream".to_string(),
+        ];
+        assembled(&objects)
+    }
+
+    /// A PDF holding `objects` as objects 1, 2 and on, with the first as the
+    /// catalog and the third as the info dictionary.
+    fn assembled(objects: &[String]) -> Vec<u8> {
+        let mut out = String::from("%PDF-1.7\n");
+        let mut offsets = Vec::new();
+        for (i, body) in objects.iter().enumerate() {
+            offsets.push(out.len());
+            out.push_str(&format!("{} 0 obj{body}endobj\n", i + 1));
+        }
+        let xref = out.len();
+        out.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1));
+        for offset in offsets {
+            out.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        out.push_str(&format!("trailer<</Size {}/Root 1 0 R/Info 3 0 R>>\nstartxref\n{xref}\n%%EOF\n", objects.len() + 1));
+        out.into_bytes()
+    }
+
+    /// The count of attached files reaches the app with the result, so the row
+    /// can say they were kept unread.
+    #[test]
+    fn a_strip_reports_the_files_attached_to_a_pdf() {
+        let pdf = pdf_with_an_attachment();
+        let r = call(&pdf, SQUINT_FORMAT_JPEG, SQUINT_MODE_STRIP);
+        assert_eq!(r.error, SQUINT_OK, "{}", message(&r));
+        assert_eq!(r.attachments, 1);
+        free(r);
+    }
+
+    /// The count of scripts removed reaches the app with the result, so the row
+    /// can say they went.
+    #[test]
+    fn a_strip_reports_the_scripts_it_removed_from_a_pdf() {
+        let objects = [
+            "<</Type/Catalog/Pages 2 0 R/OpenAction<</S/JavaScript/JS(app.alert\\(1\\))>>>>".to_string(),
+            "<</Type/Pages/Kids[]/Count 0>>".to_string(),
+            format!("<</Producer({})>>", "x".repeat(4000)),
+        ];
+        let r = call(&assembled(&objects), SQUINT_FORMAT_JPEG, SQUINT_MODE_STRIP);
+        assert_eq!(r.error, SQUINT_OK, "{}", message(&r));
+        assert_eq!(r.scripts, 1);
+        free(r);
+    }
+
+    /// Three hand-written objects with no room to spare: removing the one
+    /// producer entry cannot pay for the object and cross-reference streams the
+    /// rewrite adds, so a Strip of it comes out larger.
+    fn tiny_pdf_with_producer() -> Vec<u8> {
+        let objects = ["<</Type/Catalog/Pages 2 0 R>>", "<</Type/Pages/Kids[]/Count 0>>", "<</Producer(x)>>"];
+        let mut out = String::from("%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for (i, body) in objects.iter().enumerate() {
+            offsets.push(out.len());
+            out.push_str(&format!("{} 0 obj{body}endobj\n", i + 1));
+        }
+        let xref = out.len();
+        out.push_str(&format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1));
+        for offset in offsets {
+            out.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        out.push_str(&format!("trailer<</Size {}/Root 1 0 R/Info 3 0 R>>\nstartxref\n{xref}\n%%EOF\n", objects.len() + 1));
+        out.into_bytes()
+    }
+
+    /// A Strip that found metadata but would have grown the file keeps the
+    /// original, metadata included. It came back under the already-optimal
+    /// code, which the app words as "nothing to remove" in Strip mode: a claim
+    /// about privacy that was false.
+    #[test]
+    fn a_strip_that_would_grow_is_not_reported_as_nothing_to_remove() {
+        let pdf = tiny_pdf_with_producer();
+        // SAFETY: the pointer and length come from one live vector.
+        let r = unsafe { squint_optimize(pdf.as_ptr(), pdf.len(), SQUINT_MODE_STRIP, 80.0, 75.0, -1, 0) };
+        let code = r.error;
+        free(r);
+        assert_ne!(code, SQUINT_OK, "the test premise is a Strip that grows");
+        assert_ne!(code, SQUINT_ERR_NO_SMALLER, "a grown Strip was reported as nothing to remove");
+    }
+
+    #[test]
+    fn the_plain_entry_point_still_means_the_input_format() {
+        let png = noisy_png(64);
+        // SAFETY: the pointer and length come from one live vector.
+        let r = unsafe {
+            squint_optimize(png.as_ptr(), png.len(), SQUINT_MODE_FAST, 80.0, 75.0, -1, 0)
+        };
+        // Noise may already be as small as a PNG gets, which is an outcome and
+        // not a routing fault. What must hold is that nothing was converted.
+        if r.error == SQUINT_OK {
+            let out = output(&r);
+            assert!(out.starts_with(&[0x89, b'P', b'N', b'G']), "a PNG stays a PNG");
+            assert_eq!(r.converted, 0);
+        } else {
+            assert_eq!(r.error, SQUINT_ERR_NO_SMALLER);
+        }
+        free(r);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn asking_for_avif_reports_a_conversion() {
+        let png = noisy_png(128);
+        let r = call(&png, SQUINT_FORMAT_AVIF, SQUINT_MODE_FAST);
+        assert_eq!(r.error, SQUINT_OK, "{}", message(&r));
+        let out = output(&r);
+        assert_eq!(&out[4..8], b"ftyp", "the bytes are an ISOBMFF container");
+        assert_eq!(r.converted, 1, "an AVIF made from a PNG is a different kind of file");
+        assert!(r.len < png.len());
+        free(r);
+    }
+
+    #[test]
+    fn a_pdf_asked_for_as_avif_is_refused_not_converted() {
+        let pdf = b"%PDF-1.4\n1 0 obj << /Type /Catalog >> endobj\ntrailer << /Root 1 0 R >>\n%%EOF\n";
+        let r = call(pdf, SQUINT_FORMAT_AVIF, SQUINT_MODE_FAST);
+        assert_eq!(r.error, SQUINT_ERR_READ_ONLY);
+        assert!(r.data.is_null());
+        free(r);
+    }
 }

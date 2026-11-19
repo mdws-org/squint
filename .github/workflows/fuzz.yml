@@ -28,20 +28,39 @@ jobs:
       matrix:
         target: [strip, heif, webp, tiff, gif, pdf, png, open]
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: nightly
+      # Caches the compiled dependencies in core/fuzz/target and the
+      # cargo-fuzz binary in ~/.cargo/bin, one cache per fuzz target. The key
+      # includes the rustc version, so a new nightly starts a fresh cache.
+      # The engine is recompiled from the checked-out source on every run,
+      # since the checkout is newer than anything restored. Nothing is saved
+      # when a run fails, and the corpus and crash artifacts are not cached.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: core/fuzz -> target
+          key: ${{ matrix.target }}
       - name: install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       - name: seconds for this run
         id: budget
         run: |
           if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then echo "seconds=900" >> "$GITHUB_OUTPUT"; else echo "seconds=60" >> "$GITHUB_OUTPUT"; fi
+      # A target with a directory under fuzz/seeds starts from those files as
+      # well. libFuzzer writes new inputs only to the first directory, so the
+      # committed seeds are read and never changed.
       - name: fuzz ${{ matrix.target }}
-        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=${{ steps.budget.outputs.seconds }} -max_len=262144 -timeout=20
+        run: |
+          corpus=(fuzz/corpus/${{ matrix.target }})
+          mkdir -p "${corpus[0]}"
+          if [ -d fuzz/seeds/${{ matrix.target }} ]; then corpus+=(fuzz/seeds/${{ matrix.target }}); fi
+          cargo fuzz run ${{ matrix.target }} "${corpus[@]}" -- -max_total_time=${{ steps.budget.outputs.seconds }} -max_len=262144 -timeout=20
         working-directory: core
       - name: keep the crashing input
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-artifacts-${{ matrix.target }}
           path: core/fuzz/artifacts/

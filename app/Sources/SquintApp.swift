@@ -27,12 +27,17 @@ struct SquintApp: App {
                 .capturesItsOpener()
         }
         .windowResizability(.contentSize)
-        #if !APP_STORE
         .commands {
+            CommandGroup(before: .windowList) {
+                Button("Squint") { MainWindow.show() }
+                    .keyboardShortcut("0", modifiers: .command)
+                Divider()
+            }
+            #if !APP_STORE
             CommandGroup(after: .appInfo) {
                 CheckForUpdatesView(updater: updaterController.updater)
             }
+            #endif
         }
-        #endif
     }
 }

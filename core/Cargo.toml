@@ -1,6 +1,6 @@
 [package]
 name = "squint-core"
-version = "0.9.6"
+version = "0.9.9"
 edition = "2021"
 license = "GPL-3.0-or-later"
 description = "Perceptual image compression engine for squint"
@@ -14,7 +14,7 @@ oxipng = { version = "10", default-features = false, features = ["parallel", "zo
 rgb = "0.8"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 resvg = "0.48"
-lopdf = { version = "0.45", default-features = false }
+lopdf = { version = "0.47", default-features = false }
 
 [features]
 default = ["lossy-png"]
@@ -30,6 +30,17 @@ crate-type = ["staticlib", "rlib"]
 [[bin]]
 name = "squint"
 path = "src/main.rs"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"
+allow_attributes_without_reason = "warn"
+fn_params_excessive_bools = "warn"
+unwrap_used = "warn"
+redundant_clone = "warn"
 
 [profile.release]
 opt-level = 3

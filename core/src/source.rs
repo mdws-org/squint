@@ -109,7 +109,11 @@ impl Source {
         } else {
             let mut image = Image::decode_capped(bytes, max_dimension)?;
             let icc = extract_icc(bytes);
-            let orientation = extract_orientation(bytes);
+            let orientation = if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+                crate::png::orientation(bytes)
+            } else {
+                extract_orientation(bytes)
+            };
             image.apply_orientation(orientation);
 
             Ok(Source {
