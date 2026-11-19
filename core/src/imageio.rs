@@ -313,7 +313,7 @@ pub fn opens_as_raw(bytes: &[u8], type_hint: &str) -> bool {
         return false;
     };
     // SAFETY: `image` is a live CGImage.
-    unsafe { CGImageGetWidth(image.as_ptr() as CGImageRef) } > 0
+    (unsafe { CGImageGetWidth(image.as_ptr() as CGImageRef) }) > 0
 }
 
 /// The bytes a CFData holds, copied out.

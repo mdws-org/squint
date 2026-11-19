@@ -1452,10 +1452,11 @@ mod tests {
         assert_eq!(&out[16..32], &with[16..32], "the pixels moved");
         // Only the trailer: still something to remove.
         let plain = tiff_from(&[&[0xAA; 16]], &[(0x0111, 4, 1, 8), (0x0117, 4, 1, 16)]);
-        let (out, wiped) = strip_tiff(&with_samsung_trailer(plain.clone(), 0)).expect("a well formed trailer");
-        assert!(wiped > 0 && out[plain.len()..].iter().all(|&b| b == 0));
+        let end_of_plain = plain.len();
+        let (out, wiped) = strip_tiff(&with_samsung_trailer(plain, 0)).expect("a well formed trailer");
+        assert!(wiped > 0 && out[end_of_plain..].iter().all(|&b| b == 0));
         // A block said to start inside the pixels.
-        let over_pixels = with_samsung_trailer(tiff.clone(), 20);
+        let over_pixels = with_samsung_trailer(tiff, 20);
         assert!(strip_tiff(&over_pixels).is_none(), "a trailer over the pixels was wiped");
         // A directory length that does not reach a SEFH.
         let mut broken = with.clone();
