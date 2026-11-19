@@ -1459,7 +1459,7 @@ mod tests {
         let over_pixels = with_samsung_trailer(tiff, 20);
         assert!(strip_tiff(&over_pixels).is_none(), "a trailer over the pixels was wiped");
         // A directory length that does not reach a SEFH.
-        let mut broken = with.clone();
+        let mut broken = with;
         let at = broken.len() - 8;
         broken[at..at + 4].copy_from_slice(&5u32.to_le_bytes());
         assert!(strip_tiff(&broken).is_none(), "an unreadable trailer was left");
