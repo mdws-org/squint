@@ -107,6 +107,18 @@ extern "C" {
         cStr: *const std::ffi::c_char,
         encoding: u32,
     ) -> CFStringRef;
+    fn CFStringGetCString(theString: CFStringRef, buffer: *mut i8, bufferSize: isize, encoding: u32) -> bool;
+}
+
+#[link(name = "CoreServices", kind = "framework")]
+extern "C" {
+    static kUTTagClassFilenameExtension: CFStringRef;
+
+    fn UTTypeCreatePreferredIdentifierForTag(
+        tagClass: CFStringRef,
+        tag: CFStringRef,
+        conformingToUTI: CFStringRef,
+    ) -> CFStringRef;
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -144,6 +156,7 @@ extern "C" {
     static kCGImageAuxiliaryDataTypeHDRGainMap: CFStringRef;
     static kCGImageAuxiliaryDataTypeISOGainMap: CFStringRef;
     static kCGImageDestinationLossyCompressionQuality: CFStringRef;
+    static kCGImageSourceTypeIdentifierHint: CFStringRef;
 
     fn CGImageDestinationCreateWithData(
         data: CFMutableDataRef,
@@ -165,6 +178,7 @@ extern "C" {
 
     fn CGImageSourceCreateWithData(data: CFDataRef, options: CFDictionaryRef) -> CGImageSourceRef;
     fn CGImageSourceGetCount(isrc: CGImageSourceRef) -> usize;
+    fn CGImageSourceGetType(isrc: CGImageSourceRef) -> CFStringRef;
     fn CGImageSourceGetPrimaryImageIndex(isrc: CGImageSourceRef) -> usize;
     fn CGImageSourceGetStatus(isrc: CGImageSourceRef) -> i32;
     fn CGImageSourceGetStatusAtIndex(isrc: CGImageSourceRef, index: usize) -> i32;
@@ -223,6 +237,83 @@ fn data_from(bytes: &[u8]) -> Option<Cf<c_void>> {
     // never exceeds `isize::MAX`; CFDataCreate copies the bytes, so nothing
     // borrows `bytes` once it returns.
     Cf::wrap(unsafe { CFDataCreate(ptr::null(), bytes.as_ptr(), bytes.len() as isize) })
+}
+
+/// The text of a CFString, when it is UTF-8 and short.
+///
+/// # Safety
+/// `s` must be null or a live CFString.
+unsafe fn rust_string(s: CFStringRef) -> Option<String> {
+    if s.is_null() {
+        return None;
+    }
+    let mut buffer = [0u8; 256];
+    // SAFETY: `s` is a live CFString (the caller's contract, and checked
+    // non-null above), and the buffer's length goes with its pointer, so the
+    // call writes only inside it.
+    if !unsafe { CFStringGetCString(s, buffer.as_mut_ptr().cast(), buffer.len() as isize, K_CF_STRING_ENCODING_UTF8) } {
+        return None;
+    }
+    CStr::from_bytes_until_nul(&buffer).ok()?.to_str().ok().map(str::to_owned)
+}
+
+/// The type identifier macOS gives a file name extension, such as
+/// `com.nikon.raw-image` for `nef`. None for an extension it does not know,
+/// for which it makes up a `dyn.` identifier.
+pub fn type_for_extension(extension: &str) -> Option<String> {
+    let tag = cf_string(&std::ffi::CString::new(extension).ok()?)?;
+    // SAFETY: a framework constant, initialized before any code here runs and
+    // never written.
+    let class = unsafe { kUTTagClassFilenameExtension };
+    // SAFETY: `class` and `tag` are live CFStrings and a null conforming type
+    // is allowed; the identifier comes back under the Create rule.
+    let id = Cf::wrap(unsafe { UTTypeCreatePreferredIdentifierForTag(class, tag.as_ptr(), ptr::null()) })?;
+    // SAFETY: `id` is a live CFString.
+    unsafe { rust_string(id.as_ptr()) }.filter(|id| !id.starts_with("dyn."))
+}
+
+/// Whether macOS reads these bytes as the camera raw `type_hint` names and
+/// develops a picture from them. Told nothing, it takes many raws for plain
+/// TIFFs and opens only their small preview, which says nothing about whether
+/// the raw itself still develops; told the type, it opens a raw it recognises
+/// as that raw, and one it no longer recognises as a TIFF.
+pub fn opens_as_raw(bytes: &[u8], type_hint: &str) -> bool {
+    let Some(hint) = std::ffi::CString::new(type_hint).ok().and_then(|h| cf_string(&h)) else {
+        return false;
+    };
+    let Some(data) = data_from(bytes) else {
+        return false;
+    };
+    // SAFETY: a framework constant, initialized before any code here runs and
+    // never written.
+    let key = unsafe { kCGImageSourceTypeIdentifierHint };
+    // SAFETY: `key` and `hint` are live CFStrings.
+    let Some(options) = (unsafe { dictionary(&[key], &[hint.as_ptr()]) }) else {
+        return false;
+    };
+    // SAFETY: `data` is a live CFData and `options` a live CFDictionary; the
+    // source retains what it needs of both.
+    let Some(src) = Cf::wrap(unsafe { CGImageSourceCreateWithData(data.as_ptr() as CFDataRef, options.as_ptr() as CFDictionaryRef) })
+    else {
+        return false;
+    };
+    // SAFETY: `src` is a live image source.
+    let kind = unsafe { CGImageSourceGetType(src.as_ptr() as CGImageSourceRef) };
+    // SAFETY: `kind` is null or a CFString owned by `src` (Get rule, so not
+    // released), and `src` outlives this read.
+    match unsafe { rust_string(kind) } {
+        Some(kind) if kind != "public.tiff" => {}
+        _ => return false,
+    }
+    let primary = primary_index(&src);
+    // SAFETY: `src` is a live image source, a null options dictionary is
+    // allowed, and an index past the end returns null.
+    let Some(image) = Cf::wrap(unsafe { CGImageSourceCreateImageAtIndex(src.as_ptr() as CGImageSourceRef, primary, ptr::null()) })
+    else {
+        return false;
+    };
+    // SAFETY: `image` is a live CGImage.
+    (unsafe { CGImageGetWidth(image.as_ptr() as CGImageRef) }) > 0
 }
 
 /// The bytes a CFData holds, copied out.

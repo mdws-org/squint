@@ -3,7 +3,7 @@
 //! Ownership rule: every buffer returned here was allocated by Rust and must be
 //! handed back to `squint_result_free`. Nothing else may free it.
 
-use crate::{optimize_as, Error, Hdr, Mode, OutputFormat};
+use crate::{optimize_as, strip_typed, Error, Hdr, Mode, Optimized, OutputFormat};
 use std::os::raw::{c_char, c_int};
 
 pub const SQUINT_MODE_FAST: c_int = 0;
@@ -48,6 +48,8 @@ pub const SQUINT_ERR_ATTACHMENTS: c_int = 16;
 /// A gain map among a TIFF's pixels, usually in its embedded preview, holds
 /// XMP with its rendering parameters and more.
 pub const SQUINT_ERR_PREVIEW: c_int = 17;
+/// A camera raw would no longer open once stripped, so it was left as it was.
+pub const SQUINT_ERR_RAW: c_int = 18;
 
 /// The result of one optimization.
 ///
@@ -115,6 +117,7 @@ fn code_for(e: &Error) -> c_int {
         Error::Signed => SQUINT_ERR_SIGNED,
         Error::AttachmentsUnread { .. } => SQUINT_ERR_ATTACHMENTS,
         Error::PreviewMetadata => SQUINT_ERR_PREVIEW,
+        Error::RawUnopenable { .. } => SQUINT_ERR_RAW,
         Error::Panicked => SQUINT_ERR_PANIC,
     }
 }
@@ -216,7 +219,41 @@ pub unsafe extern "C" fn squint_optimize_as(
         optimize_as(bytes, format, mode, target, fixed_quality, png_min, DEFAULT_PROBES, cap)
     }))
     .unwrap_or(Err(Error::Panicked));
+    result_of(outcome, input_len)
+}
 
+/// Strip, naming the type of file the bytes came from: its type identifier as
+/// macOS gives it for the file's extension, such as `com.nikon.raw-image`, or
+/// null when there is none. A camera raw that macOS opened before stripping
+/// and cannot open after is refused with `SQUINT_ERR_RAW`, as is a camera raw
+/// other than a DNG that it does not open as a raw at all.
+///
+/// # Safety
+/// `input` must point to `input_len` readable bytes, and `type_hint` must be
+/// null or point to a NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn squint_strip_typed(input: *const u8, input_len: usize, type_hint: *const c_char) -> SquintResult {
+    if input.is_null() || input_len == 0 {
+        return SquintResult::failure(SQUINT_ERR_NULL_INPUT, 0, None);
+    }
+    // SAFETY: `input` was checked non-null above, a `u8` pointer has no
+    // alignment to meet, and the caller guarantees `input_len` readable bytes
+    // behind it for the length of this call.
+    let bytes = unsafe { std::slice::from_raw_parts(input, input_len) };
+    let hint = if type_hint.is_null() {
+        None
+    } else {
+        // SAFETY: `type_hint` was checked non-null, and the caller guarantees
+        // it points to a NUL-terminated string that lives through this call.
+        unsafe { std::ffi::CStr::from_ptr(type_hint) }.to_str().ok()
+    };
+    // As in `squint_optimize_as`: nothing may unwind past this frame.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| strip_typed(bytes, hint)))
+        .unwrap_or(Err(Error::Panicked));
+    result_of(outcome, input_len)
+}
+
+fn result_of(outcome: Result<Optimized, Error>, input_len: usize) -> SquintResult {
     match outcome {
         Ok(out) => {
             // A boxed slice has no spare capacity, so `len` alone is enough to
@@ -246,7 +283,8 @@ pub unsafe extern "C" fn squint_optimize_as(
     }
 }
 
-/// Release a buffer returned by `squint_optimize` or `squint_optimize_as`.
+/// Release a buffer returned by `squint_optimize`, `squint_optimize_as` or
+/// `squint_strip_typed`.
 ///
 /// # Safety
 /// Must be called at most once per result, and only on results this library
@@ -289,6 +327,7 @@ pub extern "C" fn squint_error_message(code: c_int) -> *const c_char {
         SQUINT_ERR_SIGNED => b"this PDF is digitally signed, and any change would break the signature; the file was not changed\0",
         SQUINT_ERR_ATTACHMENTS => b"nothing else to remove, but this PDF carries attached files, which Strip does not read; the file was not changed\0",
         SQUINT_ERR_PREVIEW => b"this file's embedded preview has a gain map whose XMP holds more than its rendering parameters; the file was not changed\0",
+        SQUINT_ERR_RAW => b"this camera raw would no longer open once stripped; the file was not changed. A DNG copy of it strips safely\0",
         _ => b"unknown error\0",
     };
     s.as_ptr() as *const c_char
@@ -340,6 +379,73 @@ mod tests {
         // `r`, and the returned slice borrows `r`, so it cannot outlive the
         // free that takes `r` by value.
         unsafe { std::slice::from_raw_parts(r.data, r.len) }
+    }
+
+    fn strip_typed_call(bytes: &[u8], hint: Option<&std::ffi::CStr>) -> SquintResult {
+        // SAFETY: the pointer and length come from one live slice, and the hint
+        // is null or a live NUL-terminated string.
+        unsafe { squint_strip_typed(bytes.as_ptr(), bytes.len(), hint.map_or(std::ptr::null(), std::ffi::CStr::as_ptr)) }
+    }
+
+    #[test]
+    fn a_typed_strip_with_no_input_is_refused_and_a_null_type_is_none() {
+        // SAFETY: a null input is the case under test, which the function
+        // checks before reading anything; the hint is null.
+        let r = unsafe { squint_strip_typed(std::ptr::null(), 0, std::ptr::null()) };
+        assert_eq!(r.error, SQUINT_ERR_NULL_INPUT);
+        free(r);
+        // A TIFF of ordinary pixels with a camera maker to strip.
+        const MAKE: &[u8] = b"Acme Camera Co\0";
+        let mut tiff = b"II\x2A\x00\0\0\0\0".to_vec();
+        tiff.extend_from_slice(MAKE);
+        tiff.extend_from_slice(&[0xAA; 16]);
+        let dir = tiff.len() as u32;
+        tiff[4..8].copy_from_slice(&dir.to_le_bytes());
+        tiff.extend_from_slice(&4u16.to_le_bytes());
+        for (tag, kind, count, value) in
+            [(0x0106u16, 3u16, 1u32, 2u32), (0x010F, 2, MAKE.len() as u32, 8), (0x0111, 4, 1, 8 + MAKE.len() as u32), (0x0117, 4, 1, 16)]
+        {
+            for field in [&tag.to_le_bytes()[..], &kind.to_le_bytes(), &count.to_le_bytes(), &value.to_le_bytes()] {
+                tiff.extend_from_slice(field);
+            }
+        }
+        tiff.extend_from_slice(&[0; 4]);
+        for hint in [None, Some(c"public.tiff")] {
+            let r = strip_typed_call(&tiff, hint);
+            assert_eq!(r.error, SQUINT_OK, "with {hint:?}");
+            assert!(!output(&r).windows(4).any(|w| w == b"Acme"), "the maker stayed with {hint:?}");
+            free(r);
+        }
+    }
+
+    /// A camera raw that nothing here opens as a raw comes back as its own
+    /// error code, with the engine's sentence.
+    #[test]
+    fn a_refused_camera_raw_has_its_own_code() {
+        let mut tiff = b"II\x2A\x00\0\0\0\0".to_vec();
+        tiff.extend_from_slice(b"Acme Camera Co\0\0");
+        tiff.extend_from_slice(&[0xAA; 16]);
+        tiff[4..8].copy_from_slice(&40u32.to_le_bytes());
+        tiff.extend_from_slice(&4u16.to_le_bytes());
+        for (tag, kind, count, value) in [(0x0106u16, 3u16, 1u32, 32803u32), (0x010F, 2, 15, 8), (0x0111, 4, 1, 24), (0x0117, 4, 1, 16)] {
+            for field in [&tag.to_le_bytes()[..], &kind.to_le_bytes(), &count.to_le_bytes(), &value.to_le_bytes()] {
+                tiff.extend_from_slice(field);
+            }
+        }
+        tiff.extend_from_slice(&[0; 4]);
+        let r = strip_typed_call(&tiff, Some(c"com.nikon.raw-image"));
+        assert_eq!(r.error, SQUINT_ERR_RAW);
+        assert!(r.data.is_null());
+        let text = message(&r);
+        assert!(text.contains("DNG"), "{text}");
+        // SAFETY: `squint_error_message` returns a static NUL-terminated string.
+        let fixed = unsafe { std::ffi::CStr::from_ptr(squint_error_message(SQUINT_ERR_RAW)) };
+        assert!(!fixed.to_bytes().starts_with(b"unknown"));
+        free(r);
+        // The older entry point strips through the same check.
+        let r = call(&tiff, SQUINT_FORMAT_JPEG, SQUINT_MODE_STRIP);
+        assert_eq!(r.error, SQUINT_ERR_RAW);
+        free(r);
     }
 
     #[test]
