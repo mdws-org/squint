@@ -6,7 +6,7 @@ license = "GPL-3.0-or-later"
 description = "Perceptual image compression engine for squint"
 
 [dependencies]
-fast-ssim2 = { version = "0.8", features = ["imgref"] }
+fast-ssim2 = { version = "0.9", features = ["imgref"] }
 imgref = "1.12"
 mozjpeg = "0.10"
 imagequant = { version = "4.4", optional = true }
